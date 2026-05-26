@@ -1,0 +1,31 @@
+[package]
+name = "arccode-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "arccode — a multi-provider terminal coding agent"
+
+[[bin]]
+name = "arccode"
+path = "src/main.rs"
+
+[dependencies]
+arccode-config = { workspace = true }
+arccode-core = { workspace = true }
+arccode-providers = { workspace = true }
+arccode-tools = { workspace = true }
+arccode-session = { workspace = true }
+arccode-tui = { workspace = true }
+
+tokio = { workspace = true }
+futures = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }

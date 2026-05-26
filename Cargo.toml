@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/arccode-cli",
+    "crates/arccode-config",
+    "crates/arccode-core",
+    "crates/arccode-tui",
+    "crates/arccode-providers",
+    "crates/arccode-tools",
+    "crates/arccode-session",
+    "crates/arccode-rag",
+    "crates/arccode-mcp",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/your-org/arccode"
+authors = ["arccode contributors"]
+
+[workspace.dependencies]
+arccode-cli = { path = "crates/arccode-cli", version = "0.0.1" }
+arccode-config = { path = "crates/arccode-config", version = "0.0.1" }
+arccode-core = { path = "crates/arccode-core", version = "0.0.1" }
+arccode-tui = { path = "crates/arccode-tui", version = "0.0.1" }
+arccode-providers = { path = "crates/arccode-providers", version = "0.0.1" }
+arccode-tools = { path = "crates/arccode-tools", version = "0.0.1" }
+arccode-session = { path = "crates/arccode-session", version = "0.0.1" }
+arccode-rag = { path = "crates/arccode-rag", version = "0.0.1" }
+arccode-mcp = { path = "crates/arccode-mcp", version = "0.0.1" }
+
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "fs", "io-util", "process", "signal", "sync", "time"] }
+async-trait = "0.1"
+futures = "0.3"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+thiserror = "1"
+anyhow = "1"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+
+clap = { version = "4", features = ["derive", "env"] }
+directories = "5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

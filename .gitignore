@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# arccode local state (created in user repos, but ignore here too)
+.arccode/sessions/
+.arccode/index.db*
+.arccode/*.log

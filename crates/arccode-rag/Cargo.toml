@@ -1,0 +1,18 @@
+[package]
+name = "arccode-rag"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Retrieval/embedding/index layer for arccode (Embedder trait, sqlite-vec)"
+
+[dependencies]
+arccode-core = { workspace = true }
+arccode-config = { workspace = true }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
