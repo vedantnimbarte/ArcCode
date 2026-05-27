@@ -24,6 +24,12 @@ This builds on existing pieces:
 | Approval gates     | Plan approval + PR review only; otherwise hands-off                    |
 | Worker execution   | Subprocess per agent (`arccode --print --json` child processes)        |
 | Model tiering      | Manager + reviewers on `default_model`; workers on `router.fast_model` |
+| Dev branch         | `feature/autonomous-mode` off `main`; per-phase PRs into it; final     |
+|                    | PR from `feature/autonomous-mode` into `main`                          |
+| Platforms          | Windows **and** Unix in v1 — cross-platform process control from day 1 |
+| Providers          | All nine supported providers — Phase 8 smoke-tests each tool-call path |
+| Session logs       | Each manager + worker writes its own JSONL under                       |
+|                    | `<project>/.arccode/sessions/`; `tasks.jsonl` references by session id |
 
 ## Opinionated defaults (flip during review if wrong)
 
@@ -117,6 +123,21 @@ Three new slash commands:
 ---
 
 ## Data model
+
+### Session logs (per-agent JSONL, reused infra)
+
+Each manager and worker subprocess is run with session logging enabled, so
+`<project>/.arccode/sessions/<session-id>.jsonl` is written for each agent
+exactly as a normal headless run would. The autonomous layer:
+
+- Assigns each agent a session id at spawn time and passes it to the child
+  via env var (`ARCCODE_SESSION_ID`).
+- Records `agent.session` events in `tasks.jsonl` that point at the
+  session id — so `state.json` always knows where to find the full
+  turn-by-turn for any agent.
+- This means `arccode session fork <id>` works on an autonomous worker's
+  session, and `recall_session` will surface autonomous-mode work in
+  future runs through the existing learning loop.
 
 ### `tasks.jsonl` (append-only event log)
 
@@ -290,7 +311,15 @@ reopen, and observe the same state.
      `{"event":"task_complete","summary":"…","files_changed":[…]}`.
 2. Implement `worker.rs`: spawn the child, parse NDJSON, forward
    `task.tool` events into `RunStore`, enforce `task_timeout_secs`, kill
-   the process group on timeout/abort.
+   on timeout/abort. Process control is cross-platform:
+   - Unix: spawn child in its own process group (`setsid`) and kill via
+     `kill(-pgid, SIGTERM)` then `SIGKILL` after a grace period.
+   - Windows: assign the child to a Job Object with
+     `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; closing the job handle (or
+     calling `TerminateJobObject`) reaps the whole process tree. Fallback
+     `taskkill /T /F /PID <pid>` if Job Objects fail.
+   Encapsulate this in a small `child_process::Supervisor` abstraction so
+   the rest of the orchestrator stays platform-agnostic.
 3. Add a `task_complete` tool to the tools registry, gated to worker mode,
    that flushes the final event and terminates the loop cleanly.
 
@@ -359,16 +388,32 @@ push URL) and the run terminates cleanly.
 **Done when:** running the TUI while a background `arccode autonomous` is
 active shows live progress without polling.
 
-### Phase 8 — Failure handling & polish
+### Phase 8 — Cross-provider validation, failure handling, polish
 
 1. Per-task timeout (kill + retry once with a fresh worker).
 2. Cost cap (`max_usd`) checked after every `agent.usd` event; on breach,
    abort all workers and mark run `failed`.
 3. `--resume <RUN_ID>`: replay state, restart missing workers for
    `in_progress` tasks (those whose pid is gone or unresponsive).
-4. README updates: new "Autonomous mode" section, Roadmap M7 entry.
-5. End-to-end integration test using a tiny scratch repo and a stubbed
+4. **Provider validation matrix.** Run the acceptance test (a tiny canned
+   plan) against each of the nine providers and confirm the worker
+   tool-call shape is parsed correctly end-to-end. Concretely:
+   - Anthropic — native tool use (reference).
+   - OpenAI — `tool_calls` / `function_call` shape.
+   - ChatGPT (OAuth) — same shape as OpenAI, plus token refresh path.
+   - Gemini — `functionCall` shape.
+   - OpenRouter, LiteLLM, LM Studio, vLLM, Ollama — OpenAI-compat shape;
+     test with one model per backend that supports tool use.
+
+   Any provider that can't reliably emit tool calls (some local models)
+   is marked **unsupported for autonomous mode** in README and the
+   subcommand errors out early with a helpful message if selected.
+5. README updates: new "Autonomous mode" section, Roadmap M7 entry, and
+   a provider-support table for autonomous mode specifically.
+6. End-to-end integration test using a tiny scratch repo and a stubbed
    provider that returns canned tool calls.
+7. Cross-platform CI: GitHub Actions matrix runs the integration test on
+   `ubuntu-latest` and `windows-latest`.
 
 ---
 
