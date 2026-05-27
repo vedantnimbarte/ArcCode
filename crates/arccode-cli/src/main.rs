@@ -5,7 +5,10 @@
 
 mod cli;
 mod commands;
+mod login;
 mod logging;
+mod mcp_adapter;
+mod mcp_registry;
 mod runtime;
 
 use std::process::ExitCode;
