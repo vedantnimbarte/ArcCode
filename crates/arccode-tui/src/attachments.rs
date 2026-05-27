@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 
 /// A single image attachment extracted from the prompt.
+// Fields will be consumed once provider vision injection is fully wired.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ImageAttachment {
     /// Original file path as typed by the user.
