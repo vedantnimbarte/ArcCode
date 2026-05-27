@@ -15,3 +15,6 @@ Thumbs.db
 .arccode/sessions/
 .arccode/index.db*
 .arccode/*.log
+
+# Claude Code local state
+.claude/

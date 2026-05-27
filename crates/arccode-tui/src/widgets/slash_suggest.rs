@@ -60,6 +60,18 @@ pub const CATALOG: &[Command] = &[
         description: "queue a named skill for next prompt",
     },
     Command {
+        name: "/memory",
+        description: "list saved memories · forget <name>",
+    },
+    Command {
+        name: "/recall",
+        description: "search across past sessions",
+    },
+    Command {
+        name: "/learn",
+        description: "self-learning status / reset",
+    },
+    Command {
         name: "/mcp",
         description: "manage MCP servers",
     },

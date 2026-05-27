@@ -29,6 +29,30 @@ pub trait ToolDispatcher: Send + Sync {
     async fn dispatch(&self, name: &str, args: serde_json::Value) -> ToolOutcome;
 }
 
+/// Hook the agent loop calls at three well-known points so a side-channel
+/// crate (`arccode-learn`) can implement the self-improvement loop without
+/// `arccode-core` depending on it.
+///
+/// The default impl is a no-op so existing callers that don't supply a hook
+/// pay nothing.
+pub trait LearningHook: Send + Sync {
+    /// Called once before the per-turn provider request. May return extra
+    /// system text to splice onto `AgentConfig::system` for this turn only
+    /// (memory recall, nudges, ephemeral skill injection).
+    fn before_turn(&self, _history: &[Message]) -> Option<String> {
+        None
+    }
+    /// Called after each assistant turn completes (tool round trip done).
+    fn after_turn(&self, _history: &[Message]) {}
+    /// Called once when the loop yields its final Stop event for a user
+    /// turn. Use this to flush stats, kick off background indexing, etc.
+    fn after_stop(&self, _history: &[Message]) {}
+}
+
+/// No-op default — used when the caller doesn't supply a hook.
+pub struct NoopLearningHook;
+impl LearningHook for NoopLearningHook {}
+
 #[derive(Debug, Clone)]
 pub struct ToolOutcome {
     pub content: String,
@@ -87,7 +111,7 @@ pub enum AgentStop {
 }
 
 /// Construction-time options for the loop.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentConfig {
     pub model: String,
     pub system: Option<String>,
@@ -101,6 +125,26 @@ pub struct AgentConfig {
     /// Compaction policy. Compaction runs **before** each request if the
     /// estimated context size crosses `compactor.trigger_tokens`.
     pub compactor: Compactor,
+    /// Optional learning hook. Called at before_turn / after_turn /
+    /// after_stop; lets `arccode-learn` inject memory + nudges into the
+    /// system prompt and track skill usage outcomes.
+    pub learning: Option<Arc<dyn LearningHook>>,
+}
+
+impl std::fmt::Debug for AgentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentConfig")
+            .field("model", &self.model)
+            .field("system", &self.system)
+            .field("max_turns", &self.max_turns)
+            .field("max_tokens", &self.max_tokens)
+            .field("temperature", &self.temperature)
+            .field("cache_breakpoints", &self.cache_breakpoints)
+            .field("tool_output_budget", &self.tool_output_budget)
+            .field("compactor", &self.compactor)
+            .field("learning", &self.learning.as_ref().map(|_| "<hook>"))
+            .finish()
+    }
 }
 
 impl Default for AgentConfig {
@@ -114,6 +158,7 @@ impl Default for AgentConfig {
             cache_breakpoints: vec![CacheBreakpoint::AfterSystem, CacheBreakpoint::AfterTools],
             tool_output_budget: ToolOutputBudget::default(),
             compactor: Compactor::default(),
+            learning: None,
         }
     }
 }
@@ -228,9 +273,30 @@ impl AgentLoop {
                     history.splice(0..replaced, std::iter::once(recap));
                 }
 
+                // Allow the learning hook to splice extra system text on a
+                // per-turn basis (memory index, nudges, ephemeral skill body).
+                let system_for_turn = match (config.system.as_deref(), &config.learning) {
+                    (base, Some(hook)) => match hook.before_turn(history) {
+                        Some(extra) if !extra.trim().is_empty() => {
+                            let mut s = String::new();
+                            if let Some(b) = base {
+                                s.push_str(b);
+                                if !s.ends_with('\n') {
+                                    s.push('\n');
+                                }
+                                s.push('\n');
+                            }
+                            s.push_str(&extra);
+                            Some(s)
+                        }
+                        _ => base.map(str::to_string),
+                    },
+                    (base, None) => base.map(str::to_string),
+                };
+
                 let req = CompletionRequest {
                     model: config.model.clone(),
-                    system: config.system.clone(),
+                    system: system_for_turn,
                     messages: history.clone(),
                     tools: specs.clone(),
                     max_tokens: config.max_tokens,
@@ -300,6 +366,10 @@ impl AgentLoop {
                     });
                 }
 
+                if let Some(hook) = &config.learning {
+                    hook.after_turn(history);
+                }
+
                 yield AgentEvent::TurnComplete;
 
                 // Decide whether to continue.
@@ -319,16 +389,25 @@ impl AgentLoop {
                         // run them and keep going — this is a provider quirk we
                         // observed with some non-Anthropic backends.
                         if tool_calls.is_empty() {
+                            if let Some(hook) = &config.learning {
+                                hook.after_stop(history);
+                            }
                             yield AgentEvent::Stop { reason: AgentStop::EndTurn };
                             return;
                         }
                     }
                     StopReason::MaxTokens => {
+                        if let Some(hook) = &config.learning {
+                            hook.after_stop(history);
+                        }
                         yield AgentEvent::Stop { reason: AgentStop::MaxTokens };
                         return;
                     }
                     StopReason::ToolUse | StopReason::StopSequence | StopReason::Other => {
                         if tool_calls.is_empty() {
+                            if let Some(hook) = &config.learning {
+                                hook.after_stop(history);
+                            }
                             yield AgentEvent::Stop { reason: AgentStop::EndTurn };
                             return;
                         }
@@ -364,6 +443,9 @@ impl AgentLoop {
                 history.push(Message::tool_results(results));
 
                 if turn + 1 == config.max_turns {
+                    if let Some(hook) = &config.learning {
+                        hook.after_stop(history);
+                    }
                     yield AgentEvent::Stop { reason: AgentStop::MaxTurns };
                     return;
                 }

@@ -15,7 +15,10 @@ pub mod tokens;
 pub mod tool;
 pub mod usage;
 
-pub use agent::{AgentConfig, AgentEvent, AgentLoop, AgentStop, ToolDispatcher, ToolOutcome};
+pub use agent::{
+    AgentConfig, AgentEvent, AgentLoop, AgentStop, LearningHook, NoopLearningHook, ToolDispatcher,
+    ToolOutcome,
+};
 pub use error::{ArccodeError, Result};
 pub use message::{ContentBlock, Message, Role};
 pub use provider::{CacheBreakpoint, CacheKind, CompletionRequest, Provider, ProviderCapabilities};

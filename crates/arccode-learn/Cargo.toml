@@ -1,29 +1,24 @@
 [package]
-name = "arccode-tools"
+name = "arccode-learn"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Built-in tools (file/shell/search) for arccode"
+description = "Self-improving learning loop for arccode: memory, skill proposals, usage stats, session search."
 
 [dependencies]
-arccode-core = { workspace = true }
 arccode-config = { workspace = true }
-arccode-rag = { workspace = true, default-features = false }
-arccode-learn = { workspace = true }
+arccode-core = { workspace = true }
 arccode-skills = { workspace = true }
 arccode-session = { workspace = true }
-
-tokio = { workspace = true }
-async-trait = { workspace = true }
+arccode-rag = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
 
-ignore = "0.4"
-globset = "0.4"
-regex = "1"
-similar = "2"
-
+[dev-dependencies]
+tokio = { workspace = true }

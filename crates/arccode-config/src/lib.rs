@@ -430,6 +430,17 @@ impl Config {
                 },
             ),
             (
+                "chatgpt".to_string(),
+                ProviderConfig {
+                    // Token stored in keychain after `arccode auth login` /
+                    // the /login wizard OAuth flow. Set via CHATGPT_ACCESS_TOKEN
+                    // env var as an alternative.
+                    api_key: Some("${CHATGPT_ACCESS_TOKEN}".into()),
+                    model: Some("gpt-4o".into()),
+                    ..Default::default()
+                },
+            ),
+            (
                 "gemini".to_string(),
                 ProviderConfig {
                     api_key: Some("${GOOGLE_API_KEY}".into()),

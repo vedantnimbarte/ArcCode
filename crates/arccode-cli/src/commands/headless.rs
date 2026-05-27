@@ -120,6 +120,30 @@ pub async fn run(cfg: Config, opts: HeadlessOptions) -> Result<ExitCode> {
         }
     }
 
+    // Index the just-finished session into the global sessions store so
+    // future runs can `recall_session` against it.
+    if let Some(s) = session.as_ref() {
+        let session_path = s.path().to_path_buf();
+        tokio::spawn(async move {
+            let embedder = crate::runtime::pick_embedder_pub();
+            match arccode_learn::session_index::open_global_store(&*embedder) {
+                Ok(store) => {
+                    match arccode_learn::session_index::index_session_into(
+                        &store,
+                        &*embedder,
+                        &session_path,
+                    )
+                    .await
+                    {
+                        Ok(n) => tracing::info!("indexed session ({n} chunks) into sessions.db"),
+                        Err(e) => tracing::warn!("session indexing failed: {e}"),
+                    }
+                }
+                Err(e) => tracing::warn!("could not open sessions store: {e}"),
+            }
+        });
+    }
+
     Ok(exit)
 }
 

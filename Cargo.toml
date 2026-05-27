@@ -11,6 +11,7 @@ members = [
     "crates/arccode-rag",
     "crates/arccode-mcp",
     "crates/arccode-skills",
+    "crates/arccode-learn",
 ]
 
 [workspace.package]
@@ -32,6 +33,7 @@ arccode-session = { path = "crates/arccode-session", version = "0.0.1" }
 arccode-rag = { path = "crates/arccode-rag", version = "0.0.1", default-features = false }
 arccode-mcp = { path = "crates/arccode-mcp", version = "0.0.1" }
 arccode-skills = { path = "crates/arccode-skills", version = "0.0.1" }
+arccode-learn = { path = "crates/arccode-learn", version = "0.0.1" }
 
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "fs", "io-util", "process", "signal", "sync", "time"] }
 async-trait = "0.1"
@@ -51,6 +53,11 @@ tracing-appender = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
 directories = "5"
 keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
+
+rand = "0.8"
+sha2 = "0.10"
+base64 = "0.22"
+urlencoding = "2"
 
 [profile.release]
 lto = "thin"

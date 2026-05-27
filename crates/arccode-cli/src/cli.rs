@@ -186,12 +186,22 @@ pub async fn run() -> Result<ExitCode> {
                     })
                 });
 
-            // Login-task runner: probes a freshly-entered key, or persists
-            // it (keyring + config). The TUI calls into this without
-            // touching arccode-providers or arccode-config directly.
+            // Login-task runner: probes a freshly-entered key, persists
+            // credentials, or runs the ChatGPT OAuth browser flow.
             let login_runner: arccode_tui::LoginRunner = std::sync::Arc::new(
                 move |task: arccode_tui::modal::LoginTask| {
-                    Box::pin(async move { crate::login::run_login_task(task).await })
+                    Box::pin(async move {
+                        // OAuthLogin is handled here rather than in login.rs
+                        // because it needs async I/O (network + local server).
+                        if let arccode_tui::modal::LoginTask::OAuthLogin { ref provider_id } =
+                            task
+                        {
+                            if provider_id == "chatgpt" {
+                                return run_chatgpt_oauth().await;
+                            }
+                        }
+                        crate::login::run_login_task(task).await
+                    })
                 },
             );
 
@@ -293,6 +303,22 @@ fn load_config() -> Result<Config> {
         None
     };
     Ok(Config::load(Some(&global), project_file.as_deref())?)
+}
+
+/// Run the ChatGPT OAuth PKCE flow and store the resulting tokens in the
+/// OS keychain.  Called by the login runner when the user picks
+/// "ChatGPT (subscription)" in the `/login` wizard.
+async fn run_chatgpt_oauth() -> Result<(), String> {
+    let (access_token, refresh_token) = crate::oauth::chatgpt_oauth_login()
+        .await
+        .map_err(|e| format!("OAuth login failed: {e}"))?;
+
+    arccode_config::secrets::store("chatgpt", &access_token)
+        .map_err(|e| format!("keyring (access token): {e}"))?;
+    arccode_config::secrets::store("chatgpt_refresh", &refresh_token)
+        .map_err(|e| format!("keyring (refresh token): {e}"))?;
+
+    Ok(())
 }
 
 fn parse_mode(s: Option<&str>) -> Result<Option<PermissionMode>> {

@@ -8,7 +8,7 @@
 use arccode_config::{global_config_path, secrets, Config};
 use arccode_core::Provider;
 use arccode_providers::{
-    probe, AnthropicProvider, GeminiProvider, OpenAiCompatProvider, OpenAiVariant,
+    probe, AnthropicProvider, ChatGptProvider, GeminiProvider, OpenAiCompatProvider, OpenAiVariant,
 };
 use arccode_tui::modal::{LoginPayload, LoginTask};
 use std::sync::Arc;
@@ -18,6 +18,10 @@ pub async fn run_login_task(task: LoginTask) -> Result<(), String> {
     match task {
         LoginTask::Probe(payload) => probe_payload(&payload).await,
         LoginTask::Commit(payload) => commit_payload(&payload).await,
+        // OAuthLogin is fully handled in cli.rs's login_runner before reaching here.
+        LoginTask::OAuthLogin { provider_id } => {
+            Err(format!("unexpected OAuthLogin for '{provider_id}' in login task runner"))
+        }
     }
 }
 
@@ -32,7 +36,16 @@ async fn commit_payload(p: &LoginPayload) -> Result<(), String> {
         secrets::store(&p.provider_id, key).map_err(|e| format!("keyring: {e}"))?;
     }
 
-    // 2. Update the global config file to point at this provider+model and
+    // 2. Determine whether a keyring marker should be written to the config.
+    //    For chatgpt the tokens are written directly by the OAuth runner, so
+    //    `api_key` is None in the payload — but the keychain entry exists.
+    let with_keyring = p.api_key.is_some()
+        || secrets::load(&p.provider_id)
+            .ok()
+            .flatten()
+            .is_some();
+
+    // 3. Update the global config file to point at this provider+model and
     //    record either the keyring marker (for providers with a key) or the
     //    custom base URL (for local providers).
     let path = global_config_path().map_err(|e| format!("config path: {e}"))?;
@@ -41,7 +54,7 @@ async fn commit_payload(p: &LoginPayload) -> Result<(), String> {
         &p.provider_id,
         &p.model,
         p.base_url.as_deref(),
-        p.api_key.is_some(),
+        with_keyring,
     )
     .map_err(|e| format!("save config: {e}"))?;
 
@@ -72,6 +85,13 @@ fn build_provider(p: &LoginPayload) -> Result<Arc<dyn Provider>, String> {
                 prov = prov.with_base_url(url);
             }
             Ok(Arc::new(prov))
+        }
+        "chatgpt" => {
+            // The OAuth runner stored the token in keychain; read it back.
+            let token = api_key
+                .or_else(|| secrets::load("chatgpt").ok().flatten())
+                .ok_or("chatgpt: no access token found — complete browser login first")?;
+            Ok(Arc::new(ChatGptProvider::new(token).map_err(mk_err)?))
         }
         id => {
             let variant = openai_variant(id).ok_or_else(|| format!("unknown provider '{id}'"))?;

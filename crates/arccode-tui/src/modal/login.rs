@@ -1,12 +1,12 @@
 //! Provider login wizard — the `/login` modal.
 //!
 //! State machine:
-//!     PickProvider → EnterKey / EnterBaseUrl → EnterModel → Testing
-//!         → Committing → Done
-//!     (any of Testing/Committing can land in Failed; Enter retries)
+//!   API-key flow:   PickProvider → EnterKey → EnterModel → Testing → Committing → Done
+//!   OAuth flow:     PickProvider → OAuthPending → OAuthRunning → EnterModel → Committing → Done
+//!   Local URL flow: PickProvider → EnterBaseUrl → EnterModel → Testing → Committing → Done
 //!
-//! Async work (probe, commit) is dispatched back to the host loop via
-//! [`take_pending_task`] / [`task_completed`] — the modal itself stays sync.
+//! Async work (probe, commit, OAuth login) is dispatched back to the host loop
+//! via [`take_pending_task`] / [`task_completed`] — the modal itself stays sync.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -20,20 +20,30 @@ use ratatui::{
 use super::{centered_rect, ModalOutcome};
 
 /// Stable id, display label, default model, whether it needs an API key,
-/// and the default base URL for local providers.
+/// the default base URL for local providers, and whether it uses OAuth.
 pub const PROVIDERS: &[ProviderSpec] = &[
     ProviderSpec {
         id: "anthropic",
         label: "Anthropic (Claude)",
         default_model: "claude-opus-4-7",
         needs_key: true,
+        needs_oauth: false,
         default_base_url: None,
     },
     ProviderSpec {
         id: "openai",
-        label: "OpenAI",
+        label: "OpenAI (API key)",
         default_model: "gpt-4.1",
         needs_key: true,
+        needs_oauth: false,
+        default_base_url: None,
+    },
+    ProviderSpec {
+        id: "chatgpt",
+        label: "ChatGPT (subscription)",
+        default_model: "gpt-4o",
+        needs_key: false,
+        needs_oauth: true,
         default_base_url: None,
     },
     ProviderSpec {
@@ -41,6 +51,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         label: "OpenRouter",
         default_model: "anthropic/claude-opus-4-7",
         needs_key: true,
+        needs_oauth: false,
         default_base_url: None,
     },
     ProviderSpec {
@@ -48,6 +59,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         label: "Google Gemini",
         default_model: "gemini-2.5-pro",
         needs_key: true,
+        needs_oauth: false,
         default_base_url: None,
     },
     ProviderSpec {
@@ -55,6 +67,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         label: "LiteLLM proxy",
         default_model: "anthropic/claude-opus-4-7",
         needs_key: true,
+        needs_oauth: false,
         default_base_url: Some("http://localhost:4000/v1"),
     },
     ProviderSpec {
@@ -62,6 +75,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         label: "LM Studio (local)",
         default_model: "local-model",
         needs_key: false,
+        needs_oauth: false,
         default_base_url: Some("http://localhost:1234/v1"),
     },
     ProviderSpec {
@@ -69,6 +83,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         label: "vLLM (local)",
         default_model: "local-model",
         needs_key: false,
+        needs_oauth: false,
         default_base_url: Some("http://localhost:8000/v1"),
     },
     ProviderSpec {
@@ -76,6 +91,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         label: "Ollama (local)",
         default_model: "llama3.1:8b",
         needs_key: false,
+        needs_oauth: false,
         default_base_url: Some("http://localhost:11434/v1"),
     },
 ];
@@ -86,6 +102,8 @@ pub struct ProviderSpec {
     pub label: &'static str,
     pub default_model: &'static str,
     pub needs_key: bool,
+    /// Uses browser-based OAuth instead of an API key.
+    pub needs_oauth: bool,
     pub default_base_url: Option<&'static str>,
 }
 
@@ -95,6 +113,10 @@ enum Stage {
     EnterKey,
     EnterBaseUrl,
     EnterModel,
+    /// OAuth: waiting for the user to press Enter to open the browser.
+    OAuthPending,
+    /// OAuth: browser is open, waiting for the callback to complete.
+    OAuthRunning,
     Testing,
     Committing,
     Done,
@@ -114,6 +136,9 @@ pub struct LoginPayload {
 pub enum LoginTask {
     Probe(LoginPayload),
     Commit(LoginPayload),
+    /// Perform the ChatGPT OAuth browser login and store both tokens in the
+    /// keychain.  Reports `Ok(())` on success.
+    OAuthLogin { provider_id: String },
 }
 
 #[derive(Debug)]
@@ -125,9 +150,7 @@ pub struct LoginWizard {
     model: String,
     /// Set when the most recent async task failed. Cleared on retry.
     error: Option<String>,
-    /// Task the host should pick up and execute. Drained by
-    /// [`take_pending_task`]; refilled when the stage transitions into
-    /// Testing or Committing.
+    /// Task the host should pick up and execute.
     pending: Option<LoginTask>,
 }
 
@@ -175,8 +198,7 @@ impl LoginWizard {
         }
     }
 
-    /// Drain the pending async task. Host runs it then reports via
-    /// [`task_completed`].
+    /// Drain the pending async task.
     pub fn take_pending_task(&mut self) -> Option<LoginTask> {
         self.pending.take()
     }
@@ -184,8 +206,16 @@ impl LoginWizard {
     /// Host reports completion of the most recently dispatched task.
     pub fn task_completed(&mut self, result: Result<(), String>) {
         match (self.stage, result) {
+            (Stage::OAuthRunning, Ok(())) => {
+                // OAuth succeeded — advance to model selection.
+                self.stage = Stage::EnterModel;
+            }
+            (Stage::OAuthRunning, Err(msg)) => {
+                self.error = Some(msg);
+                // Let user retry by pressing Enter again.
+                self.stage = Stage::OAuthPending;
+            }
             (Stage::Testing, Ok(())) => {
-                // Probe succeeded — proceed to commit.
                 self.stage = Stage::Committing;
                 self.pending = Some(LoginTask::Commit(self.payload()));
             }
@@ -194,27 +224,25 @@ impl LoginWizard {
             }
             (_, Err(msg)) => {
                 self.error = Some(msg);
-                // Drop back to model entry so the user can edit and retry.
                 self.stage = Stage::EnterModel;
             }
             _ => {}
         }
     }
 
-    /// True once the wizard has finished and the host should close it and
-    /// adopt the new provider.
     pub fn is_done(&self) -> bool {
         self.stage == Stage::Done
     }
 
-    /// Snapshot of the data the host should adopt on close.
     pub fn final_payload(&self) -> LoginPayload {
         self.payload()
     }
 
     pub fn handle_key(&mut self, k: KeyEvent) -> ModalOutcome {
-        // Async stages eat keys; the host pump drives them.
-        if matches!(self.stage, Stage::Testing | Stage::Committing | Stage::Done) {
+        if matches!(
+            self.stage,
+            Stage::OAuthRunning | Stage::Testing | Stage::Committing | Stage::Done
+        ) {
             return ModalOutcome::Continue;
         }
         self.error = None;
@@ -223,6 +251,7 @@ impl LoginWizard {
             Stage::EnterKey => self.handle_text(k, TextField::Key),
             Stage::EnterBaseUrl => self.handle_text(k, TextField::BaseUrl),
             Stage::EnterModel => self.handle_text(k, TextField::Model),
+            Stage::OAuthPending => self.handle_oauth_pending(k),
             _ => ModalOutcome::Continue,
         }
     }
@@ -241,13 +270,25 @@ impl LoginWizard {
             }
             KeyCode::Enter => {
                 let spec = self.spec();
-                self.stage = if spec.needs_key {
+                self.stage = if spec.needs_oauth {
+                    Stage::OAuthPending
+                } else if spec.needs_key {
                     Stage::EnterKey
                 } else {
                     Stage::EnterBaseUrl
                 };
             }
             _ => {}
+        }
+        ModalOutcome::Continue
+    }
+
+    fn handle_oauth_pending(&mut self, k: KeyEvent) -> ModalOutcome {
+        if k.code == KeyCode::Enter {
+            self.stage = Stage::OAuthRunning;
+            self.pending = Some(LoginTask::OAuthLogin {
+                provider_id: self.spec().id.to_string(),
+            });
         }
         ModalOutcome::Continue
     }
@@ -271,9 +312,6 @@ impl LoginWizard {
                             self.error = Some("API key required".into());
                             return ModalOutcome::Continue;
                         }
-                        // Remote providers may also want a custom base_url
-                        // (proxies etc.) — but for v1 only show it for the
-                        // ones that ship with a default.
                         if spec.default_base_url.is_some() {
                             self.stage = Stage::EnterBaseUrl;
                         } else {
@@ -288,8 +326,15 @@ impl LoginWizard {
                             self.error = Some("model required".into());
                             return ModalOutcome::Continue;
                         }
-                        self.stage = Stage::Testing;
-                        self.pending = Some(LoginTask::Probe(self.payload()));
+                        // OAuth providers skip the probe — they already have a
+                        // valid token; go straight to Commit.
+                        if spec.needs_oauth {
+                            self.stage = Stage::Committing;
+                            self.pending = Some(LoginTask::Commit(self.payload()));
+                        } else {
+                            self.stage = Stage::Testing;
+                            self.pending = Some(LoginTask::Probe(self.payload()));
+                        }
                     }
                 }
             }
@@ -316,9 +361,9 @@ impl LoginWizard {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // step indicator
-                Constraint::Min(3),    // body
-                Constraint::Length(2), // hint / error
+                Constraint::Length(1),
+                Constraint::Min(3),
+                Constraint::Length(2),
             ])
             .split(inner);
 
@@ -332,6 +377,8 @@ impl LoginWizard {
             Stage::PickProvider => "Step 1/4 · pick a provider",
             Stage::EnterKey => "Step 2/4 · enter API key",
             Stage::EnterBaseUrl => "Step 2/4 · base URL",
+            Stage::OAuthPending => "Step 2/4 · authenticate via browser",
+            Stage::OAuthRunning => "Step 2/4 · browser authentication in progress",
             Stage::EnterModel => "Step 3/4 · pick model",
             Stage::Testing => "Step 4/4 · testing connection",
             Stage::Committing => "Step 4/4 · saving",
@@ -382,6 +429,37 @@ impl LoginWizard {
                 ]);
                 Paragraph::new(line).render(area, buf);
             }
+            Stage::OAuthPending => {
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        "Your default browser will open to authenticate with ChatGPT.",
+                        Style::default().fg(Color::White),
+                    )),
+                    Line::from(Span::styled(
+                        "A ChatGPT Plus or Pro subscription is required.",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Press Enter to open browser…",
+                        Style::default().fg(Color::Cyan),
+                    )),
+                ])
+                .render(area, buf);
+            }
+            Stage::OAuthRunning => {
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        "Browser opened — complete authentication there.",
+                        Style::default().fg(Color::Yellow),
+                    )),
+                    Line::from(Span::styled(
+                        "Waiting for callback on localhost:1455…",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ])
+                .render(area, buf);
+            }
             Stage::EnterModel => {
                 let line = Line::from(vec![
                     Span::styled("Model: ", Style::default().fg(Color::DarkGray)),
@@ -427,6 +505,8 @@ impl LoginWizard {
                 Stage::EnterBaseUrl | Stage::EnterModel => {
                     "Enter continue · Backspace edit · Esc cancel"
                 }
+                Stage::OAuthPending => "Enter open browser · Esc cancel",
+                Stage::OAuthRunning => "(waiting for browser auth…)",
                 Stage::Testing | Stage::Committing => "(working…)",
                 Stage::Done => "press Esc to close",
             };

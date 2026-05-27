@@ -135,6 +135,11 @@ enum Cmd {
     Export(String),
     Params,
     Resume,
+    // self-improvement commands
+    Memory(String),     // "" = list, "forget <name>" = delete
+    Recall(String),     // query for cross-session search
+    SkillStats(String), // "" = all skills, "<name>" = one skill
+    Learn(String),      // "status" | "on" | "off"
     Submit(String),
     None,
 }
@@ -177,7 +182,16 @@ fn parse_slash(line: &str) -> Cmd {
                 Cmd::Skills
             }
         }
-        "/skill" if !arg.is_empty() => Cmd::Skill(arg.to_string()),
+        "/skill" if !arg.is_empty() => {
+            if let Some(rest) = arg.strip_prefix("stats") {
+                Cmd::SkillStats(rest.trim().to_string())
+            } else {
+                Cmd::Skill(arg.to_string())
+            }
+        }
+        "/memory" => Cmd::Memory(arg.to_string()),
+        "/recall" => Cmd::Recall(arg.to_string()),
+        "/learn" => Cmd::Learn(arg.to_string()),
         "/mcp" => Cmd::Mcp,
         "/export" => Cmd::Export(if arg.is_empty() { "md".into() } else { arg.to_string() }),
         "/params" => Cmd::Params,
@@ -629,6 +643,153 @@ async fn idle_step(
                                     .collect();
                                 ui.modal = ActiveModal::SessionPicker(SessionPicker::new(entries));
                             }
+                            Cmd::Memory(arg) => {
+                                let store = arccode_learn::memory::MemoryStore::new(
+                                    project_root.clone(),
+                                );
+                                if let Some(name) = arg.strip_prefix("forget ") {
+                                    match store.forget(name.trim()) {
+                                        Ok(true) => ui.transcript.push(TranscriptItem::System(
+                                            format!("forgot memory '{}'", name.trim()),
+                                        )),
+                                        Ok(false) => ui.transcript.push(TranscriptItem::Error(
+                                            format!("no memory named '{}'", name.trim()),
+                                        )),
+                                        Err(e) => ui.transcript.push(TranscriptItem::Error(
+                                            format!("/memory forget: {e}"),
+                                        )),
+                                    }
+                                } else if arg.is_empty() {
+                                    let mems = store.load_all();
+                                    if mems.is_empty() {
+                                        ui.transcript.push(TranscriptItem::System(
+                                            "(no memories yet — the agent will save them as it learns; \
+                                             you can ask it to 'remember X' to trigger one now)"
+                                                .into(),
+                                        ));
+                                    } else {
+                                        let mut out = String::from("memories:\n");
+                                        for m in mems {
+                                            out.push_str(&format!(
+                                                "  [{}] {} ({}) — {}\n",
+                                                m.mtype.as_str(),
+                                                m.name,
+                                                m.scope.label(),
+                                                m.description
+                                            ));
+                                        }
+                                        ui.transcript.push(TranscriptItem::System(out));
+                                    }
+                                } else {
+                                    ui.transcript.push(TranscriptItem::Error(
+                                        "/memory: usage is `/memory` (list) or `/memory forget <name>`"
+                                            .into(),
+                                    ));
+                                }
+                            }
+                            Cmd::Recall(query) => {
+                                if query.is_empty() {
+                                    ui.transcript.push(TranscriptItem::Error(
+                                        "/recall: usage is `/recall <query>`".into(),
+                                    ));
+                                } else {
+                                    ui.transcript.push(TranscriptItem::System(format!(
+                                        "ask the agent: \"recall_session for '{query}'\" — the \
+                                         agent will call the recall_session tool and summarise. \
+                                         (Tip: you can also just ask naturally, e.g. 'have we \
+                                         discussed {query} before?')"
+                                    )));
+                                }
+                            }
+                            Cmd::SkillStats(name) => {
+                                let stats = match arccode_learn::stats::StatsStore::open_default() {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        ui.transcript.push(TranscriptItem::Error(format!(
+                                            "/skill stats: open learn.db: {e}"
+                                        )));
+                                        draw(terminal, ui)?;
+                                        continue;
+                                    }
+                                };
+                                let mut out = String::new();
+                                if name.is_empty() {
+                                    let sum = stats.summary().unwrap_or_default();
+                                    if sum.is_empty() {
+                                        out.push_str("(no skill invocations recorded yet)");
+                                    } else {
+                                        out.push_str("skill stats:\n");
+                                        for r in sum {
+                                            let pct = (r.correction_rate() * 100.0) as u32;
+                                            let flag = if r.needs_rewrite() { " (needs rewrite)" } else { "" };
+                                            out.push_str(&format!(
+                                                "  {:<28} ok={:<4} corrected={:<4} unclear={:<4} ({pct}% corrected){flag}\n",
+                                                r.skill_name,
+                                                r.success,
+                                                r.corrected,
+                                                r.unclear,
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    let rows = stats.recent(&name, 20).unwrap_or_default();
+                                    if rows.is_empty() {
+                                        out.push_str(&format!("(no rows for '{name}')"));
+                                    } else {
+                                        out.push_str(&format!("recent invocations of '{name}':\n"));
+                                        for r in rows {
+                                            out.push_str(&format!(
+                                                "  {} {} {}\n",
+                                                r.ts,
+                                                r.outcome.as_str(),
+                                                r.signal.unwrap_or_default()
+                                            ));
+                                        }
+                                    }
+                                }
+                                ui.transcript.push(TranscriptItem::System(out));
+                            }
+                            Cmd::Learn(arg) => {
+                                let stats = match arccode_learn::stats::StatsStore::open_default() {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        ui.transcript.push(TranscriptItem::Error(format!(
+                                            "/learn: open learn.db: {e}"
+                                        )));
+                                        draw(terminal, ui)?;
+                                        continue;
+                                    }
+                                };
+                                match arg.as_str() {
+                                    "" | "status" => {
+                                        let quiet = stats.counter_get("sessions_without_save").unwrap_or(0);
+                                        let total_skills = stats.summary().map(|v| v.len()).unwrap_or(0);
+                                        let store = arccode_learn::memory::MemoryStore::new(
+                                            project_root.clone(),
+                                        );
+                                        let mem_count = store.load_all().len();
+                                        ui.transcript.push(TranscriptItem::System(format!(
+                                            "learn status:\n  \
+                                             memories: {mem_count}\n  \
+                                             tracked skills: {total_skills}\n  \
+                                             sessions without a save: {quiet}\n  \
+                                             nudges fire at: {}",
+                                            arccode_learn::proposal::NUDGE_AFTER_N_QUIET_SESSIONS,
+                                        )));
+                                    }
+                                    "reset" => {
+                                        let _ = stats.counter_set("sessions_without_save", 0);
+                                        ui.transcript.push(TranscriptItem::System(
+                                            "learn: quiet-session counter reset".into(),
+                                        ));
+                                    }
+                                    other => {
+                                        ui.transcript.push(TranscriptItem::Error(format!(
+                                            "/learn: unknown subcommand '{other}' (expected status|reset)"
+                                        )));
+                                    }
+                                }
+                            }
                             Cmd::SkillsNew(name) => {
                                 match arccode_skills::new_global_path(&name) {
                                     Ok(path) => {
@@ -972,6 +1133,10 @@ fn help_text() -> String {
          /skills                     browse and apply skills\n  \
          /skill <name>               queue a skill for the next prompt\n  \
          /skills new <name>          create a new skill in $EDITOR\n  \
+         /skill stats [name]         skill usage and outcome counts\n  \
+         /memory                     list saved memories (use 'forget <name>' to delete)\n  \
+         /recall <query>             search across past sessions\n  \
+         /learn [status|reset]       self-learning loop dashboard\n  \
          /mcp                        manage MCP servers (add / connect / remove)\n  \
          /params                     adjust temperature and max_tokens\n  \
          /resume                     resume a previous session\n  \

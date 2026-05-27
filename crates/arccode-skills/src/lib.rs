@@ -80,6 +80,14 @@ pub fn new_global_path(name: &str) -> Result<PathBuf, SkillError> {
     Ok(dir.join(format!("{name}.md")))
 }
 
+/// Path under `<project>/.arccode/skills/` where a project-scoped skill
+/// should be written. Creates the directory if missing.
+pub fn new_project_path(project_root: &Path, name: &str) -> Result<PathBuf, SkillError> {
+    let dir = ProjectPaths::discover(project_root).dir.join("skills");
+    std::fs::create_dir_all(&dir).map_err(|e| SkillError::Io(format!("{e}")))?;
+    Ok(dir.join(format!("{name}.md")))
+}
+
 /// Starter content for a brand-new skill file.
 pub fn starter_template(name: &str) -> String {
     format!(

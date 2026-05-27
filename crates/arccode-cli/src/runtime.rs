@@ -6,8 +6,13 @@
 use anyhow::{anyhow, Context, Result};
 use arccode_config::{secrets, Config, PermissionMode, ProjectPaths};
 use arccode_core::{AgentConfig, AgentLoop, Compactor, Provider, ToolOutputBudget};
-use arccode_providers::{AnthropicProvider, GeminiProvider, OpenAiCompatProvider, OpenAiVariant};
+use arccode_learn::{
+    hooks::{LearnConfig, LearnHandles},
+    memory::MemoryStore,
+};
+use arccode_providers::{AnthropicProvider, ChatGptProvider, GeminiProvider, OpenAiCompatProvider, OpenAiVariant};
 use arccode_rag::{Embedder, HashEmbedder, IndexStore, Indexer};
+use arccode_skills::Skill;
 use arccode_tools::{ToolCtx, ToolRegistry};
 use std::sync::Arc;
 
@@ -80,6 +85,10 @@ pub fn build_provider(cfg: &Config, provider_id: &str) -> Result<Arc<dyn Provide
             }
             Ok(Arc::new(p))
         }
+        "chatgpt" => {
+            let token = resolve_chatgpt_token(pc)?;
+            Ok(Arc::new(ChatGptProvider::new(token)?))
+        }
         id if openai_variant(id).is_some() => {
             let variant = openai_variant(id).unwrap();
             let key = resolve_optional_api_key(pc.api_key.as_deref(), variant);
@@ -90,8 +99,62 @@ pub fn build_provider(cfg: &Config, provider_id: &str) -> Result<Arc<dyn Provide
             Ok(Arc::new(p))
         }
         other => Err(anyhow!(
-            "provider '{other}' is not implemented yet (M2 ships Anthropic + OpenAI/OpenRouter/LM Studio/vLLM/LiteLLM/Ollama; Gemini next)"
+            "provider '{other}' is not implemented yet (M2 ships Anthropic + OpenAI/OpenRouter/LM Studio/vLLM/LiteLLM/Ollama/ChatGPT; Gemini next)"
         )),
+    }
+}
+
+/// Resolve a ChatGPT OAuth access token from the environment or keychain.
+///
+/// Token lookup order:
+///   1. `CHATGPT_ACCESS_TOKEN` env var (useful for CI / headless environments).
+///   2. Config value / `keyring:chatgpt` marker.
+///   3. OS keychain entry `"chatgpt"` directly.
+///
+/// If the token has already expired the `ChatGptProvider` will receive a 401
+/// and surface a "re-login" error. Use [`refresh_chatgpt_token_if_needed`] in
+/// async contexts (e.g., the login runner) to proactively refresh.
+fn resolve_chatgpt_token(pc: &arccode_config::ProviderConfig) -> Result<String> {
+    if let Ok(t) = std::env::var("CHATGPT_ACCESS_TOKEN") {
+        if !t.trim().is_empty() {
+            return Ok(t.trim().to_string());
+        }
+    }
+    check_config_value(pc.api_key.as_deref())
+        .or_else(|| arccode_config::secrets::load("chatgpt").ok().flatten())
+        .ok_or_else(|| {
+            anyhow!(
+                "no ChatGPT token found — run /login and choose 'ChatGPT (subscription)' \
+                 to authenticate via browser"
+            )
+        })
+}
+
+/// Attempt a silent token refresh if the stored access token is expiring.
+/// Called from async contexts (agent build, login runner) so it can safely
+/// await the HTTP call.
+pub async fn refresh_chatgpt_token_if_needed() {
+    let access = match arccode_config::secrets::load("chatgpt").ok().flatten() {
+        Some(t) => t,
+        None => return,
+    };
+    if !crate::oauth::token_is_expiring(&access, 300) {
+        return;
+    }
+    let refresh = match arccode_config::secrets::load("chatgpt_refresh").ok().flatten() {
+        Some(r) => r,
+        None => return,
+    };
+    tracing::info!("chatgpt access token expiring; attempting silent refresh");
+    match crate::oauth::refresh_chatgpt_token(&refresh).await {
+        Ok((new_access, new_refresh)) => {
+            let _ = arccode_config::secrets::store("chatgpt", &new_access);
+            let _ = arccode_config::secrets::store("chatgpt_refresh", &new_refresh);
+            tracing::info!("chatgpt token refreshed successfully");
+        }
+        Err(e) => {
+            tracing::warn!("chatgpt silent refresh failed: {e}");
+        }
     }
 }
 
@@ -162,7 +225,16 @@ fn looks_like_placeholder(s: &str) -> bool {
     s.trim().starts_with("${") && s.trim().ends_with('}')
 }
 
+#[allow(dead_code)] // kept as a public API for callers that don't need learn handles
 pub async fn build_registry(cfg: &Config, mode: PermissionMode) -> Result<ToolRegistry> {
+    build_registry_with_learn(cfg, mode, None).await
+}
+
+pub async fn build_registry_with_learn(
+    cfg: &Config,
+    mode: PermissionMode,
+    learn: Option<Arc<LearnHandles>>,
+) -> Result<ToolRegistry> {
     let cwd = std::env::current_dir()?;
     let paths = ProjectPaths::discover(&cwd);
     let ctx = ToolCtx::new_with_config(
@@ -172,8 +244,63 @@ pub async fn build_registry(cfg: &Config, mode: PermissionMode) -> Result<ToolRe
         cfg.tools.shell_denylist.clone(),
     );
     let mut reg = ToolRegistry::new(ctx).with_builtins();
-    if let Some(indexer) = build_indexer(&paths)? {
-        reg = reg.with_semantic_search(indexer);
+    let indexer = build_indexer(&paths)?;
+    if let Some(idx) = indexer.clone() {
+        reg = reg.with_semantic_search(idx);
+    }
+
+    if let Some(handles) = learn {
+        let embedder = pick_embedder();
+        // Open the global sessions index (cross-project recall).
+        let sess_store = match arccode_learn::session_index::open_global_store(&*embedder) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!("disabling cross-project session recall: {e}");
+                None
+            }
+        };
+        // Backfill any unindexed sessions in the background so the user
+        // can immediately recall recent work.
+        if let Some(store) = sess_store.clone() {
+            let emb = embedder.clone();
+            let root = paths.root.clone();
+            tokio::spawn(async move {
+                match arccode_learn::session_index::backfill_project_sessions(
+                    &root, &store, &*emb,
+                )
+                .await
+                {
+                    Ok(n) if n > 0 => {
+                        tracing::info!("backfilled {n} session(s) into sessions.db")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("session backfill failed: {e}"),
+                }
+            });
+        }
+        reg.register(arccode_tools::builtin::SaveMemory::new(
+            handles.memory.clone(),
+            handles.signals.clone(),
+        ));
+        reg.register(arccode_tools::builtin::RecallMemory::new(
+            handles.memory.clone(),
+        ));
+        reg.register(arccode_tools::builtin::ForgetMemory::new(
+            handles.memory.clone(),
+        ));
+        reg.register(arccode_tools::builtin::InvokeSkill::new(
+            paths.root.clone(),
+            handles.stats.clone(),
+            handles.signals.clone(),
+            handles.hook.config().session_id.clone(),
+        ));
+        if let Some(store) = sess_store.clone() {
+            reg.register(arccode_tools::builtin::RecallSession::new(
+                store,
+                embedder.clone(),
+            ));
+        }
+        reg.register(arccode_tools::builtin::ReadSession::new(paths.root.clone()));
     }
     // MCP servers are connected later via [`McpRegistry::seed`] so the
     // shared `Arc<ToolRegistry>` can be reached from the TUI for runtime
@@ -198,6 +325,11 @@ pub fn build_indexer(paths: &ProjectPaths) -> Result<Option<Arc<Indexer>>> {
         embedder,
         Arc::new(store),
     ))))
+}
+
+/// Public wrapper around `pick_embedder` for callers outside this module.
+pub fn pick_embedder_pub() -> Arc<dyn Embedder> {
+    pick_embedder()
 }
 
 fn pick_embedder() -> Arc<dyn Embedder> {
@@ -236,9 +368,51 @@ pub async fn build_agent_and_registry(
     selection: &Selection,
     mode: PermissionMode,
 ) -> Result<(AgentLoop, Arc<ToolRegistry>)> {
+    let (agent, registry, _learn) = build_agent_registry_learn(cfg, selection, mode).await?;
+    Ok((agent, registry))
+}
+
+/// Full variant that also returns the [`LearnHandles`] so callers (TUI / CLI)
+/// can poke the memory store, stats db, or trigger session indexing.
+pub async fn build_agent_registry_learn(
+    cfg: &Config,
+    selection: &Selection,
+    mode: PermissionMode,
+) -> Result<(AgentLoop, Arc<ToolRegistry>, Option<Arc<LearnHandles>>)> {
+    // Proactively refresh the ChatGPT token before building the provider.
+    if selection.provider_id == "chatgpt" {
+        refresh_chatgpt_token_if_needed().await;
+    }
     let provider = build_provider(cfg, &selection.provider_id)?;
-    let registry = Arc::new(build_registry(cfg, mode).await?);
-    let system = build_system_prompt(mode);
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let paths = ProjectPaths::discover(&cwd);
+
+    // Build the learn hook first so we can hand its memory/stats handles to
+    // the tool registry (some tools need to read/write them).
+    let session_id = format!(
+        "session-{}",
+        chrono_like_now()
+    );
+    let learn_cfg = LearnConfig::new(paths.root.clone(), session_id);
+    let learn = match LearnHandles::build(learn_cfg) {
+        Ok(h) => Some(Arc::new(h)),
+        Err(e) => {
+            tracing::warn!("disabling learning loop: {e}");
+            None
+        }
+    };
+
+    let registry = Arc::new(build_registry_with_learn(cfg, mode, learn.clone()).await?);
+
+    // Compose the system prompt: base + memory index + skills catalog.
+    let memory_store = learn
+        .as_ref()
+        .map(|l| l.memory.clone())
+        .unwrap_or_else(|| Arc::new(MemoryStore::new(paths.root.clone())));
+    let skills = arccode_skills::load_all(&paths.root);
+    let system = build_system_prompt_full(mode, &memory_store, &skills);
+
     let agent_cfg = AgentConfig {
         model: selection.model.clone(),
         system: Some(system),
@@ -247,21 +421,89 @@ pub async fn build_agent_and_registry(
             trigger_tokens: cfg.tokens.compact_at_tokens,
             ..Default::default()
         },
+        learning: learn
+            .as_ref()
+            .map(|l| l.hook.clone() as Arc<dyn arccode_core::LearningHook>),
         ..Default::default()
     };
     let agent = AgentLoop::new(provider, registry.clone(), agent_cfg);
-    Ok((agent, registry))
+    Ok((agent, registry, learn))
 }
 
+fn chrono_like_now() -> String {
+    // Avoid pulling chrono just for this — use the system clock.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("{ts}")
+}
+
+#[allow(dead_code)] // kept as a back-compat helper for headless / json mode
 pub fn build_system_prompt(mode: PermissionMode) -> String {
+    // Kept for backwards compatibility (e.g. headless / json mode that
+    // doesn't load memory). Real chat mode uses `build_system_prompt_full`.
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "<unknown>".to_string());
+    base_prompt(mode, &cwd)
+}
+
+/// Compose the full system prompt, including memory index + available skills
+/// + recall/save hints. Memory bodies are NOT included inline — the agent
+/// uses `recall_memory` to fetch them on demand.
+pub fn build_system_prompt_full(
+    mode: PermissionMode,
+    memory: &MemoryStore,
+    skills: &[Skill],
+) -> String {
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    let mut s = base_prompt(mode, &cwd);
+
+    let memories = memory.load_all();
+    if let Some(block) = arccode_learn::memory::render_prompt_block(&memories) {
+        s.push('\n');
+        s.push_str(&block);
+    }
+
+    if !skills.is_empty() {
+        s.push('\n');
+        s.push_str("# Available skills\n");
+        for sk in skills {
+            s.push_str(&format!(
+                "- {} — {} [{}]\n",
+                sk.name,
+                truncate_line(&sk.description, 140),
+                sk.source.label(),
+            ));
+        }
+        s.push_str(
+            "(Call the `invoke_skill` tool with a name to inject the full skill body for the next turn.)\n",
+        );
+    }
+
+    s
+}
+
+fn truncate_line(s: &str, max: usize) -> String {
+    let one = s.replace(['\n', '\r'], " ");
+    if one.chars().count() <= max {
+        return one;
+    }
+    let mut out: String = one.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn base_prompt(mode: PermissionMode, cwd: &str) -> String {
     format!(
-        "You are arccode, a terminal coding agent. You help the user inspect, \
+        "You are arccode, a self-improving terminal coding agent. You help the user inspect, \
          edit, and run code from the command line.\n\
          \n\
-         Available tools: semantic_search, read_file, write_file, edit_file, run_shell, list_dir, glob, grep.\n\
+         Available tools include: semantic_search, read_file, write_file, edit_file, run_shell, \
+         list_dir, glob, grep, save_memory, recall_memory, invoke_skill, recall_session, read_session.\n\
          \n\
          Style rules:\n\
          - For \"where is X\" or \"how does Y work\" questions, call `semantic_search` first \
@@ -272,6 +514,14 @@ pub fn build_system_prompt(mode: PermissionMode) -> String {
          - Edit with `edit_file` and include enough surrounding context that `old_string` is unique.\n\
          - Verify your edits when reasonable (compile, run a test, re-read the diff).\n\
          - Be concise. Don't restate what the diff already shows.\n\
+         \n\
+         Self-improvement:\n\
+         - When the user says \"remember\", \"save this\", \"from now on\", or expresses a stable \
+         preference, call `save_memory` so the next session has it.\n\
+         - When the user asks \"have we discussed this before\" or \"how did we fix X last time\", \
+         call `recall_session` first.\n\
+         - When a skill from the catalog below clearly applies, call `invoke_skill` to load it; \
+         performing the task well in the resulting turn improves its usage stats.\n\
          \n\
          Environment:\n\
          - Working directory: {cwd}\n\
