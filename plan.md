@@ -52,6 +52,317 @@ This builds on existing pieces:
 
 ---
 
+## Unified Pilot Mode (authoritative model)
+
+The split between an "autonomous" product and a "Jarvis" product collapses
+into a single surface: **pilot mode**. Jarvis-tier capabilities (daemon,
+critic, sandboxing, knowledge graph, tool synthesis) are layered
+capabilities on top of the same orchestrator — not a separate product.
+The user picks a **tier** that defines how much rope the agent gets, and
+optionally toggles individual capabilities to deviate from the tier's
+defaults.
+
+Everything below this section (User-facing surface, Data model,
+Architecture, Phases 1–13, E1–E13, J1–J15) remains the source of truth
+for *how* each capability is built. This section defines *how they
+compose into one product.*
+
+### Naming & CLI surface (replaces `arccode autonomous`)
+
+Subcommand: `pilot`. The legacy `arccode autonomous` becomes a hidden
+alias that prints a deprecation notice and forwards to `arccode pilot`,
+removed at M4.
+
+```text
+arccode pilot <GOAL> [OPTIONS]              # run a goal end-to-end
+arccode pilot daemon                        # start the always-on watcher (autopilot)
+arccode pilot status [<run-id>]             # active runs, history, daemon queue
+arccode pilot tell <run-id> "<message>"     # inject a message into a live run
+arccode pilot ask  <run-id> "<question>"    # block on an answer from a run
+arccode pilot abort <run-id>                # graceful stop, leave worktrees
+arccode pilot resume <run-id>               # restart an interrupted run
+arccode pilot queue list|drop|prioritize    # manage daemon's pending goals
+
+OPTIONS
+  --tier <assist|copilot|autopilot>   # capability tier (default: copilot)
+  --plan-only                             # plan, write tasks.jsonl, exit
+  --watch                                 # tail the run in this terminal
+  --yes                                   # auto-approve regardless of tier
+  --review                                # force hard plan-approval gate
+  --sandbox <host|container|vm>           # override sandbox tier per run
+  --max-usd <FLOAT> --max-agents <N>      # per-run budget caps
+  --base <REV>                            # branch from REV instead of HEAD
+  --channel <none|desktop|slack|email>    # where notifications are sent
+  --no-pr                                 # skip PR creation, just push
+```
+
+### Capability tiers
+
+Tiers are named for *your* role in the cockpit, not the agent's. Each
+tier is a strict superset of the previous one. Tier sets defaults only —
+every capability is independently togglable via `[pilot.capabilities]`.
+
+```
+┌─────────────┬─────────────────────────────────────────────────────────┐
+│ assist      │ You are pilot-in-command. Agent plans, you approve     │
+│             │ interactively, agent executes one run, opens PR, exits.│
+│             │ No daemon, no critic, no cross-run learning.           │
+│             │ Use when: trying pilot mode out, sensitive repo, you   │
+│             │ want to be in the loop.                                │
+├─────────────┼─────────────────────────────────────────────────────────┤
+│ copilot     │ Default. Agent flies; you monitor and intervene at     │
+│             │ decision points. Trust-tiered approval, self-healing   │
+│             │ retries, per-task reviewer, real verification, PR      │
+│             │ automation, cross-run learning. Talks to you only when │
+│             │ stuck or crossing risk thresholds.                     │
+│             │ Use when: most day-to-day goals.                       │
+├─────────────┼─────────────────────────────────────────────────────────┤
+│ autopilot   │ Agent flies and navigates; you're not in the cockpit   │
+│             │ unless an alarm trips. Adds daemon mode, multi-channel │
+│             │ intake, critic agent, project knowledge graph, tool    │
+│             │ synthesis, sandboxed execution, mid-run conversational │
+│             │ interjection. Finds work without being asked, reports  │
+│             │ proactively, runs continuously.                        │
+│             │ Use when: trusted repo, well-tuned config, you want    │
+│             │ work to flow without invocation.                       │
+└─────────────┴─────────────────────────────────────────────────────────┘
+```
+
+The metaphor isn't decorative — it enforces the J15 framing. Pilots have
+checklists, abort criteria, and a flight envelope they don't exit.
+Autopilot is bounded operation, not omniscience.
+
+### Tier → capability matrix
+
+Capabilities cross-reference the existing E1–E13 and J1–J15 specs lower
+in this document. ✓ = on by default at this tier; — = off by default
+(still individually togglable).
+
+| Capability                                       | assist | copilot | autopilot |
+| ------------------------------------------------ | :-----: | :--------: | :-------: |
+| Two-pass repo-aware planner (E2)                 |    ✓    |     ✓      |     ✓     |
+| Executable acceptance + self-verify (E3)         |    ✓    |     ✓      |     ✓     |
+| Worktree + integration branch (Phase 5)          |    ✓    |     ✓      |     ✓     |
+| Hard plan approval (Phase 2)                     |    ✓    |     —      |     —     |
+| Hard escalation triggers (J15)                   |    ✓    |     ✓      |     ✓     |
+| Trust-tiered approval (E1)                       |    —    |     ✓      |     ✓     |
+| Self-healing retry ladder + check-gate (E5)      |    —    |     ✓      |     ✓     |
+| Conflict avoidance + rebase-as-you-go (E4)       |    —    |     ✓      |     ✓     |
+| Per-task reviewer (E7)                           |    —    |     ✓      |     ✓     |
+| PR auto-body + conditional auto-merge (E8)       |    —    |     ✓      |     ✓     |
+| Real verification — run/screenshot/http (J6)     |    —    |     ✓      |     ✓     |
+| Cross-run learning + adaptive routing (E6)       |    —    |     ✓      |     ✓     |
+| Manager↔worker IPC (E10)                         |    —    |     ✓      |     ✓     |
+| Mid-run user interjection (J4)                   |    —    |     ✓      |     ✓     |
+| Cost/risk estimation with confidence (J9)        |    —    |     ✓      |     ✓     |
+| Mandatory checkpoint hygiene (E11)               |    —    |     ✓      |     ✓     |
+| Goal negotiation + challenge (J1)                |    —    |     —      |     ✓     |
+| Daemon discovery (J2)                            |    —    |     —      |     ✓     |
+| Multi-channel intake (J3)                        |    —    |     —      |     ✓     |
+| Proactive status reporting (J5)                  |    —    |     —      |     ✓     |
+| Tool synthesis (J7)                              |    —    |     —      |     ✓     |
+| Project knowledge graph (J8)                     |    —    |     —      |     ✓     |
+| Critic agent (J10)                               |    —    |     —      |     ✓     |
+| Sandboxed execution tiers (J11)                  |    —    |     —      |     ✓     |
+| Skill packs (J12)                                |    —    |     —      |     ✓     |
+| Real-time watcher hooks (J13)                    |    —    |     —      |     ✓     |
+| Voice intake (J14, opt-in)                       |    —    |     —      |     ✓     |
+
+A `copilot` user who wants only the critic agent without going to
+full autopilot writes:
+
+```toml
+[pilot]
+tier = "copilot"
+
+[pilot.capabilities]
+critic = true
+```
+
+### Unified config schema (replaces `[autonomous.*]`)
+
+```toml
+[pilot]
+tier                     = "copilot"            # assist | copilot | autopilot
+default_model            = "claude-opus-4-7"       # manager, reviewers, critic
+worker_model             = "claude-haiku-4-5"      # workers
+max_concurrent_agents    = 4
+max_usd                  = 10.0
+task_timeout_secs        = 1800
+turn_gate_cmd            = "cargo check --workspace"
+
+[pilot.approval]
+auto_approve_usd         = 1.00
+auto_approve_max_tasks   = 5
+auto_approve_globs       = ["crates/**/*.rs", "docs/**", "README.md"]
+dangerous_paths          = ["**/migrations/**", ".github/**",
+                            "**/auth/**", "**/secrets*", "Cargo.lock"]
+notify_only_window_secs  = 60
+notify_channel           = "desktop"
+
+[pilot.pr]
+auto_merge               = true
+auto_merge_max_severity  = "low"
+require_ci_green         = true
+
+[pilot.sandbox]
+default_tier             = "host"                  # host | container | vm
+container_image          = "arccode/sandbox:latest"
+vm_provider              = "firecracker"           # firecracker | qemu | cloud
+
+[pilot.daemon]                                        # autopilot only
+enabled                  = true
+poll_interval_secs       = 300
+auto_threshold           = 0.75
+max_concurrent_runs      = 2
+trusted_authors          = ["vedantnimbarte"]
+trusted_labels           = ["arccode:auto"]
+sources                  = ["github_issues", "ci_failures",
+                            "dependabot", "todos", "coverage_gaps"]
+
+[pilot.intake]                                        # autopilot
+channels                 = ["cli", "github_issue", "github_comment",
+                            "slack", "email", "webhook", "file_drop"]
+[pilot.intake.slack]
+webhook_url              = "https://hooks.slack.com/..."
+trigger_pattern          = "@arccode"
+[pilot.intake.email]
+address                  = "arccode+arc-code@example.com"
+[pilot.intake.voice]
+enabled                  = false
+
+[pilot.refine]                                        # autopilot
+max_clarifying_questions = 3
+challenge_threshold      = "medium"
+suggest_alternatives     = true
+
+[pilot.skills]
+packs                    = ["arccode-official/rust-developer@1.4",
+                            "arccode-official/security-reviewer@2.0"]
+
+[pilot.capabilities]                                  # per-capability override
+# critic         = true     # turn on a capability that's off in the tier
+# tool_synthesis = false    # turn off one that's on in the tier
+```
+
+### One lifecycle, tier-conditional branches
+
+```
+goal arrives
+  │
+  ├── tier ∈ {assist, copilot}  → CLI only
+  └── tier = autopilot              → CLI + J3 intake adapters
+  │
+  ▼
+trust check (author, source, content allowlist)
+  │
+  ▼
+clarify + challenge (J1)           ── autopilot only
+  │
+  ▼
+plan + critique (E2)
+  │
+  ▼
+estimate cost / risk / confidence (J9)
+  │
+  ▼
+approval gate
+  ├── assist      → always hard prompt (Phase 2)
+  ├── copilot   → trust-tiered (E1): auto | notify-only | hard
+  └── autopilot    → trust-tiered + auto on high daemon score
+  │
+  ▼
+schedule + execute
+  ├── write-set scheduler (E4)
+  ├── per-turn check-gate (E5)
+  ├── workers in worktrees (Phases 3, 5)
+  ├── sandbox tier per task (J11, autopilot)
+  └── critic shadow (J10, autopilot)
+  │
+  ▼
+per-task review (E7)
+  └── + critic re-review (J10, autopilot)
+  │
+  ▼
+rebase-as-you-go merge into integration branch (E4)
+  │
+  ▼
+PR automation (E8)
+  └── auto-merge gated by tier + J15 escalation rules
+  │
+  ▼
+post-run learning
+  ├── stats + lessons (E6)
+  └── knowledge graph update (J8, autopilot)
+  │
+  ▼
+report
+  ├── assist, copilot → completion print + notify channel
+  └── autopilot           → proactive status push (J5)
+```
+
+### Consolidated milestones (supersedes Phases 1–13 grouping)
+
+Same work as before; regrouped so each milestone ships a *usable tier*
+rather than a horizontal slice.
+
+| Milestone | Ships tier   | Folds in                                                                                              |
+| --------- | ------------ | ----------------------------------------------------------------------------------------------------- |
+| **M1**    | `assist`    | Phases 1–8: scaffolding, planner, worker subprocess, manager, worktree+merge, PR, TUI, provider matrix |
+| **M2**    | `copilot` | Phases 7.5–7.9 folded in: E1, E2, E3, E4, E5, E6, E7, E8, E10, E11, J6, J9, J15                       |
+| **M3**    | `autopilot`  | Phases 9–12 folded in: J1, J2, J3, J4, J5, J7, J8, J10, J11, J12, J13                                 |
+| **M4**    | polish       | J14 voice, skill pack registry, daemon dashboards, perf tuning, removal of `autonomous` alias         |
+
+Default tier at each milestone:
+
+- M1 → `assist` (only tier that exists)
+- M2 → `copilot` (becomes default; `assist` still selectable)
+- M3 → `copilot` (autopilot exists but is opt-in)
+- M4 → `copilot` (no default change; autopilot remains opt-in)
+
+### Migration & deprecation
+
+- `arccode autonomous <GOAL>` → hidden alias for `arccode pilot <GOAL>`
+  from M1 through M3, prints a one-line deprecation notice. Removed at M4.
+- `[autonomous]` config section is auto-migrated into `[pilot]` on first
+  read with a warning; values map 1:1 (e.g.
+  `autonomous.max_concurrent_agents` → `pilot.max_concurrent_agents`).
+- `tasks.jsonl` / `state.json` schemas are unchanged — unification
+  happens at the CLI and config layer, not at the run-store layer.
+- Existing TUI commands (`/autonomous status|abort|resume`) become
+  aliases for `/pilot status|abort|resume`.
+
+### Why one mode beats two
+
+- **One mental model.** Users learn one subcommand, one config tree, one
+  set of statuses. Tier is a knob, not a fork in the road.
+- **Smooth onboarding.** Start at `assist`, build trust, flip to
+  `copilot`, opt into `autopilot` when ready. No rewrite to "upgrade."
+- **The metaphor does work.** `assist / copilot / autopilot` names the
+  *user's* seat, not the agent's capability level. It tells new users
+  exactly what their job is at each tier, and it borrows aviation's
+  built-in cultural understanding that autopilot ≠ unsupervised — it's
+  bounded operation with abort criteria. Cleaner than "god mode," which
+  would have suggested the opposite of what J15 enforces.
+- **Composable capabilities.** Power users mix tiers and per-capability
+  overrides; defaults stay safe.
+- **No duplicate plumbing.** Daemon, critic, sandbox, knowledge graph
+  are layers over the same orchestrator; splitting them out would mean
+  two run-stores, two TUIs, two PR flows, two sets of provider tests.
+- **Honest framing.** There is no separate "Jarvis product." The agent
+  is the same; how much rope you give it is the tier.
+
+---
+
+> **Note:** the remainder of this document — User-facing surface, Data
+> model, Architecture, Phases 1–13, E1–E13, J1–J15 — is the per-feature
+> spec that the Pilot Mode tiers above reference. Treat the matrix as
+> authoritative when there's any disagreement about *what ships at what
+> tier*; treat the sections below as authoritative for *how each piece
+> is built.*
+
+---
+
 ## User-facing surface
 
 ### CLI
@@ -628,15 +939,43 @@ the TUI dashboard but render flat). For users who want to observe a run
 without opening the full TUI. Default behavior remains background-style
 streaming as in the current plan.
 
-### E13. Drop `designer` from v1; add `refactorer` and `merge-fixer`
+### E13. Role lineup: scope `designer` to UI work; add `refactorer` and `merge-fixer`
 
-(Promotes Open Question #1 to a decision.)
+(Resolves Open Question #1.)
 
-Shipped roles: `developer`, `tester`, `reviewer`, `refactorer`,
-`merge-fixer`. `designer` deferred until there's a concrete artifact
-it produces on a TUI codebase. `refactorer` exists because the splitter
-ladder (E5 rung 3) often produces "extract helper" tasks that are
-better routed to a refactor-specialized prompt than to `developer`.
+Shipped roles: `developer`, `designer`, `tester`, `reviewer`,
+`refactorer`, `merge-fixer`.
+
+- **`designer`** — scoped to **UI design for websites and web
+  applications**. Activated by the planner whenever a task touches user-
+  facing UI: HTML/CSS/JS, React/Vue/Svelte components, Tailwind / design-
+  system files, static page layouts, or visual assets. Produces:
+  component markup + styles, layout structure, design-token / theme
+  values, responsive breakpoints, accessibility annotations. Has the
+  `frontend-design` skill loaded by default and runs in a worktree
+  where it can spin up the dev server (via the `run` skill) to verify
+  what it built actually renders.
+
+  The planner detects "UI work" via globs configured in
+  `[pilot.roles.designer].ui_globs` (defaults:
+  `["**/*.html", "**/*.css", "**/*.tsx", "**/*.jsx", "**/*.vue",
+  "**/*.svelte", "public/**", "static/**", "styles/**"]`) plus an LLM
+  classifier on the goal text ("design a landing page", "build a
+  dashboard"). For Rust TUI work the planner routes to `developer`,
+  not `designer` — the role exists for actual UI rendering surfaces,
+  not for ratatui layout.
+
+- **`refactorer`** — handles tasks produced by the E5 splitter ladder
+  (rung 3). Specialized prompt for "extract helper", "rename across
+  files", "move module" work that `developer` does worse as a sideline.
+
+- **`merge-fixer`** — resolves merge conflicts during rebase-as-you-go
+  (E4) before escalating to the user.
+
+Documentation work (changelog entries, README updates, API docs)
+remains a `developer` responsibility — E8's auto-PR-body handles the
+mechanical pieces, and standalone "write the docs" tasks aren't common
+enough to justify a dedicated role.
 
 ---
 
@@ -649,7 +988,7 @@ These overrides replace the corresponding rows in "Opinionated defaults":
 | Approval flow         | Trust-tiered (E1); hard gate only for risky plans                        |
 | Conflict strategy     | Write-set scheduling + rebase-as-you-go + auto merge-fixer (E4)          |
 | Failure policy        | 4-rung retry ladder with auto-splitting (E5); per-turn check-gate        |
-| Agent roles shipped   | `developer`, `tester`, `reviewer`, `refactorer`, `merge-fixer` (E13)     |
+| Agent roles shipped   | `developer`, `designer`, `tester`, `reviewer`, `refactorer`, `merge-fixer` (E13) |
 | Reviewer placement    | Per-task reviewer (E7); final reviewer only for cross-cutting concerns   |
 | PR finalization       | Auto-`arccode review` + auto-generated body + conditional auto-merge (E8) |
 | Manager↔worker IPC    | Bidirectional via stdin command channel (E10)                            |
@@ -1095,10 +1434,10 @@ removing them.
 
 These don't block writing code today, but flag them before merging:
 
-1. **Designer agent on a Rust TUI codebase**: what does "designer" actually
-   produce? Mockups in markdown? Theme palette TOML? Worth narrowing the
-   role definition in `~/.arccode/agents/designer.md` to "ratatui visual
-   style + UX flow" rather than "graphic design".
+1. ~~**Designer agent on a Rust TUI codebase**~~ — **Resolved in E13.**
+   `designer` is scoped to web/UI work (HTML/CSS/JS, components,
+   design tokens), activated by planner via `ui_globs` + goal
+   classifier. TUI work routes to `developer`.
 2. **Manager → worker IPC after spawn**: do we need bidirectional comms
    (manager sends "pivot, the schema changed"), or is one-shot dispatch
    enough? Plan currently assumes one-shot; `message_agent` exists as a
