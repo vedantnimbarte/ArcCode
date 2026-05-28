@@ -10,6 +10,7 @@ pub mod manager;
 pub mod model;
 pub mod orchestrator;
 pub mod planner;
+pub mod pr;
 pub mod role;
 pub mod store;
 pub mod tools;
