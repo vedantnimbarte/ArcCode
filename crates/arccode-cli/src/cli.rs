@@ -241,6 +241,18 @@ pub enum PilotAction {
         #[arg(long, default_value_t = 250)]
         interval_ms: u64,
     },
+    /// Resume an interrupted run.
+    ///
+    /// Loads the run's existing tasks.jsonl + state.json, marks any tasks
+    /// stuck in InProgress (whose worker is gone) as Failed so the retry
+    /// watchdog picks them up, and resumes the manager loop from there.
+    Resume {
+        /// Run id under `<project>/.arccode/autonomous/`.
+        run_id: String,
+        /// Skip `gh pr create` (just push the branch on completion).
+        #[arg(long)]
+        no_pr: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -434,6 +446,10 @@ pub async fn run() -> Result<ExitCode> {
             PilotAction::Status { run_id } => commands::pilot::status(run_id).await,
             PilotAction::Watch { run_id, interval_ms } => {
                 commands::pilot::watch(run_id, interval_ms).await
+            }
+            PilotAction::Resume { run_id, no_pr } => {
+                let cfg = load_config()?;
+                commands::pilot::resume(cfg, run_id, no_pr, cli.model).await
             }
         },
         Some(Command::Autonomous {

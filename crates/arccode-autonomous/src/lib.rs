@@ -10,6 +10,7 @@ pub mod dashboard;
 pub mod manager;
 pub mod model;
 pub mod orchestrator;
+pub mod pipeline;
 pub mod planner;
 pub mod pr;
 pub mod provider_support;

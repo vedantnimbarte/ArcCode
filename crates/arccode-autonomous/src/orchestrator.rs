@@ -268,6 +268,11 @@ pub struct OrchestratorConfig {
     /// the orchestrator refuses new assignments and the budget watchdog
     /// (spawned alongside the actor) aborts in-flight workers. 0 = disabled.
     pub max_usd: f64,
+    /// Per-task retry budget for the auto-retry watchdog. When a task hits
+    /// `Failed` and its retry count is below this, the orchestrator
+    /// auto-reassigns it (rung-2 of the E5 ladder). Plan.md proposes 1 by
+    /// default; the rest of the retry ladder lands in M2/E5.
+    pub max_retries_per_task: u32,
 }
 
 impl Default for OrchestratorConfig {
@@ -280,6 +285,7 @@ impl Default for OrchestratorConfig {
             base_commit: String::new(),
             use_real_worktrees: false,
             max_usd: 10.0,
+            max_retries_per_task: 1,
         }
     }
 }
@@ -294,7 +300,8 @@ pub fn spawn(
 ) -> (OrchestratorHandle, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(64);
     let handle = OrchestratorHandle { tx: tx.clone() };
-    let broadcast_rx = store.subscribe();
+    let budget_rx = store.subscribe();
+    let retry_rx = store.subscribe();
     let store = Arc::new(Mutex::new(store));
 
     // Budget watchdog: subscribes to the store's broadcast channel and
@@ -303,13 +310,29 @@ pub fn spawn(
     // watchdog catches the case where a task starts cheap and a later
     // turn pushes us over.
     if cfg.max_usd > 0.0 {
-        let watchdog_tx = tx;
+        let watchdog_tx = tx.clone();
         let cap = cfg.max_usd;
         let store_for_watchdog = store.clone();
-        tokio::spawn(budget_watchdog(broadcast_rx, store_for_watchdog, cap, watchdog_tx));
+        tokio::spawn(budget_watchdog(
+            budget_rx,
+            store_for_watchdog,
+            cap,
+            watchdog_tx,
+        ));
     } else {
-        // Drop the subscription so the channel doesn't pile up.
-        drop(broadcast_rx);
+        drop(budget_rx);
+    }
+
+    // Retry watchdog: subscribes to TaskStatus events. When a task
+    // transitions to Failed, if it has retry budget left, auto-reassign it
+    // (rung 2 of plan.md's E5 ladder). Rung 3+ (splitter, hard escalation)
+    // lives in the manager loop and lands in M2.
+    if cfg.max_retries_per_task > 0 {
+        let watchdog_tx = tx;
+        let max_retries = cfg.max_retries_per_task;
+        tokio::spawn(retry_watchdog(retry_rx, max_retries, watchdog_tx));
+    } else {
+        drop(retry_rx);
     }
 
     let join = tokio::spawn(run_actor(store, cfg, spawner, rx));
@@ -356,6 +379,59 @@ async fn budget_watchdog(
                     }
                     return;
                 }
+            }
+            Ok(_) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+/// Background task: when a task transitions to Failed, auto-reassign it
+/// up to `max_retries` times. Tracks per-task retry counts in-process —
+/// the run-store doesn't need to know about retries; only the watchdog
+/// does. If the orchestrator restarts mid-run, retry counts reset, which
+/// is the conservative behaviour (one more shot on resume).
+async fn retry_watchdog(
+    mut events: tokio::sync::broadcast::Receiver<Event>,
+    max_retries: u32,
+    orch: mpsc::Sender<OrchestratorCommand>,
+) {
+    use std::collections::HashMap;
+    let mut retries: HashMap<String, u32> = HashMap::new();
+    loop {
+        match events.recv().await {
+            Ok(Event::TaskStatus {
+                id,
+                status: TaskStatus::Failed,
+                ..
+            }) => {
+                let attempts = retries.entry(id.clone()).or_insert(0);
+                if *attempts >= max_retries {
+                    tracing::warn!(
+                        target: "pilot::retry",
+                        task = %id,
+                        attempts,
+                        max_retries,
+                        "task exhausted retry budget; leaving Failed"
+                    );
+                    continue;
+                }
+                *attempts += 1;
+                let attempt = *attempts;
+                tracing::info!(
+                    target: "pilot::retry",
+                    task = %id,
+                    attempt,
+                    "auto-reassigning failed task"
+                );
+                let (reply, _) = oneshot::channel();
+                let _ = orch
+                    .send(OrchestratorCommand::Reassign {
+                        task_id: id,
+                        reply,
+                    })
+                    .await;
             }
             Ok(_) => continue,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -693,6 +769,104 @@ async fn handle_finalize(
     Ok(())
 }
 
+/// Test helper: spawner that fails the first invocation for each task,
+/// succeeds on the second. Exercises the auto-retry watchdog.
+#[cfg(test)]
+pub fn fake_flaky_spawner() -> WorkerSpawner {
+    use std::sync::Mutex;
+    let attempts: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    Arc::new(move |ctx: SpawnContext| {
+        let attempts = attempts.clone();
+        Box::pin(async move {
+            let n = {
+                let mut m = attempts.lock().unwrap();
+                let n = m.entry(ctx.task.id.clone()).or_insert(0);
+                *n += 1;
+                *n
+            };
+            {
+                let mut store = ctx.store.lock().await;
+                let _ = store
+                    .append(Event::AgentSpawn {
+                        t: RunStore::now(),
+                        agent: ctx.agent_id.clone(),
+                        role: ctx.task.role.clone(),
+                        pid: Some(0),
+                        session_id: Some(ctx.session_id.clone()),
+                    })
+                    .await;
+                let _ = store
+                    .append(Event::AgentStatus {
+                        t: RunStore::now(),
+                        agent: ctx.agent_id.clone(),
+                        status: AgentStatus::InProgress,
+                    })
+                    .await;
+                let _ = store
+                    .append(Event::TaskStatus {
+                        t: RunStore::now(),
+                        id: ctx.task.id.clone(),
+                        status: TaskStatus::InProgress,
+                        outcome: None,
+                    })
+                    .await;
+            }
+            if n == 1 {
+                // First attempt fails.
+                let mut store = ctx.store.lock().await;
+                let _ = store
+                    .append(Event::TaskStatus {
+                        t: RunStore::now(),
+                        id: ctx.task.id.clone(),
+                        status: TaskStatus::Failed,
+                        outcome: None,
+                    })
+                    .await;
+                let _ = store
+                    .append(Event::AgentStatus {
+                        t: RunStore::now(),
+                        agent: ctx.agent_id.clone(),
+                        status: AgentStatus::Failed,
+                    })
+                    .await;
+                Ok(WorkerSpawnResult {
+                    agent_id: ctx.agent_id,
+                    status: TaskStatus::Failed,
+                    outcome: None,
+                })
+            } else {
+                let outcome = TaskOutcome {
+                    summary: format!("Retry-attempt {n} succeeded for {}", ctx.task.id),
+                    files_changed: ctx.task.writes.clone(),
+                };
+                {
+                    let mut store = ctx.store.lock().await;
+                    let _ = store
+                        .append(Event::TaskStatus {
+                            t: RunStore::now(),
+                            id: ctx.task.id.clone(),
+                            status: TaskStatus::Review,
+                            outcome: Some(outcome.clone()),
+                        })
+                        .await;
+                    let _ = store
+                        .append(Event::AgentStatus {
+                            t: RunStore::now(),
+                            agent: ctx.agent_id.clone(),
+                            status: AgentStatus::Done,
+                        })
+                        .await;
+                }
+                Ok(WorkerSpawnResult {
+                    agent_id: ctx.agent_id,
+                    status: TaskStatus::Review,
+                    outcome: Some(outcome),
+                })
+            }
+        })
+    })
+}
+
 /// Test helper: build a [`WorkerSpawner`] that simulates one happy-path
 /// worker by emitting the canonical event sequence (worker_start →
 /// task.tool → task_complete) directly into the run store, then returning
@@ -814,6 +988,7 @@ mod tests {
             base_commit: String::new(),
             use_real_worktrees: false,
             max_usd: 0.0, // disabled in unit tests
+            max_retries_per_task: 0, // most tests assert single-shot behaviour
         }
     }
 
@@ -961,6 +1136,87 @@ mod tests {
             Err(OrchestratorError::UnknownTask(id)) => assert_eq!(id, "nope"),
             other => panic!("expected UnknownTask, got {other:?}"),
         }
+        handle.shutdown().await;
+        let _ = join.await;
+    }
+
+    /// Phase 8.1 acceptance: when a task hits Failed, the retry watchdog
+    /// auto-reassigns it (rung 2 of the E5 ladder) until either it
+    /// succeeds or the per-task retry budget is exhausted.
+    #[tokio::test]
+    async fn failed_task_is_auto_retried_within_budget() {
+        let dir = tempdir().unwrap();
+        let store = RunStore::create(
+            dir.path().join(".arccode/autonomous/test-run"),
+            "test-run",
+            "g",
+            "abc",
+            "arccode/auto/test-run",
+        )
+        .await
+        .unwrap();
+        let mut config = cfg(dir.path().to_path_buf());
+        config.max_retries_per_task = 1;
+        let (handle, join) = spawn(store, config, fake_flaky_spawner());
+        handle.add_task(dev_task("t1", vec![])).await.unwrap();
+        let _agent = handle.assign_task("t1").await.unwrap();
+        wait_for_review(&handle, "t1").await;
+        // The watchdog's reassign happens between the first Failed and
+        // the second InProgress — by the time we see Review the retry
+        // already happened. Confirm the run-store recorded the round trip.
+        let log = std::fs::read_to_string(
+            dir.path()
+                .join(".arccode/autonomous/test-run/tasks.jsonl"),
+        )
+        .unwrap();
+        let failed_count = log.matches(r#""status":"failed""#).count();
+        let review_count = log.matches(r#""status":"review""#).count();
+        assert!(
+            failed_count >= 1,
+            "expected at least one Failed transition; log:\n{log}"
+        );
+        assert!(
+            review_count >= 1,
+            "expected at least one Review transition after retry; log:\n{log}"
+        );
+        handle.finalize_task("t1", Some("sha-1".into())).await.unwrap();
+        let state = handle.snapshot().await.unwrap();
+        assert_eq!(state.task("t1").unwrap().status, TaskStatus::Done);
+        handle.shutdown().await;
+        let _ = join.await;
+    }
+
+    /// Inverse case: when retries are disabled (`max_retries_per_task = 0`),
+    /// the watchdog never fires and the task stays Failed.
+    #[tokio::test]
+    async fn failed_task_stays_failed_when_retry_disabled() {
+        let dir = tempdir().unwrap();
+        let store = RunStore::create(
+            dir.path().join(".arccode/autonomous/test-run"),
+            "test-run",
+            "g",
+            "abc",
+            "arccode/auto/test-run",
+        )
+        .await
+        .unwrap();
+        let config = cfg(dir.path().to_path_buf()); // max_retries_per_task = 0
+        let (handle, join) = spawn(store, config, fake_flaky_spawner());
+        handle.add_task(dev_task("t1", vec![])).await.unwrap();
+        let _agent = handle.assign_task("t1").await.unwrap();
+
+        // Wait for the first attempt to land in Failed.
+        for _ in 0..200 {
+            let state = handle.snapshot().await.unwrap();
+            if state.task("t1").map(|t| t.status) == Some(TaskStatus::Failed) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Give the watchdog a beat to (not) fire.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let state = handle.snapshot().await.unwrap();
+        assert_eq!(state.task("t1").unwrap().status, TaskStatus::Failed);
         handle.shutdown().await;
         let _ = join.await;
     }

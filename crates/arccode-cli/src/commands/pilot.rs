@@ -14,7 +14,7 @@ use arccode_autonomous::{
     planner::{parse_plan, persist_plan, plan_from_goal, render_plan, PlannerLlm, ProviderLlm},
     run_dir, RunStore,
 };
-use arccode_config::{Config, PilotConfig, ProjectPaths};
+use arccode_config::{Config, ProjectPaths};
 
 use crate::runtime;
 
@@ -25,6 +25,7 @@ pub struct PilotOptions {
     pub plan_only: bool,
     pub yes: bool,
     pub review: bool,
+    #[allow(dead_code)] // reserved for in-terminal tail of an in-process run (Phase 7.8 / E12)
     pub watch: bool,
     pub no_pr: bool,
     pub base: Option<String>,
@@ -140,17 +141,49 @@ pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Phases 3–6 land here: build the orchestrator, spawn the manager,
-    // spawn workers in worktrees, merge into the integration branch, open
-    // a PR. Until then, plan-only is the only complete flow.
-    let _ = (opts.watch, opts.no_pr, &pilot); // hush "unused" warnings
-    let _ = PilotConfig::default(); // type-import keeps the public surface honest
-    eprintln!(
-        "[pilot] orchestrator (Phases 3-6) not yet implemented — re-run with --plan-only \
-         to skip this notice. tasks.jsonl is ready at {}.",
-        store.log_path().display()
-    );
-    Ok(ExitCode::from(64))
+    let base_branch =
+        std::env::var("ARCCODE_PILOT_BASE_BRANCH").unwrap_or_else(|_| "main".into());
+    let orch_cfg = arccode_autonomous::orchestrator::OrchestratorConfig {
+        max_concurrent_agents: pilot.max_concurrent_agents,
+        task_timeout: std::time::Duration::from_secs(pilot.task_timeout_secs),
+        project_root: project.root.clone(),
+        run_id: run_id.clone(),
+        base_commit: base_commit.clone(),
+        use_real_worktrees: true,
+        max_usd: pilot.max_usd,
+        max_retries_per_task: 1,
+    };
+    let inputs = arccode_autonomous::pipeline::PipelineInputs {
+        provider,
+        manager_model: selection.model.clone(),
+        worker_spawner: build_real_worker_spawner(
+            pilot.worker_model.as_deref().unwrap_or(&selection.model),
+        )?,
+        base_branch,
+        project_root: project.root.clone(),
+        command_runner: Box::new(arccode_autonomous::pr::SystemCommandRunner),
+        no_pr: opts.no_pr,
+        orchestrator_cfg: orch_cfg,
+        max_ticks: 64,
+    };
+
+    eprintln!("[pilot] driving manager loop ({} ticks max)…", inputs.max_ticks);
+    let outcome = arccode_autonomous::pipeline::run_to_completion(store, inputs)
+        .await
+        .context("pipeline run_to_completion")?;
+    if !outcome.failed_tasks.is_empty() {
+        eprintln!(
+            "[pilot] some tasks did not reach Done: {:?}",
+            outcome.failed_tasks
+        );
+        return Ok(ExitCode::from(2));
+    }
+    if let Some(pr) = outcome.pr {
+        eprintln!("[pilot] PR opened: {}", pr.url);
+    } else if outcome.merged.is_some() {
+        eprintln!("[pilot] integration branch ready; PR step skipped (--no-pr).");
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Resolve the base commit for the run. `--base <REV>` overrides; otherwise
@@ -264,6 +297,142 @@ fn open_plan_in_editor(plan: &[arccode_autonomous::planner::PlannedTask]) -> Res
 /// Trait shim — `std::io::Stdin::is_terminal` is stable since 1.70 but
 /// brought in via the `IsTerminal` trait.
 use std::io::IsTerminal;
+
+// ----------------------------------------------------------------------
+// `arccode pilot resume`
+// ----------------------------------------------------------------------
+
+/// Resume an interrupted run. Loads the existing RunStore, marks stuck
+/// InProgress tasks as Failed so the retry watchdog picks them up, then
+/// re-enters the same end-to-end pipeline that `pilot run` uses.
+pub async fn resume(
+    cfg: Config,
+    run_id: String,
+    no_pr: bool,
+    model_override: Option<String>,
+) -> Result<ExitCode> {
+    let project = ProjectPaths::discover(&std::env::current_dir()?);
+    let run_path = arccode_autonomous::run_dir(&project.root, &run_id);
+    if !run_path.exists() {
+        return Err(anyhow!(
+            "no run directory at {} — run id {run_id} not found",
+            run_path.display()
+        ));
+    }
+
+    let mut store = arccode_autonomous::RunStore::load(&run_path)
+        .await
+        .with_context(|| format!("loading run {run_id}"))?;
+
+    let stuck = arccode_autonomous::pipeline::mark_stale_in_progress_failed(&mut store)
+        .await
+        .context("marking stale tasks")?;
+    if !stuck.is_empty() {
+        eprintln!(
+            "[pilot] resume: marked {} stuck task(s) as Failed: {:?}",
+            stuck.len(),
+            stuck
+        );
+    }
+
+    // Resolve the same manager provider as a fresh run would.
+    let planner_model = cfg
+        .pilot
+        .default_model
+        .clone()
+        .or(model_override)
+        .or_else(|| cfg.default_model.clone());
+    let selection = runtime::resolve_selection(&cfg, planner_model.as_deref())?;
+    if let Err(why) = arccode_autonomous::provider_support::gate_run(&selection.provider_id) {
+        return Err(anyhow!(why));
+    }
+    let provider = runtime::build_provider(&cfg, &selection.provider_id)
+        .with_context(|| format!("building provider {}", selection.provider_id))?;
+
+    let state = store.state().clone();
+    let base_branch = std::env::var("ARCCODE_PILOT_BASE_BRANCH").unwrap_or_else(|_| "main".into());
+    let orch_cfg = arccode_autonomous::orchestrator::OrchestratorConfig {
+        max_concurrent_agents: cfg.pilot.max_concurrent_agents,
+        task_timeout: std::time::Duration::from_secs(cfg.pilot.task_timeout_secs),
+        project_root: project.root.clone(),
+        run_id: run_id.clone(),
+        base_commit: state.base_commit.clone(),
+        use_real_worktrees: true,
+        max_usd: cfg.pilot.max_usd,
+        max_retries_per_task: 1,
+    };
+    let inputs = arccode_autonomous::pipeline::PipelineInputs {
+        provider,
+        manager_model: selection.model.clone(),
+        worker_spawner: build_real_worker_spawner(&selection.model)?,
+        base_branch,
+        project_root: project.root,
+        command_runner: Box::new(arccode_autonomous::pr::SystemCommandRunner),
+        no_pr,
+        orchestrator_cfg: orch_cfg,
+        max_ticks: 64,
+    };
+
+    eprintln!("[pilot] resume: driving manager loop for run {run_id}");
+    let outcome = arccode_autonomous::pipeline::run_to_completion(store, inputs)
+        .await
+        .context("pipeline run_to_completion")?;
+    if !outcome.failed_tasks.is_empty() {
+        eprintln!(
+            "[pilot] resume: tasks ended in non-Done state: {:?}",
+            outcome.failed_tasks
+        );
+        return Ok(ExitCode::from(2));
+    }
+    if let Some(pr) = outcome.pr {
+        eprintln!("[pilot] resume: PR URL → {}", pr.url);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Build the production WorkerSpawner: spawns real `arccode --worker-mode`
+/// child processes via [`arccode_autonomous::worker::run_worker`].
+fn build_real_worker_spawner(_worker_model: &str) -> Result<arccode_autonomous::orchestrator::WorkerSpawner> {
+    let arccode_bin = std::env::current_exe().context("locating arccode binary")?;
+    Ok(std::sync::Arc::new(move |ctx: arccode_autonomous::orchestrator::SpawnContext| {
+        let arccode_bin = arccode_bin.clone();
+        Box::pin(async move {
+            // Translate SpawnContext to WorkerSpec and drive run_worker.
+            // The orchestrator's store handle is exposed through ctx; we
+            // build a minimal WorkerSpec here.
+            //
+            // NOTE: run_worker takes its OWN &mut RunStore reference, not
+            // an Arc<Mutex<RunStore>>. To keep this self-contained without
+            // refactoring the worker module, we acquire a lock for the
+            // duration of the worker's lifetime — which is fine because
+            // the manager actor processes one assign at a time.
+            let spec = arccode_autonomous::worker::WorkerSpec {
+                arccode_bin,
+                task: ctx.task.clone(),
+                role: ctx.task.role.clone(),
+                worktree: ctx.worktree.clone(),
+                session_id: ctx.session_id.clone(),
+                model: None, // worker reads pilot.worker_model from config
+                timeout: std::time::Duration::from_secs(1800),
+            };
+            let mut store_guard = ctx.store.lock().await;
+            let result = arccode_autonomous::worker::run_worker(
+                &mut *store_guard,
+                &ctx.agent_id,
+                spec,
+            )
+            .await
+            .map_err(|e| {
+                arccode_autonomous::orchestrator::OrchestratorError::Spawn(e.to_string())
+            })?;
+            Ok(arccode_autonomous::orchestrator::WorkerSpawnResult {
+                agent_id: ctx.agent_id,
+                status: result.status,
+                outcome: result.outcome,
+            })
+        })
+    }))
+}
 
 // ----------------------------------------------------------------------
 // `arccode pilot status` and `arccode pilot watch`
