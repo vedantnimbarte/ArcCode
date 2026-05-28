@@ -823,8 +823,8 @@ mod tests {
 
     #[test]
     fn critique_detects_overlapping_writes_without_dep_edge() {
-        use tempfile::tempdir;
-        let dir = tempdir().unwrap();
+        // No tempdir needed — we disable path-existence by passing
+        // empty root, so we're only exercising the overlap detection.
         let plan = vec![
             PlannedTask {
                 id: "t1".into(),

@@ -79,6 +79,21 @@ pub type WorkerSpawner = Arc<
         + Sync,
 >;
 
+/// Per-rung-3 splitter callback (E5 rung 3). Given the failing task +
+/// the accumulated failure history, returns N replacement tasks that
+/// together cover the original goal. Production wires this to a
+/// planner-style LLM call; tests pass a canned closure. None disables
+/// splitting and the watchdog falls through to rung 4 (Blocked) instead.
+pub type TaskSplitter = Arc<
+    dyn Fn(
+            Task,
+            Vec<String>,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<Vec<NewTaskSpec>, OrchestratorError>> + Send>,
+        > + Send
+        + Sync,
+>;
+
 /// Per-spawn context handed to a [`WorkerSpawner`].
 #[derive(Clone)]
 pub struct SpawnContext {
@@ -90,6 +105,18 @@ pub struct SpawnContext {
     /// arrive. Behind a Mutex because the orchestrator and the spawner both
     /// write events.
     pub store: Arc<Mutex<RunStore>>,
+    /// Retry-ladder rung for this spawn. 0 = first attempt; 1-3 are E5
+    /// retry rungs. Spawners use this to seed the worker's task spec
+    /// (e.g. prepend failure history to `goal` on rungs > 0).
+    pub rung: u32,
+    /// Rung 2 of the E5 ladder escalates from `worker_model` to the
+    /// configured manager model. Spawners read this and pass the bigger
+    /// model id when spawning the child.
+    pub escalate_model: bool,
+    /// Compact summary of prior failures on this task. Empty on rung 0.
+    /// Spawners can splice this into the system prompt so the next
+    /// worker doesn't repeat the same mistake blindly.
+    pub failure_history: Vec<String>,
 }
 
 /// Commands the manager's tools send to the orchestrator. Each command
@@ -268,10 +295,12 @@ pub struct OrchestratorConfig {
     /// the orchestrator refuses new assignments and the budget watchdog
     /// (spawned alongside the actor) aborts in-flight workers. 0 = disabled.
     pub max_usd: f64,
-    /// Per-task retry budget for the auto-retry watchdog. When a task hits
-    /// `Failed` and its retry count is below this, the orchestrator
-    /// auto-reassigns it (rung-2 of the E5 ladder). Plan.md proposes 1 by
-    /// default; the rest of the retry ladder lands in M2/E5.
+    /// Per-task retry budget for the auto-retry watchdog. Each failed
+    /// attempt advances the E5 retry ladder one rung; the watchdog
+    /// stops when this many retries have been exhausted (or rung 4 is
+    /// reached, whichever comes first). Default 3 means the user sees
+    /// at most one initial attempt + 3 retries before the task is
+    /// marked Blocked.
     pub max_retries_per_task: u32,
 }
 
@@ -285,9 +314,18 @@ impl Default for OrchestratorConfig {
             base_commit: String::new(),
             use_real_worktrees: false,
             max_usd: 10.0,
-            max_retries_per_task: 1,
+            max_retries_per_task: 3,
         }
     }
+}
+
+/// Per-task retry state maintained inside the actor. Threaded through
+/// handle_assign so the spawner sees the right rung / escalation flag.
+#[derive(Debug, Default, Clone)]
+struct RetryState {
+    rung: u32,
+    escalate_model: bool,
+    failure_history: Vec<String>,
 }
 
 /// Run the orchestrator actor on the current Tokio runtime. Returns the
@@ -297,6 +335,17 @@ pub fn spawn(
     store: RunStore,
     cfg: OrchestratorConfig,
     spawner: WorkerSpawner,
+) -> (OrchestratorHandle, tokio::task::JoinHandle<()>) {
+    spawn_with_splitter(store, cfg, spawner, None)
+}
+
+/// Variant of [`spawn`] that registers a [`TaskSplitter`] for E5 rung 3.
+/// `None` disables splitting and the ladder falls through to Blocked.
+pub fn spawn_with_splitter(
+    store: RunStore,
+    cfg: OrchestratorConfig,
+    spawner: WorkerSpawner,
+    splitter: Option<TaskSplitter>,
 ) -> (OrchestratorHandle, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(64);
     let handle = OrchestratorHandle { tx: tx.clone() };
@@ -323,19 +372,17 @@ pub fn spawn(
         drop(budget_rx);
     }
 
-    // Retry watchdog: subscribes to TaskStatus events. When a task
-    // transitions to Failed, if it has retry budget left, auto-reassign it
-    // (rung 2 of plan.md's E5 ladder). Rung 3+ (splitter, hard escalation)
-    // lives in the manager loop and lands in M2.
+    // Retry watchdog: subscribes to TaskStatus events. On Failed, fires
+    // a Reassign — the actor decides rung + action based on its own
+    // per-task retry state. The watchdog is now stateless.
     if cfg.max_retries_per_task > 0 {
         let watchdog_tx = tx;
-        let max_retries = cfg.max_retries_per_task;
-        tokio::spawn(retry_watchdog(retry_rx, max_retries, watchdog_tx));
+        tokio::spawn(retry_watchdog(retry_rx, watchdog_tx));
     } else {
         drop(retry_rx);
     }
 
-    let join = tokio::spawn(run_actor(store, cfg, spawner, rx));
+    let join = tokio::spawn(run_actor(store, cfg, spawner, splitter, rx));
     (handle, join)
 }
 
@@ -387,18 +434,13 @@ async fn budget_watchdog(
     }
 }
 
-/// Background task: when a task transitions to Failed, auto-reassign it
-/// up to `max_retries` times. Tracks per-task retry counts in-process —
-/// the run-store doesn't need to know about retries; only the watchdog
-/// does. If the orchestrator restarts mid-run, retry counts reset, which
-/// is the conservative behaviour (one more shot on resume).
+/// Background task: when a task transitions to Failed, fire a Reassign.
+/// The actor owns the per-task retry state; this watchdog is now
+/// stateless, just a "Failed → Reassign" pump.
 async fn retry_watchdog(
     mut events: tokio::sync::broadcast::Receiver<Event>,
-    max_retries: u32,
     orch: mpsc::Sender<OrchestratorCommand>,
 ) {
-    use std::collections::HashMap;
-    let mut retries: HashMap<String, u32> = HashMap::new();
     loop {
         match events.recv().await {
             Ok(Event::TaskStatus {
@@ -406,25 +448,6 @@ async fn retry_watchdog(
                 status: TaskStatus::Failed,
                 ..
             }) => {
-                let attempts = retries.entry(id.clone()).or_insert(0);
-                if *attempts >= max_retries {
-                    tracing::warn!(
-                        target: "pilot::retry",
-                        task = %id,
-                        attempts,
-                        max_retries,
-                        "task exhausted retry budget; leaving Failed"
-                    );
-                    continue;
-                }
-                *attempts += 1;
-                let attempt = *attempts;
-                tracing::info!(
-                    target: "pilot::retry",
-                    task = %id,
-                    attempt,
-                    "auto-reassigning failed task"
-                );
                 let (reply, _) = oneshot::channel();
                 let _ = orch
                     .send(OrchestratorCommand::Reassign {
@@ -444,6 +467,7 @@ async fn run_actor(
     store: Arc<Mutex<RunStore>>,
     cfg: OrchestratorConfig,
     spawner: WorkerSpawner,
+    splitter: Option<TaskSplitter>,
     mut rx: mpsc::Receiver<OrchestratorCommand>,
 ) {
     // Track active worker tasks so we can enforce the concurrency cap and
@@ -452,6 +476,8 @@ async fn run_actor(
         Arc::new(Mutex::new(HashMap::new()));
     let mut next_agent_seq: u64 = 0;
     let mut next_task_seq: u64 = 0;
+    // E5 retry ladder state, per task.
+    let mut retries: HashMap<String, RetryState> = HashMap::new();
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
@@ -469,6 +495,7 @@ async fn run_actor(
                     &active,
                     &task_id,
                     &mut next_agent_seq,
+                    &retries,
                 )
                 .await;
                 let _ = reply.send(result);
@@ -479,9 +506,12 @@ async fn run_actor(
                     &store,
                     &cfg,
                     &spawner,
+                    splitter.as_ref(),
                     &active,
                     &task_id,
                     &mut next_agent_seq,
+                    &mut retries,
+                    &mut next_task_seq,
                 )
                 .await;
                 let _ = reply.send(result);
@@ -578,6 +608,7 @@ async fn handle_assign(
     active: &Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     task_id: &str,
     next_agent_seq: &mut u64,
+    retries: &HashMap<String, RetryState>,
 ) -> Result<String, OrchestratorError> {
     let (task, agent_id, worktree, session_id) = {
         let store_g = store.lock().await;
@@ -679,12 +710,16 @@ async fn handle_assign(
             .await?;
     }
 
+    let retry = retries.get(task_id).cloned().unwrap_or_default();
     let ctx = SpawnContext {
         task,
         agent_id: agent_id.clone(),
         worktree,
         session_id,
         store: store.clone(),
+        rung: retry.rung,
+        escalate_model: retry.escalate_model,
+        failure_history: retry.failure_history,
     };
     let spawner = spawner.clone();
     let task_id_for_log = task_id.to_string();
@@ -707,13 +742,107 @@ async fn handle_reassign(
     store: &Arc<Mutex<RunStore>>,
     cfg: &OrchestratorConfig,
     spawner: &WorkerSpawner,
+    splitter: Option<&TaskSplitter>,
     active: &Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     task_id: &str,
     next_agent_seq: &mut u64,
+    retries: &mut HashMap<String, RetryState>,
+    next_task_seq: &mut u64,
 ) -> Result<String, OrchestratorError> {
-    // Abort the current worker (if any), reset task to Todo, then assign
-    // fresh. Useful as the E5 retry-ladder rung 2 implementation.
-    handle_abort(store, active, task_id).await?;
+    // E5 ladder. Advance the rung and pick the action.
+    //
+    //   rung 0 = initial attempt (handled by AssignTask, not here)
+    //   rung 1 = retry same model, augmented context
+    //   rung 2 = retry with escalated model
+    //   rung 3 = splitter (decompose task into subtasks)
+    //   rung ≥ 4 = mark Blocked, ladder exhausted
+    //
+    // The watchdog calls this on every Failed event without tracking
+    // its own counter; this is the single place rung state is mutated.
+
+    // Capture failure context BEFORE incrementing — the worker's
+    // outcome on the failing attempt feeds the next rung's history.
+    let failure_note = {
+        let store_g = store.lock().await;
+        store_g
+            .state()
+            .task(task_id)
+            .and_then(|t| t.outcome.as_ref().map(|o| o.summary.clone()))
+            .unwrap_or_else(|| "failed without outcome summary".to_string())
+    };
+
+    let state = retries.entry(task_id.to_string()).or_default();
+    state.rung += 1;
+    state.failure_history.push(format!(
+        "rung {}: {}",
+        state.rung.saturating_sub(1).max(1),
+        failure_note
+    ));
+    let current_rung = state.rung;
+
+    // Rung-specific tweaks to the retry state that the next assign reads.
+    match current_rung {
+        1 => {
+            state.escalate_model = false;
+        }
+        2 => {
+            state.escalate_model = true;
+        }
+        _ => {}
+    }
+
+    if current_rung > cfg.max_retries_per_task {
+        // Ladder exhausted.
+        let mut store_g = store.lock().await;
+        store_g
+            .append(Event::TaskStatus {
+                t: RunStore::now(),
+                id: task_id.to_string(),
+                status: TaskStatus::Blocked,
+                outcome: None,
+            })
+            .await?;
+        tracing::warn!(
+            target: "pilot::retry",
+            task = %task_id,
+            rung = current_rung,
+            "retry ladder exhausted; task Blocked"
+        );
+        return Err(OrchestratorError::BadTransition(
+            task_id.to_string(),
+            TaskStatus::Failed,
+            "reassign (ladder exhausted)",
+        ));
+    }
+
+    // Rung 3 = splitter. We can only split if the caller registered
+    // one; otherwise fall through to a normal reassign (still safer
+    // than failing the run outright).
+    if current_rung == 3 {
+        if let Some(splitter) = splitter {
+            return run_splitter_rung(
+                store,
+                splitter,
+                active,
+                task_id,
+                state.failure_history.clone(),
+                next_task_seq,
+            )
+            .await;
+        }
+        tracing::info!(
+            target: "pilot::retry",
+            task = %task_id,
+            "no splitter registered; rung 3 falls through to a normal reassign"
+        );
+    }
+
+    // Rungs 1, 2, and 3-without-splitter: silently kill any lingering
+    // detached spawner task and reset to Todo without re-emitting Failed.
+    // (handle_abort's emit would trigger the watchdog to send another
+    // Reassign and race-cancel the fresh spawner before it records its
+    // observation.)
+    quiet_kill_active_for_task(store, active, task_id).await?;
     {
         let mut store_g = store.lock().await;
         store_g
@@ -725,7 +854,152 @@ async fn handle_reassign(
             })
             .await?;
     }
-    handle_assign(store, cfg, spawner, active, task_id, next_agent_seq).await
+    handle_assign(store, cfg, spawner, active, task_id, next_agent_seq, retries).await
+}
+
+/// Like handle_abort but doesn't emit Failed/Aborted events — used from
+/// the retry ladder where the task is about to be reassigned anyway and
+/// the broadcast watchdog must not see another Failed.
+async fn quiet_kill_active_for_task(
+    store: &Arc<Mutex<RunStore>>,
+    active: &Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    task_id: &str,
+) -> Result<(), OrchestratorError> {
+    let agent_id = {
+        let store_g = store.lock().await;
+        store_g
+            .state()
+            .task(task_id)
+            .and_then(|t| t.agent.clone())
+    };
+    if let Some(agent_id) = agent_id {
+        if let Some(handle) = active.lock().await.remove(&agent_id) {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+    Ok(())
+}
+
+/// E5 rung 3: ask the splitter to decompose the failing task into
+/// smaller subtasks. The failing task is marked Done (replaced); the
+/// new subtasks are appended via task.create with their first dep
+/// pointing at the failing task's deps (so downstream tasks still wait
+/// correctly).
+async fn run_splitter_rung(
+    store: &Arc<Mutex<RunStore>>,
+    splitter: &TaskSplitter,
+    active: &Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    task_id: &str,
+    failure_history: Vec<String>,
+    next_task_seq: &mut u64,
+) -> Result<String, OrchestratorError> {
+    // Quietly stop any lingering detached spawner for the failing task
+    // (without re-emitting Failed events, which would re-trigger the
+    // watchdog).
+    quiet_kill_active_for_task(store, active, task_id).await?;
+
+    let failing_task = {
+        let store_g = store.lock().await;
+        store_g
+            .state()
+            .task(task_id)
+            .cloned()
+            .ok_or_else(|| OrchestratorError::UnknownTask(task_id.to_string()))?
+    };
+
+    let new_specs = splitter(failing_task.clone(), failure_history).await?;
+    if new_specs.is_empty() {
+        return Err(OrchestratorError::Spawn(
+            "splitter returned zero subtasks; falling back to ladder exhaustion".into(),
+        ));
+    }
+
+    // Append every subtask as a task.create. Their `deps` inherit the
+    // failing task's deps; downstream tasks that depended on the
+    // failing task get re-pointed to depend on every new subtask so
+    // the DAG stays acyclic and the dep wave is preserved.
+    let parent_deps = failing_task.deps.clone();
+    let mut new_ids: Vec<String> = Vec::new();
+    {
+        let mut store_g = store.lock().await;
+        for spec in new_specs {
+            *next_task_seq += 1;
+            let id = spec.id.unwrap_or_else(|| {
+                let n = *next_task_seq;
+                format!("t{n}")
+            });
+            new_ids.push(id.clone());
+            let deps = if spec.deps.is_empty() {
+                parent_deps.clone()
+            } else {
+                spec.deps.clone()
+            };
+            store_g
+                .append(Event::TaskCreate {
+                    t: RunStore::now(),
+                    id: id.clone(),
+                    role: spec.role,
+                    title: spec.title,
+                    goal: spec.goal,
+                    deps,
+                    writes: spec.writes,
+                    acceptance: spec.acceptance,
+                    reversibility: spec.reversibility,
+                    reversibility_reason: spec.reversibility_reason,
+                })
+                .await?;
+        }
+        // Re-point any task that depended on the failing task to depend
+        // on every new subtask instead. The task.create-replace event
+        // schema is additive: we append updated task.create events with
+        // the same ids but different deps; apply() replaces the task.
+        let dependents: Vec<crate::model::Task> = store_g
+            .state()
+            .tasks
+            .iter()
+            .filter(|t| t.deps.iter().any(|d| d == task_id))
+            .cloned()
+            .collect();
+        for mut d in dependents {
+            d.deps.retain(|dep| dep != task_id);
+            d.deps.extend(new_ids.iter().cloned());
+            store_g
+                .append(Event::TaskCreate {
+                    t: RunStore::now(),
+                    id: d.id.clone(),
+                    role: d.role,
+                    title: d.title,
+                    goal: d.goal,
+                    deps: d.deps,
+                    writes: d.writes,
+                    acceptance: d.acceptance,
+                    reversibility: d.reversibility,
+                    reversibility_reason: d.reversibility_reason,
+                })
+                .await?;
+        }
+        // Mark the failing task Done so the DAG considers it satisfied
+        // — its work has been re-allocated to subtasks.
+        store_g
+            .append(Event::TaskStatus {
+                t: RunStore::now(),
+                id: task_id.to_string(),
+                status: TaskStatus::Done,
+                outcome: None,
+            })
+            .await?;
+    }
+    tracing::info!(
+        target: "pilot::retry",
+        task = %task_id,
+        subtasks = ?new_ids,
+        "rung 3 splitter replaced task with subtasks"
+    );
+    Ok(format!(
+        "split task {task_id} into {} subtask(s)",
+        new_ids.len()
+    ))
 }
 
 async fn handle_finalize(
@@ -1188,6 +1462,269 @@ mod tests {
 
     /// Inverse case: when retries are disabled (`max_retries_per_task = 0`),
     /// the watchdog never fires and the task stays Failed.
+    /// E5 rung 2 acceptance: the escalate_model flag is true on rung 2's
+    /// SpawnContext but false on rung 1. A capturing spawner records
+    /// what it sees and we assert the progression.
+    #[tokio::test]
+    async fn rung_two_sets_escalate_model_flag_on_spawn_context() {
+        use std::sync::Mutex;
+        let dir = tempdir().unwrap();
+        let store = RunStore::create(
+            dir.path().join(".arccode/autonomous/test-run"),
+            "test-run",
+            "g",
+            "abc",
+            "arccode/auto/test-run",
+        )
+        .await
+        .unwrap();
+        let mut config = cfg(dir.path().to_path_buf());
+        config.max_retries_per_task = 2;
+
+        // Capture spawner: records rung + escalate_model per invocation,
+        // always fails the first two attempts, succeeds on the third.
+        let observations: Arc<Mutex<Vec<(u32, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let observations_for_spawner = observations.clone();
+        let spawner: WorkerSpawner = Arc::new(move |ctx: SpawnContext| {
+            let obs = observations_for_spawner.clone();
+            Box::pin(async move {
+                obs.lock().unwrap().push((ctx.rung, ctx.escalate_model));
+                let mut store = ctx.store.lock().await;
+                let _ = store
+                    .append(Event::AgentSpawn {
+                        t: RunStore::now(),
+                        agent: ctx.agent_id.clone(),
+                        role: ctx.task.role.clone(),
+                        pid: Some(0),
+                        session_id: Some(ctx.session_id.clone()),
+                    })
+                    .await;
+                let final_status = if ctx.rung >= 2 {
+                    TaskStatus::Review
+                } else {
+                    TaskStatus::Failed
+                };
+                let outcome = if final_status == TaskStatus::Review {
+                    Some(TaskOutcome {
+                        summary: format!("done on rung {}", ctx.rung),
+                        files_changed: vec![],
+                    })
+                } else {
+                    None
+                };
+                let _ = store
+                    .append(Event::TaskStatus {
+                        t: RunStore::now(),
+                        id: ctx.task.id.clone(),
+                        status: final_status,
+                        outcome: outcome.clone(),
+                    })
+                    .await;
+                Ok(WorkerSpawnResult {
+                    agent_id: ctx.agent_id,
+                    status: final_status,
+                    outcome,
+                })
+            })
+        });
+
+        let (handle, join) = spawn(store, config, spawner);
+        handle.add_task(dev_task("t1", vec![])).await.unwrap();
+        let _ = handle.assign_task("t1").await.unwrap();
+        wait_for_review(&handle, "t1").await;
+
+        let obs = observations.lock().unwrap().clone();
+        assert!(obs.len() >= 3, "expected three attempts, got {obs:?}");
+        // First attempt: rung 0, no escalation.
+        assert_eq!(obs[0], (0, false));
+        // Second attempt (after first Failed): rung 1, no escalation.
+        assert_eq!(obs[1], (1, false));
+        // Third attempt (rung 2): escalation flag set.
+        assert_eq!(obs[2], (2, true));
+
+        handle.shutdown().await;
+        let _ = join.await;
+    }
+
+    /// E5 rung 3 acceptance: when a splitter is registered and rung 3
+    /// hits, the failing task is replaced by the splitter's subtasks.
+    #[tokio::test]
+    async fn rung_three_invokes_splitter_when_registered() {
+        use crate::model::Acceptance;
+        let dir = tempdir().unwrap();
+        let store = RunStore::create(
+            dir.path().join(".arccode/autonomous/test-run"),
+            "test-run",
+            "g",
+            "abc",
+            "arccode/auto/test-run",
+        )
+        .await
+        .unwrap();
+        let mut config = cfg(dir.path().to_path_buf());
+        // Need enough rungs to actually reach rung 3.
+        config.max_retries_per_task = 4;
+
+        // Splitter: replaces "big" with "small-a" + "small-b".
+        let splitter: TaskSplitter = Arc::new(|_task: Task, _history: Vec<String>| {
+            Box::pin(async move {
+                Ok(vec![
+                    NewTaskSpec {
+                        id: Some("small-a".into()),
+                        role: Role::Developer,
+                        title: "half A".into(),
+                        goal: String::new(),
+                        deps: vec![],
+                        writes: vec!["file-a.rs".into()],
+                        acceptance: Vec::<Acceptance>::new(),
+                        reversibility: Default::default(),
+                        reversibility_reason: None,
+                    },
+                    NewTaskSpec {
+                        id: Some("small-b".into()),
+                        role: Role::Developer,
+                        title: "half B".into(),
+                        goal: String::new(),
+                        deps: vec![],
+                        writes: vec!["file-b.rs".into()],
+                        acceptance: Vec::<Acceptance>::new(),
+                        reversibility: Default::default(),
+                        reversibility_reason: None,
+                    },
+                ])
+            })
+        });
+
+        // Always-fail spawner — drives the ladder to rung 3.
+        let spawner: WorkerSpawner = Arc::new(|ctx: SpawnContext| {
+            Box::pin(async move {
+                let mut store = ctx.store.lock().await;
+                let _ = store
+                    .append(Event::AgentSpawn {
+                        t: RunStore::now(),
+                        agent: ctx.agent_id.clone(),
+                        role: ctx.task.role.clone(),
+                        pid: Some(0),
+                        session_id: Some(ctx.session_id.clone()),
+                    })
+                    .await;
+                let _ = store
+                    .append(Event::TaskStatus {
+                        t: RunStore::now(),
+                        id: ctx.task.id.clone(),
+                        status: TaskStatus::Failed,
+                        outcome: Some(TaskOutcome {
+                            summary: "fake failure".into(),
+                            files_changed: vec![],
+                        }),
+                    })
+                    .await;
+                Ok(WorkerSpawnResult {
+                    agent_id: ctx.agent_id,
+                    status: TaskStatus::Failed,
+                    outcome: None,
+                })
+            })
+        });
+
+        let (handle, join) = spawn_with_splitter(store, config, spawner, Some(splitter));
+        handle.add_task(dev_task("big", vec![])).await.unwrap();
+        let _ = handle.assign_task("big").await.unwrap();
+
+        // Wait until small-a / small-b appear OR `big` lands Done.
+        for _ in 0..200 {
+            let state = handle.snapshot().await.unwrap();
+            let has_subtasks = state.task("small-a").is_some() && state.task("small-b").is_some();
+            if has_subtasks {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let state = handle.snapshot().await.unwrap();
+        assert!(
+            state.task("small-a").is_some(),
+            "splitter subtask small-a missing"
+        );
+        assert!(
+            state.task("small-b").is_some(),
+            "splitter subtask small-b missing"
+        );
+        assert_eq!(
+            state.task("big").map(|t| t.status),
+            Some(TaskStatus::Done),
+            "the original task should be marked Done (replaced by subtasks)"
+        );
+
+        handle.shutdown().await;
+        let _ = join.await;
+    }
+
+    /// E5 rung 4 acceptance: when the ladder exhausts without a
+    /// splitter, the task is marked Blocked (terminal).
+    #[tokio::test]
+    async fn ladder_exhaustion_marks_task_blocked() {
+        let dir = tempdir().unwrap();
+        let store = RunStore::create(
+            dir.path().join(".arccode/autonomous/test-run"),
+            "test-run",
+            "g",
+            "abc",
+            "arccode/auto/test-run",
+        )
+        .await
+        .unwrap();
+        let mut config = cfg(dir.path().to_path_buf());
+        config.max_retries_per_task = 2; // Two retries; after that → Blocked.
+
+        // Always-fail spawner.
+        let spawner: WorkerSpawner = Arc::new(|ctx: SpawnContext| {
+            Box::pin(async move {
+                let mut store = ctx.store.lock().await;
+                let _ = store
+                    .append(Event::AgentSpawn {
+                        t: RunStore::now(),
+                        agent: ctx.agent_id.clone(),
+                        role: ctx.task.role.clone(),
+                        pid: Some(0),
+                        session_id: Some(ctx.session_id.clone()),
+                    })
+                    .await;
+                let _ = store
+                    .append(Event::TaskStatus {
+                        t: RunStore::now(),
+                        id: ctx.task.id.clone(),
+                        status: TaskStatus::Failed,
+                        outcome: None,
+                    })
+                    .await;
+                Ok(WorkerSpawnResult {
+                    agent_id: ctx.agent_id,
+                    status: TaskStatus::Failed,
+                    outcome: None,
+                })
+            })
+        });
+
+        let (handle, join) = spawn(store, config, spawner);
+        handle.add_task(dev_task("t1", vec![])).await.unwrap();
+        let _ = handle.assign_task("t1").await.unwrap();
+
+        for _ in 0..400 {
+            let state = handle.snapshot().await.unwrap();
+            if matches!(
+                state.task("t1").map(|t| t.status),
+                Some(TaskStatus::Blocked)
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let state = handle.snapshot().await.unwrap();
+        assert_eq!(state.task("t1").map(|t| t.status), Some(TaskStatus::Blocked));
+        handle.shutdown().await;
+        let _ = join.await;
+    }
+
     #[tokio::test]
     async fn failed_task_stays_failed_when_retry_disabled() {
         let dir = tempdir().unwrap();

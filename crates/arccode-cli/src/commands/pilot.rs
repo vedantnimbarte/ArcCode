@@ -183,6 +183,7 @@ pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
         manager_model: selection.model.clone(),
         worker_spawner: build_real_worker_spawner(
             pilot.worker_model.as_deref().unwrap_or(&selection.model),
+            &selection.model,
         )?,
         base_branch,
         project_root: project.root.clone(),
@@ -438,7 +439,13 @@ pub async fn resume(
     let inputs = arccode_autonomous::pipeline::PipelineInputs {
         provider,
         manager_model: selection.model.clone(),
-        worker_spawner: build_real_worker_spawner(&selection.model)?,
+        worker_spawner: build_real_worker_spawner(
+            cfg.pilot
+                .worker_model
+                .as_deref()
+                .unwrap_or(&selection.model),
+            &selection.model,
+        )?,
         base_branch,
         project_root: project.root,
         command_runner: Box::new(arccode_autonomous::pr::SystemCommandRunner),
@@ -466,27 +473,52 @@ pub async fn resume(
 
 /// Build the production WorkerSpawner: spawns real `arccode --worker-mode`
 /// child processes via [`arccode_autonomous::worker::run_worker`].
-fn build_real_worker_spawner(_worker_model: &str) -> Result<arccode_autonomous::orchestrator::WorkerSpawner> {
+///
+/// `manager_model` is the bigger model the orchestrator escalates to on
+/// rung 2 of the E5 retry ladder. `worker_model` is the cheaper default.
+fn build_real_worker_spawner(
+    worker_model: &str,
+    manager_model: &str,
+) -> Result<arccode_autonomous::orchestrator::WorkerSpawner> {
     let arccode_bin = std::env::current_exe().context("locating arccode binary")?;
+    let worker_model = worker_model.to_string();
+    let manager_model = manager_model.to_string();
     Ok(std::sync::Arc::new(move |ctx: arccode_autonomous::orchestrator::SpawnContext| {
         let arccode_bin = arccode_bin.clone();
+        let worker_model = worker_model.clone();
+        let manager_model = manager_model.clone();
         Box::pin(async move {
-            // Translate SpawnContext to WorkerSpec and drive run_worker.
-            // The orchestrator's store handle is exposed through ctx; we
-            // build a minimal WorkerSpec here.
-            //
-            // NOTE: run_worker takes its OWN &mut RunStore reference, not
-            // an Arc<Mutex<RunStore>>. To keep this self-contained without
-            // refactoring the worker module, we acquire a lock for the
-            // duration of the worker's lifetime — which is fine because
-            // the manager actor processes one assign at a time.
+            // E5 rung 2: escalate to the manager model when the
+            // orchestrator flagged this attempt as needing it.
+            let model = if ctx.escalate_model {
+                Some(manager_model)
+            } else {
+                Some(worker_model)
+            };
+            // Splice prior-failure history into the task's goal so the
+            // next worker sees what went wrong. Cheap context augment;
+            // E11 checkpoint integration is the heavier sibling.
+            let mut task = ctx.task.clone();
+            if !ctx.failure_history.is_empty() {
+                task.goal.push_str(
+                    "\n\n## Prior attempts on this task failed:\n",
+                );
+                for f in &ctx.failure_history {
+                    task.goal.push_str(&format!("- {f}\n"));
+                }
+                task.goal.push_str(
+                    "Read the failure context, fix the underlying issue, \
+                     and re-run `run_acceptance` until every check is green \
+                     before reporting `task_complete`.\n",
+                );
+            }
             let spec = arccode_autonomous::worker::WorkerSpec {
                 arccode_bin,
-                task: ctx.task.clone(),
-                role: ctx.task.role.clone(),
+                role: task.role.clone(),
+                task,
                 worktree: ctx.worktree.clone(),
                 session_id: ctx.session_id.clone(),
-                model: None, // worker reads pilot.worker_model from config
+                model,
                 timeout: std::time::Duration::from_secs(1800),
             };
             let mut store_guard = ctx.store.lock().await;
