@@ -532,6 +532,15 @@ mod tests {
         // line-ending differences that read as conflicts.
         git(&root, &["config", "core.autocrlf", "false"]);
         git(&root, &["config", "core.eol", "lf"]);
+        // CI runners (GH Actions ubuntu-latest / windows-latest) have no
+        // global `user.email` / `user.name`. The test helper passes
+        // GIT_AUTHOR_* / GIT_COMMITTER_* env vars for its own invocations,
+        // but production code in `merge_integration` shells out to git
+        // without those env vars and would otherwise hit "Committer
+        // identity unknown". Persisting identity in the repo's local
+        // config picks up for every git process spawned against this repo.
+        git(&root, &["config", "user.email", "pilot@arccode.local"]);
+        git(&root, &["config", "user.name", "arccode pilot"]);
         std::fs::write(root.join("seed.txt"), b"hello\n").unwrap();
         git(&root, &["add", "-A"]);
         git(&root, &["commit", "-m", "seed"]);
