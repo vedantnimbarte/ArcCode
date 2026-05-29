@@ -75,7 +75,7 @@ impl SupervisedCommand {
                     // EPERM happens when we're already a session leader,
                     // which is harmless here.
                     Err(nix::errno::Errno::EPERM) => Ok(()),
-                    Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+                    Err(e) => Err(std::io::Error::other(e)),
                 });
             }
         }
