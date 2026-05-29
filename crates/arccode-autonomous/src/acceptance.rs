@@ -79,12 +79,48 @@ fn run_one(check: &Acceptance, cwd: &Path) -> AcceptanceResult {
         Acceptance::Shell { cmd } => run_shell(cmd, cwd),
         Acceptance::Grep { pattern, path } => run_grep(pattern, path, cwd),
         // Http checks need async I/O; we skip them in this synchronous
-        // runner and surface that explicitly. J6's verify-the-app work
-        // will land a separate async runner.
+        // runner and surface that explicitly. A separate async runner
+        // handles them.
         Acceptance::Http { url, .. } => AcceptanceResult::fail(
             format!("http: {url}"),
             "HTTP acceptance not yet supported in the synchronous runner (E3 scope is shell+grep)",
         ),
+        // J6 — run the app: execute the script (or the target as a
+        // command) like a shell check, but label it as a run.
+        Acceptance::Run { target, script } => {
+            let cmd = script.clone().unwrap_or_else(|| target.clone());
+            let mut res = run_shell(&cmd, cwd);
+            res.label = format!("run: {target}");
+            res
+        }
+        // J6 — assert a rendered artifact contains expected text.
+        Acceptance::Assert {
+            screenshot,
+            must_contain_text,
+        } => run_assert(screenshot, must_contain_text, cwd),
+    }
+}
+
+/// J6 — verify a rendered artifact (screenshot / SVG dump) exists and
+/// contains every expected text fragment.
+fn run_assert(path: &str, must_contain: &[String], cwd: &Path) -> AcceptanceResult {
+    let label = format!("assert: {path}");
+    let full = cwd.join(path);
+    let body = match std::fs::read_to_string(&full) {
+        Ok(b) => b,
+        Err(e) => {
+            return AcceptanceResult::fail(label, format!("read {} failed: {e}", full.display()))
+        }
+    };
+    let missing: Vec<&str> = must_contain
+        .iter()
+        .filter(|needle| !body.contains(needle.as_str()))
+        .map(|s| s.as_str())
+        .collect();
+    if missing.is_empty() {
+        AcceptanceResult::ok(label, format!("all {} fragment(s) present", must_contain.len()))
+    } else {
+        AcceptanceResult::fail(label, format!("missing text: {}", missing.join(", ")))
     }
 }
 
@@ -314,6 +350,55 @@ mod tests {
         let results = run_acceptance_checks(&checks, dir.path());
         assert!(!results[0].ok);
         assert!(results[0].output.contains("HTTP"));
+    }
+
+    #[test]
+    fn run_kind_executes_script() {
+        let dir = tempdir().unwrap();
+        let cmd = if cfg!(windows) { "exit 0" } else { "true" };
+        let checks = vec![Acceptance::Run {
+            target: "tui".into(),
+            script: Some(cmd.into()),
+        }];
+        let results = run_acceptance_checks(&checks, dir.path());
+        assert!(results[0].ok);
+        assert!(results[0].label.starts_with("run: tui"));
+    }
+
+    #[test]
+    fn assert_passes_when_all_fragments_present() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("shot.svg"), b"<svg>Dark mode on</svg>").unwrap();
+        let checks = vec![Acceptance::Assert {
+            screenshot: "shot.svg".into(),
+            must_contain_text: vec!["Dark mode on".into()],
+        }];
+        let results = run_acceptance_checks(&checks, dir.path());
+        assert!(results[0].ok, "got {:?}", results[0]);
+    }
+
+    #[test]
+    fn assert_fails_on_missing_text() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("shot.svg"), b"<svg>Light mode</svg>").unwrap();
+        let checks = vec![Acceptance::Assert {
+            screenshot: "shot.svg".into(),
+            must_contain_text: vec!["Dark mode on".into()],
+        }];
+        let results = run_acceptance_checks(&checks, dir.path());
+        assert!(!results[0].ok);
+        assert!(results[0].output.contains("missing text"));
+    }
+
+    #[test]
+    fn assert_fails_on_missing_file() {
+        let dir = tempdir().unwrap();
+        let checks = vec![Acceptance::Assert {
+            screenshot: "nope.svg".into(),
+            must_contain_text: vec![],
+        }];
+        let results = run_acceptance_checks(&checks, dir.path());
+        assert!(!results[0].ok);
     }
 
     #[test]

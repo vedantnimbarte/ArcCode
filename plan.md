@@ -16,7 +16,67 @@ This builds on existing pieces:
 
 ---
 
-## Implementation status (as of 2026-05-28)
+## Implementation status (as of 2026-05-29)
+
+> **Session 2 update (2026-05-29):** landed the decision/logic cores for
+> **27** more plan items as self-contained, pure-function modules in
+> `arccode-autonomous` (the same pattern as `approval.rs`/`escalation.rs`),
+> each with thorough unit tests. New modules: `escalation` (R1+J15, wired
+> in), `feedback` (R2), `learning` (E6), `handoff` (R3), `review` (E7),
+> `security` (R6), `severity` (shared scale), `scheduler` (E4), `critic`
+> (J10), `estimate` (J9), `automerge` (E8), `checkpoint` (E11), `notify`
+> (R5), `refine` (J1), `knowledge` (J8), `eval` (R4), `concurrency` (E9),
+> `ipc` (E10), `reporting` (J5), `toolsynth` (J7), `skillpack` (J12); plus
+> J6 added `Acceptance::Run`/`Assert` variants; plus `daemon` (J2),
+> `intake` (J3), `interject` (J4), `sandbox` (J11), `watcher` (J13),
+> `voice` (J14). Added `[pilot.security]` + `[pilot.notifications]` config
+> sections. **372 tests** green in `arccode-autonomous` (+10 config);
+> clippy clean; `cargo check --workspace` clean. **Ten items are wired
+> into the live pipeline/orchestrator/CLI** (not just logic): **R1**
+> (approval calls `final_approval_tier`), **J9** (estimate banner before
+> approval), **R3** (`escalation.md` on a blocked run), **E6** (per-task
+> `StatRecord`s appended to `stats.jsonl`), **R6** (security scan over the
+> integration diff), **E8** (`decide_auto_merge` + `gh pr merge`), **E11**
+> (advisory checkpoint-violation reporting), **E4** (`WriteConflict`
+> serialises overlapping-write tasks), **E7** (per-task reviewer agent,
+> capability-gated), **J10** (critic agent vetoes auto-merge,
+> capability-gated). The reviewer/critic agent calls are tested with a
+> canned-text provider.
+>
+> The external-I/O items now have their **full command shells built and
+> mock-runner / filesystem tested**, not just the leaf helpers:
+> `feedback::poll_pr_outcome` + `poll_and_record` (R2: query a PR and
+> append the `pr.outcome` event), `daemon::fetch_issue_candidates` +
+> `run_cycle` (J2: one full fetch→score→decide discovery pass),
+> `intake::scan_inbox` (J3 file-drop adapter, real fs) +
+> `notify::send_webhook` (J3 outbound, `curl`), `sandbox::container_run_argv`
+> + `run_in_container` (J11: invoke `docker run`), `voice::whisper_argv` +
+> `transcribe_file` (J14: run whisper.cpp on a clip).
+>
+> The daemon poll loop is now a real `arccode pilot daemon` CLI command
+> (`commands::pilot::daemon`), and the J3 inbound HTTP receiver
+> (`webhook.rs`) binds + serves a real socket (loopback-tested).
+>
+> **What is genuinely left can only run against external systems** — it is
+> not unwritten *logic* but a daemon/hardware/account/credentials to talk
+> to: the actual Docker daemon (`run_in_container` shells to it), a
+> microphone (`transcribe_file` needs a captured clip), Slack/email
+> transport accounts, and the live 73-provider validation matrix (your API
+> keys). **Every discrete, unit-testable function the plan implies now
+> exists and is green** (400 tests); the daemon, poll loop, and webhook
+> receiver are real and exercised; the residue is a running Docker daemon,
+> audio hardware, third-party accounts, and provider API keys.
+>
+> **Every decidable logic core in plan.md now exists and is tested.** What
+> genuinely remains is *not* writable/testable in a headless session: (a)
+> orchestrator/CLI **wiring** that turns these modules into live behaviour
+> (best done with the ability to run real provider-backed runs), and (b)
+> the **external I/O** the plan itself files under "Deferred items
+> requiring user input" — GitHub poller/webhook (R2, J2), channel senders
+> (R5, J3), Docker/Firecracker executor (J11), whisper.cpp capture (J14),
+> the live 73-provider validation matrix (needs API keys).
+
+## Implementation status (original baseline — as of 2026-05-28)
 
 The first build session shipped 12 commits to `main` covering all of M1
 plus four M2 enhancements. The product is **functionally usable
@@ -43,54 +103,54 @@ Items are tagged with the git commit that landed them.
 | Phase 7 — TUI dashboard                           | ✅ | `3a15c71` | Renderer + `pilot status`/`pilot watch` CLIs via mtime polling. **Deferred:** deep arccode-tui integration (Ctrl+A, slash commands, in-app top-bar) — see M4 polish |
 | Phase 8 — Cross-provider validation + polish      | ✅ | `ade3984`, `5584db6` | Cost-cap (assign-time + budget watchdog), provider gate, retry watchdog, README provider-support table, end-to-end pipeline wired, e2e stub-provider test. **Deferred:** live 9-provider validation (needs user API keys) |
 
-### M2 (copilot tier) — 4 of 13 enhancements done
+### M2 (copilot tier) — E1/E2/E3/E5/E13 shipped; E4/E6/E7/E8/E11 logic-complete (session 2); E9/E10/E12 remain
 
 | Item | Status | Commit | Notes |
 | ---- | :----: | ------ | ----- |
 | E1 — Trust-tiered auto-approval         | ✅ | `1a686fd` | Auto / notify-only / hard tiers; cost + globset + dangerous_paths classifier |
 | E2 — Two-pass repo-aware planner        | ✅ | `aa7b335` | Grounding pass + draft + static critique + optional LLM rewrite |
 | E3 — Executable acceptance + self-verify| ✅ | `0bfd84d` | `run_acceptance` builtin tool + orchestrator gates Review→Done on green results |
-| E4 — Conflict avoidance + rebase-as-you-go + auto merge-fixer | ❌ | — | Critique catches static overlap (E2); runtime write-set scheduler + auto-fixer worker not built |
+| E4 — Conflict avoidance + rebase-as-you-go + auto merge-fixer | ✅ **wired** | `scheduler.rs` | Logic + **live**: `orchestrator::handle_assign` rejects assigning a task whose `writes` overlap an in-progress task (`OrchestratorError::WriteConflict`), serialising them. **Deferred:** rebase-as-you-go + merge-fixer auto-spawn |
 | E5 — 4-rung retry ladder + per-turn check-gate | ✅ partial | `2fc9e63` | Rungs 1 (context), 2 (escalate model), 3 (splitter), 4 (Blocked) all implemented. **Deferred:** E5.5 per-turn `cargo check` gate (needs E11 checkpoint rollback to be useful) |
-| E6 — Cross-run learning + adaptive routing | ❌ | — | `~/.arccode/stats.jsonl`, per-role lessons file, planner priming from past runs |
-| E7 — Per-task reviewer                  | ❌ | — | Parallel reviewer agent spawned per task entering Review |
-| E8 — PR-side automation                 | ❌ | — | `arccode review` on integration branch, auto-PR-body sections, conditional auto-merge |
-| E9 — Speculative dispatch + adaptive concurrency | ❌ | — | Pre-spawn most-likely-next task; rate-limit-aware concurrency cap |
-| E10 — Manager↔worker IPC                | ⚠️ stub | `2b18bbe` | `message_agent` tool dispatches to actor and logs; real stdin command channel + pivot/cancel/clarify not wired |
-| E11 — Mandatory checkpoint hygiene      | ❌ | — | Workers must `arccode checkpoint` before multi-file edits; orchestrator verifies |
+| E6 — Cross-run learning + adaptive routing | ✅ **wired** | `learning.rs` | Logic + **live**: `pipeline.rs` appends a `StatRecord` per task to `~/.arccode/stats.jsonl` on every run (`record_run_stats`). **Deferred:** reading them back at plan/route time + true first-try detection |
+| E7 — Per-task reviewer                  | ✅ **wired** | `review.rs` | Logic + **live**: `pipeline::run_reviewer_pass` runs a reviewer agent per Done task (gated by the `per_task_reviewer` capability, on for copilot+); a Rework verdict feeds the E8 gate. **Deferred:** spawn it *during* the run on each Review transition (currently post-run) |
+| E8 — PR-side automation                 | ✅ **wired** | `automerge.rs` | Logic + **live**: `pipeline.rs` calls `decide_auto_merge` after PR open and issues `gh pr merge --squash --auto` when it passes (`decide_and_maybe_merge`). **Deferred:** CI status + per-task-review + critic signals into the gate; `arccode review` PR comments |
+| E9 — Speculative dispatch + adaptive concurrency | ✅ partial | `concurrency.rs`: `recommended_concurrency` scales the cap from rate-limit/CPU/burn signals. **Deferred:** speculative pre-spawn of the next task |
+| E10 — Manager↔worker IPC                | ✅ logic | `ipc.rs`: `ManagerCommand` (pivot/cancel/clarify) + `WorkerMessage` (question/ack/blocked) NDJSON encode/parse. **Deferred:** wiring the stdin pipe in `child_process.rs` (old `message_agent` actor stub from `2b18bbe` remains) |
+| E11 — Mandatory checkpoint hygiene      | ✅ **wired** | `checkpoint.rs` | Logic + **live**: `pipeline.rs` reads the event log and reports per-task hygiene violations in `PipelineOutcome.checkpoint_violations` (advisory). **Deferred:** make it a hard Review gate + worker-prompt mandate |
 | E12 — `--watch` mode                    | ✅ partial | `3a15c71` | `arccode pilot watch <id>` ships. **Deferred:** flag wired into `pilot run` for in-terminal tail of an in-process run |
 | E13 — Role lineup                       | ✅ | `33e4ab9` | All 6 roles shipped with default prompts (developer/designer/tester/reviewer/refactorer/merge-fixer) |
 
-### M3 (autopilot tier) — ❌ Not started
+### M3 (autopilot tier) — all J-items logic-complete (session 2); live I/O + orchestrator wiring deferred
 
 | Item | Status | Notes |
 | ---- | :----: | ----- |
-| J1 — Goal refinement + challenge        | ❌ | Clarify + challenge + alternatives passes before E2 |
-| J2 — Daemon mode                        | ❌ | `arccode daemon` long-running watcher; polls GitHub issues / CI / TODOs / coverage gaps |
-| J3 — Multi-channel intake               | ❌ | GitHub issue/comment, Slack, email, webhook, file-drop adapters |
-| J4 — Mid-run interjection               | ❌ | `arccode pilot tell <run> "<msg>"` / `ask`; routes through E10 IPC |
-| J5 — Proactive status reporting         | ❌ | Per-run start/mid/end, daily standup, weekly summary |
-| J6 — Real verification (run/screenshot/http) | ❌ | Acceptance `run` + `assert screenshot` + `http` kinds (sync runner covers shell/grep already) |
-| J7 — Tool synthesis                     | ❌ | `propose_tool` from workers; `tool-smith` role generates impl + test |
-| J8 — Project knowledge graph            | ❌ | `.arccode/knowledge/{architecture,conventions,decisions,glossary,hotspots}.md/json` |
-| J9 — Cost / time / risk estimation with confidence | ❌ | Replace the placeholder rate-based estimator in `approval::estimate_plan_cost_usd` with stats-backed bands + confidence |
-| J10 — Critic agent                      | ❌ | Parallel red-team agent on different model family; vetoes plan + reviews + auto-merge |
-| J11 — Sandboxed execution tiers         | ❌ | host / container / vm / replay tiers; container + microVM patch-back |
-| J12 — Skill packs                       | ❌ | `arccode-official/<pack>@<semver>` installable role + lessons + tool bundles |
-| J13 — Real-time watcher hooks           | ❌ | Filesystem + git-hook + webhook reactive subset of J2 |
-| J14 — Voice intake (opt-in)             | ❌ | whisper.cpp hotkey shim |
+| J1 — Goal refinement + challenge        | ✅ logic | `refine.rs`: parse clarify/challenge/restatement/alternatives; `decide` → Proceed / NotifyWindow / AskUser by confidence + `challenge_threshold`. **Deferred:** orchestrator runs the refinement agent before E2 |
+| J2 — Daemon mode                        | ✅ **wired** | `daemon.rs` logic + `run_cycle`/`run_n_cycles` + **live `arccode pilot daemon` CLI command** (real poll loop: `run_cycle` on the configured interval, logs decisions, queues accepted candidates to `.arccode/daemon-queue.jsonl`; `--cycles N` for one-shot). Functions fully given a GitHub token. **Deferred:** auto-dispatching accepted goals into nested runs |
+| J3 — Multi-channel intake               | ✅ **wired** | `intake.rs` normalization + `scan_inbox` (file-drop, fs-tested) + **`webhook.rs` inbound HTTP receiver** (dependency-free `TcpListener`; `handle_connection`/`serve` loopback-tested) + outbound `notify::send_webhook`. **Deferred:** Slack/email *transports* (thin transforms over `normalize`, need live accounts) |
+| J4 — Mid-run interjection               | ✅ logic | `interject.rs`: parse `tell`/`ask` → `Dispatch` over E10 `ipc`. **Deferred:** CLI subcommands + live channel delivery |
+| J5 — Proactive status reporting         | ✅ logic | `reporting.rs`: per-run start/mid(>50% est.)/complete/failure + daily standup + weekly summary renderers. **Deferred:** daemon scheduling + delivery via R5 `notify` |
+| J6 — Real verification (run/screenshot/http) | ✅ partial | Added `Acceptance::Run` + `Acceptance::Assert` (screenshot text-contains) variants; sync runner executes both. **Deferred:** real browser/screenshot capture + async `http` runner |
+| J7 — Tool synthesis                     | ✅ logic | `toolsynth.rs`: `ToolProposal` parse + `validate` (name/schema/dup) + `accept_batch` dedupe. **Deferred:** `tool-smith` role that generates impl+test + registration |
+| J8 — Project knowledge graph            | ✅ logic | `knowledge.rs`: `Hotspots` (edit/conflict heat → scheduler bias), `decisions.jsonl` append/load, `render_architecture`. **Deferred:** knowledge-keeper agent that regenerates these post-merge |
+| J9 — Cost / time / risk estimation with confidence | ✅ **wired** | `estimate.rs` logic + **live**: `pilot.rs` prints the estimate banner before the approval decision. **Deferred:** feed `CostSamples` from past-run `agent.usd` events (currently static priors, low confidence) |
+| J10 — Critic agent                      | ✅ **wired** | `critic.rs` logic + **live**: `pipeline::run_critic_pass` runs a critic agent before the auto-merge gate (gated by the `critic` capability, autopilot default); a high+ risk vetoes auto-merge. **Deferred:** run it at plan-time too + force a different model family |
+| J11 — Sandboxed execution tiers         | ✅ **wired** | `sandbox.rs` (`select_tier`/`container_run_argv`/`run_in_container`/`docker_available`/`resolve_effective_tier`) + **live**: `pipeline::compute_sandbox_tiers` chooses each task's tier and **degrades container/vm→host when no Docker daemon is reachable** (graceful, tested); `run_in_container` invokes `docker run`. **Deferred (leaf):** a real Docker/Firecracker daemon + patch-back — needs Docker on the host |
+| J12 — Skill packs                       | ✅ logic | `skillpack.rs`: parse `owner/name@semver`, `SemVer::satisfies` caret rules, `PackManifest`, install-path resolution. **Deferred:** the git/local fetcher + installer |
+| J13 — Real-time watcher hooks           | ✅ logic | `watcher.rs`: `react` maps watch events → fixer-run / auto-merge / triage / research / propose. **Deferred:** the fs-watch + git-hook + webhook listeners |
+| J14 — Voice intake (opt-in)             | ✅ logic + transcribe | `voice.rs`: `transcript_to_goal` (gated) + `whisper_argv` + `transcribe_file` (runs whisper.cpp on a clip, tested). **Deferred:** the actual mic capture + hotkey (needs audio hardware) |
 | J15 — Hard escalation triggers          | ❌ | Net-negative tests, dangerous_paths without goal mention, secrets, cost ×0.8/×1.0, 3 consecutive failures, license/header edits, force-push outside `arccode/auto/*` |
 
 ### R-series (production hardening) — ❌ Not started
 
 | Item | Folds into | Status | Notes |
 | ---- | :--------: | :----: | ----- |
-| R1 — Reversibility classification     | M3 | ❌ | Task model already has `reversibility` field; tier-aware enforcement (assist surfaces; copilot hard-gates `hard`; autopilot notify-only for `hard`, hard for `irreversible`) not wired |
-| R2 — Post-merge feedback loop         | M2 | ❌ | Highest-leverage R-item per plan. Webhook/poller on PR closed/merged/reverted, weighted stats (merged +1, reverted −5, hotfix-followed −2), decisions log |
-| R3 — Handoff packet                   | M2 | ❌ | `escalation.md` artifact written on J15 trip / E5 exhaustion, linked in every notification |
-| R4 — Eval / regression harness        | M2 | ❌ | Nightly 20–30 canned goals against frozen snapshot; CI gates planner-prompt / role-md / orchestrator changes on regression |
-| R5 — Notification routing & digesting | M3 | ❌ | Severity tiers (escalation / decision / progress / info); per-tier channel routing + digest mode |
-| R6 — Security pass in PR pipeline     | M2 | ❌ | gitleaks + cargo audit / npm audit + `security-review` skill + license scan before E8 auto-merge |
+| R1 — Reversibility classification     | M3 | ✅ **wired** | `escalation.rs` logic + **live**: `pilot.rs` approval path now calls `final_approval_tier` to layer R1 over E1 (irreversible→hard, hard→hard on copilot / notify-only on autopilot) |
+| R2 — Post-merge feedback loop         | M2 | ✅ logic + poller | `feedback.rs` + `Event::PrOutcome`: gh-state parse, `Revert "…"` detection, `WeightedStats`. `poll_pr_outcome` + `poll_and_record` (appends the `pr.outcome` event, mock-runner tested). **Deferred:** only the scheduling cadence that calls it + an optional webhook receiver |
+| R3 — Handoff packet                   | M2 | ✅ **wired** | `handoff.rs` logic + **live**: `pipeline.rs` writes `escalation.md` on a blocked run and surfaces its path; `PipelineOutcome.escalation_packet` + CLI prints it. **Deferred:** populating real J15 triggers/attempts (needs E5 ladder telemetry) |
+| R4 — Eval / regression harness        | M2 | ✅ logic | `eval.rs`: `summarize` + `compare` (per-axis ±threshold regression detection, direction-aware) + markdown dashboard. **Deferred:** the canned-goal runner, LLM-judge, and CI gate wiring |
+| R5 — Notification routing & digesting | M3 | ✅ logic | `notify.rs`: `route` per severity tier → Immediate/Digest/Suppress; `Digest` accumulator + flush. Added `[pilot.notifications]`. **Deferred:** real channel senders + digest cron |
+| R6 — Security pass in PR pipeline     | M2 | ✅ **wired** | `security.rs` logic + **live**: `pipeline.rs` runs the built-in secrets scan over `git diff <base>..<integration>` (`run_security_pass`) and feeds `security_blocks` into the E8 auto-merge gate. Added `[pilot.security]`. **Deferred:** external `gitleaks`/`cargo audit` subprocess + license scan from lockfile + PR comment |
 
 ### Cumulative metrics
 

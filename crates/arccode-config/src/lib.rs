@@ -1285,6 +1285,8 @@ pub struct PilotConfig {
     pub daemon: PilotDaemonConfig,
     pub refine: PilotRefineConfig,
     pub skills: PilotSkillsConfig,
+    pub security: PilotSecurityConfig,
+    pub notifications: PilotNotificationsConfig,
 
     /// Per-capability overrides. Each key turns one E1–E13 / J1–J15
     /// capability on or off regardless of the tier's defaults.
@@ -1308,6 +1310,8 @@ impl Default for PilotConfig {
             daemon: PilotDaemonConfig::default(),
             refine: PilotRefineConfig::default(),
             skills: PilotSkillsConfig::default(),
+            security: PilotSecurityConfig::default(),
+            notifications: PilotNotificationsConfig::default(),
             capabilities: BTreeMap::new(),
         }
     }
@@ -1448,6 +1452,70 @@ impl Default for PilotRefineConfig {
 pub struct PilotSkillsConfig {
     /// Installed skill packs, each `owner/name@semver`.
     pub packs: Vec<String>,
+}
+
+/// R6 — security pass run before E8's auto-merge gate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PilotSecurityConfig {
+    /// Secrets scanner binary to invoke on the diff (e.g. "gitleaks").
+    /// Empty disables the external scanner (the built-in heuristic scan
+    /// still runs).
+    pub secrets_scanner: String,
+    /// Run `cargo audit` / `npm audit` on lockfile changes.
+    pub dependency_audit: bool,
+    /// SPDX identifiers permitted for new dependencies.
+    pub allowed_licenses: Vec<String>,
+    /// Findings at or above this severity block auto-merge.
+    /// "info" | "low" | "medium" | "high" | "critical".
+    pub block_severity: String,
+}
+
+/// R5 — notification routing & digesting. Each severity tier routes to a
+/// set of channels, or the special sinks "digest" (batched) / "suppress".
+/// `escalation` / `decision` are channel lists (immediate); `progress` /
+/// `info` are single tokens that may be a channel, "digest", or
+/// "suppress".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PilotNotificationsConfig {
+    pub escalation: Vec<String>,
+    pub decision: Vec<String>,
+    pub progress: String,
+    pub info: String,
+    /// Cron expression for flushing the digest queue.
+    pub digest_cron: String,
+}
+
+impl Default for PilotNotificationsConfig {
+    fn default() -> Self {
+        Self {
+            escalation: vec!["desktop".into(), "slack".into(), "email".into()],
+            decision: vec!["desktop".into(), "slack".into()],
+            progress: "digest".into(),
+            info: "suppress".into(),
+            digest_cron: "0 9 * * *".into(),
+        }
+    }
+}
+
+impl Default for PilotSecurityConfig {
+    fn default() -> Self {
+        Self {
+            secrets_scanner: "gitleaks".into(),
+            dependency_audit: true,
+            allowed_licenses: vec![
+                "MIT".into(),
+                "Apache-2.0".into(),
+                "BSD-3-Clause".into(),
+                "BSD-2-Clause".into(),
+                "ISC".into(),
+                "MPL-2.0".into(),
+                "Unicode-DFS-2016".into(),
+            ],
+            block_severity: "medium".into(),
+        }
+    }
 }
 
 #[cfg(test)]

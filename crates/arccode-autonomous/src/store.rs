@@ -174,6 +174,34 @@ impl RunStore {
         self.dir.join("state.json")
     }
 
+    /// Read and parse the full event log from disk. Unlike [`state`],
+    /// which only keeps the reconstructed snapshot, this returns every
+    /// [`Event`] in order — needed by consumers that reason over the
+    /// activity stream (E11 checkpoint hygiene, R2 feedback). Blank lines
+    /// are skipped; a malformed line aborts with [`StoreError::BadEvent`].
+    pub async fn read_events(&self) -> Result<Vec<Event>, StoreError> {
+        let log_path = self.log_path();
+        let body = match tokio::fs::read_to_string(&log_path).await {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for (i, line) in body.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let event: Event = serde_json::from_str(line).map_err(|source| StoreError::BadEvent {
+                path: log_path.clone(),
+                line: i + 1,
+                source,
+            })?;
+            out.push(event);
+        }
+        Ok(out)
+    }
+
     /// Borrow the current in-memory snapshot.
     pub fn state(&self) -> &RunState {
         &self.state

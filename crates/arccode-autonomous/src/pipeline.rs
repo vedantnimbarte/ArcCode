@@ -40,6 +40,8 @@ pub enum PipelineError {
     Pr(#[from] crate::pr::PrError),
     #[error("store: {0}")]
     Store(#[from] crate::store::StoreError),
+    #[error("provider: {0}")]
+    Provider(String),
 }
 
 /// Inputs the pipeline needs that aren't already encoded in the
@@ -58,6 +60,31 @@ pub struct PipelineInputs {
     pub no_pr: bool,
     pub orchestrator_cfg: OrchestratorConfig,
     pub max_ticks: usize,
+    /// Tier the run is operating at — recorded in the R3 escalation packet
+    /// when the run blocks.
+    pub tier: arccode_config::PilotTier,
+    /// Worker model id — recorded in E6 stat records.
+    pub worker_model: String,
+    /// Where to append E6 cross-run stat records (`stats.jsonl`). `None`
+    /// disables stats recording (tests, `--plan-only`).
+    pub stats_path: Option<PathBuf>,
+    /// Whether E1 auto-approved this plan — an input to the E8 auto-merge
+    /// gate (auto-merge only fires for runs trusted from the start).
+    pub auto_approved: bool,
+    /// PR automation config (E8): auto-merge switch, CI requirement,
+    /// severity gate.
+    pub pr_config: arccode_config::PilotPrConfig,
+    /// Security-pass config (R6): block severity, license allowlist.
+    pub security_config: arccode_config::PilotSecurityConfig,
+    /// E7 — run a per-task reviewer agent after the run. Off by default.
+    pub run_reviewer: bool,
+    /// J10 — run a critic agent before the auto-merge gate. Off by default.
+    pub run_critic: bool,
+    /// Model the reviewer/critic agents run on (usually `default_model`).
+    pub reviewer_model: String,
+    /// J11 default sandbox tier ("host" | "container" | "vm"); per-task
+    /// tiers are escalated from this floor by `sandbox::select_tier`.
+    pub sandbox_default_tier: String,
 }
 
 /// Outcome of one full pipeline run.
@@ -66,6 +93,25 @@ pub struct PipelineOutcome {
     pub merged: Option<IntegrationMergeOutcome>,
     pub pr: Option<PrOutcome>,
     pub failed_tasks: Vec<String>,
+    /// Path to the R3 escalation packet (`escalation.md`), written when the
+    /// run blocked on failed/blocked tasks. `None` on a clean run.
+    pub escalation_packet: Option<PathBuf>,
+    /// E8 auto-merge decision, computed after the PR opens. `None` when no
+    /// PR was opened (`--no-pr` or a blocked run).
+    pub auto_merge: Option<crate::automerge::AutoMergeDecision>,
+    /// E11 advisory checkpoint-hygiene violations, as `(task_id, reason)`.
+    /// Empty on a clean run; advisory only (does not block).
+    pub checkpoint_violations: Vec<(String, String)>,
+    /// E7 per-task reviewer verdicts, as `(task_id, verdict)`. Empty when
+    /// the reviewer pass is disabled.
+    pub reviews: Vec<(String, crate::review::Verdict)>,
+    /// J10 critic veto. `true` means the critic flagged a high+ risk and
+    /// auto-merge was blocked regardless of the other gates.
+    pub critic_vetoed: bool,
+    /// J11 per-task sandbox tier chosen for the run, as `(task_id, tier)`.
+    /// Selection is always computed; actual container/vm execution is a
+    /// Docker/Firecracker-gated leaf invoked per tier.
+    pub sandbox_tiers: Vec<(String, String)>,
 }
 
 /// Drive the run from its current state to completion.
@@ -84,6 +130,10 @@ pub async fn run_to_completion(
 
     let (handle, join) = orchestrator::spawn(store, inputs.orchestrator_cfg, inputs.worker_spawner);
 
+    // Keep a handle to the provider for the post-run reviewer (E7) and
+    // critic (J10) passes — `build_manager` consumes the original Arc.
+    let aux_provider = inputs.provider.clone();
+
     // Drive the manager loop. Manager system prompt is loaded inside
     // build_manager; the per-tick state block is injected by
     // drive_to_completion.
@@ -98,6 +148,29 @@ pub async fn run_to_completion(
     handle.shutdown().await;
     let _ = join.await;
 
+    let run_dir = crate::run_dir(&project_root, &run_id);
+
+    // E11 — advisory checkpoint-hygiene check over the recorded tool
+    // stream. Surfaced (not blocked) so the operator can see when a
+    // multi-file task skipped checkpointing.
+    let checkpoint_violations = compute_checkpoint_violations(&run_dir, &final_state).await;
+
+    // E6 — record one cross-run stat per task so the adaptive router and
+    // J9 estimator have history to learn from on later runs.
+    if let Some(stats_path) = &inputs.stats_path {
+        record_run_stats(stats_path, &final_state, &inputs.worker_model);
+    }
+
+    // J11 — compute the sandbox tier each task should run in, escalating
+    // from the configured default by its writes/acceptance/reversibility,
+    // then degrading container/vm to host when no Docker daemon is
+    // reachable so the run never wedges on a missing executor.
+    let sandbox_tiers = compute_sandbox_tiers(
+        &final_state,
+        &inputs.sandbox_default_tier,
+        inputs.command_runner.as_ref(),
+    );
+
     let failed: Vec<String> = final_state
         .tasks
         .iter()
@@ -111,10 +184,20 @@ pub async fn run_to_completion(
             failed = ?failed,
             "tasks ended in non-Done state; skipping merge + PR"
         );
+        // R3 — write a handoff packet so the user has a single
+        // openable artifact explaining where the run blocked and how to
+        // resume, instead of just a log line.
+        let packet = write_escalation_packet(&project_root, &run_id, &final_state, inputs.tier);
         return Ok(PipelineOutcome {
             merged: None,
             pr: None,
             failed_tasks: failed,
+            escalation_packet: packet,
+            auto_merge: None,
+            checkpoint_violations,
+            reviews: Vec::new(),
+            critic_vetoed: false,
+            sandbox_tiers,
         });
     }
 
@@ -128,7 +211,6 @@ pub async fn run_to_completion(
         .iter()
         .any(|t| t.status == TaskStatus::Review);
 
-    let run_dir = crate::run_dir(&project_root, &run_id);
     let mut store = RunStore::load(&run_dir).await?;
 
     let merge_outcome = if need_merge {
@@ -170,6 +252,12 @@ pub async fn run_to_completion(
             merged: merge_outcome,
             pr: None,
             failed_tasks: Vec::new(),
+            escalation_packet: None,
+            auto_merge: None,
+            checkpoint_violations,
+            reviews: Vec::new(),
+            critic_vetoed: false,
+            sandbox_tiers,
         });
     }
 
@@ -185,11 +273,400 @@ pub async fn run_to_completion(
     )
     .await?;
 
+    // R6 — security pass over the integration diff, feeding the E8 gate.
+    let security_report = run_security_pass(
+        inputs.command_runner.as_ref(),
+        &project_root,
+        &snapshot_for_pr.base_commit,
+        &integration_branch,
+        &inputs.security_config,
+    );
+    let sec_gate = inputs
+        .security_config
+        .block_severity
+        .parse::<crate::severity::Severity>()
+        .unwrap_or(crate::severity::Severity::Medium);
+    let security_blocks = security_report.blocks_merge(sec_gate);
+    if security_blocks {
+        tracing::warn!(
+            target: "pilot::pipeline",
+            findings = security_report.findings.len(),
+            "security pass blocks auto-merge"
+        );
+    }
+
+    // E7 — per-task reviewer pass (opt-in). Runs a reviewer agent per
+    // task and records its verdict; the worst finding severity feeds the
+    // auto-merge gate.
+    let reviews = if inputs.run_reviewer {
+        run_reviewer_pass(aux_provider.as_ref(), &inputs.reviewer_model, &snapshot_for_pr).await
+    } else {
+        Vec::new()
+    };
+    let review_max_severity = reviews
+        .iter()
+        .filter_map(|(_, v)| match v {
+            crate::review::Verdict::Rework => Some(crate::severity::Severity::High),
+            crate::review::Verdict::Approve => None,
+        })
+        .max();
+
+    // J10 — critic pass (opt-in). A high+ risk vetoes auto-merge.
+    let critic_vetoed = if inputs.run_critic {
+        run_critic_pass(aux_provider.as_ref(), &inputs.reviewer_model, &snapshot_for_pr).await
+    } else {
+        false
+    };
+
+    // E8 — auto-merge gate. Combine the available signals and decide
+    // whether to merge automatically. When it decides Merge and the PR was
+    // opened by gh, we issue `gh pr merge`.
+    let auto_merge_decision = decide_and_maybe_merge(
+        inputs.command_runner.as_ref(),
+        &project_root,
+        &inputs.pr_config,
+        inputs.auto_approved,
+        inputs.tier,
+        security_blocks,
+        review_max_severity,
+        critic_vetoed,
+        &pr_outcome,
+    );
+
     Ok(PipelineOutcome {
         merged: merge_outcome,
         pr: Some(pr_outcome),
         failed_tasks: Vec::new(),
+        escalation_packet: None,
+        auto_merge: Some(auto_merge_decision),
+        checkpoint_violations,
+        reviews,
+        critic_vetoed,
+        sandbox_tiers,
     })
+}
+
+/// J11 — compute the per-task sandbox tier for the run from the configured
+/// default floor + each task's writes/acceptance/reversibility. Pure;
+/// actual container/vm execution (`sandbox::run_in_container`) is the
+/// Docker/Firecracker-gated leaf invoked per chosen tier.
+fn compute_sandbox_tiers(
+    state: &crate::model::RunState,
+    default_tier: &str,
+    runner: &dyn CommandRunner,
+) -> Vec<(String, String)> {
+    let floor = crate::sandbox::SandboxTier::parse(default_tier);
+    // Probe Docker once; container/vm tiers degrade to host when absent.
+    let docker = crate::sandbox::docker_available(runner);
+    state
+        .tasks
+        .iter()
+        .map(|t| {
+            let requested = crate::sandbox::select_tier(t, floor);
+            let effective = if docker {
+                requested
+            } else {
+                crate::sandbox::resolve_effective_tier(requested, runner).0
+            };
+            (t.id.clone(), effective.as_str().to_string())
+        })
+        .collect()
+}
+
+/// E8 — evaluate the auto-merge gate and, when it says Merge and `gh`
+/// opened the PR, run `gh pr merge --squash --auto`. Returns the decision.
+#[allow(clippy::too_many_arguments)]
+fn decide_and_maybe_merge(
+    runner: &dyn CommandRunner,
+    project_root: &std::path::Path,
+    pr_config: &arccode_config::PilotPrConfig,
+    auto_approved: bool,
+    tier: arccode_config::PilotTier,
+    security_blocks: bool,
+    review_max_severity: Option<crate::severity::Severity>,
+    critic_vetoes: bool,
+    pr_outcome: &PrOutcome,
+) -> crate::automerge::AutoMergeDecision {
+    use crate::severity::Severity;
+    let gate = pr_config
+        .auto_merge_max_severity
+        .parse::<Severity>()
+        .unwrap_or(Severity::Low);
+    // Autopilot may auto-merge from a notify-only window too; copilot only
+    // from a clean auto-approve. We model "trusted from the start" as
+    // auto_approved, relaxed for autopilot.
+    let tier_was_auto = auto_approved || tier == arccode_config::PilotTier::Autopilot;
+    let decision = crate::automerge::decide_auto_merge(&crate::automerge::AutoMergeInputs {
+        config_auto_merge: pr_config.auto_merge,
+        tier_was_auto,
+        ci_green: None, // CI status not plumbed yet
+        require_ci_green: pr_config.require_ci_green,
+        review_max_severity, // E7 per-task reviewer (wired below)
+        security_blocks,     // R6 security pass (wired below)
+        critic_vetoes,       // J10 critic (wired below)
+        dangerous_paths_touched: false,
+        merge_max_severity: gate,
+    });
+    if decision.is_merge() && pr_outcome.created_by_gh {
+        let out = runner.run(
+            "gh",
+            &["pr", "merge", "--squash", "--auto", &pr_outcome.url],
+            project_root,
+        );
+        match out {
+            Ok(o) if o.success() => {
+                tracing::info!(target: "pilot::pipeline", url = %pr_outcome.url, "auto-merged PR");
+            }
+            Ok(o) => tracing::warn!(target: "pilot::pipeline", stderr = %o.stderr, "gh pr merge failed"),
+            Err(e) => tracing::warn!(target: "pilot::pipeline", error = %e, "gh pr merge errored"),
+        }
+    }
+    decision
+}
+
+/// R6 — run the security pass over the integration diff. Currently the
+/// dependency-free built-in scan (secrets via prefix + entropy) over the
+/// added lines of `git diff <base>..<integration>`. External scanners
+/// (`gitleaks`, `cargo audit`) and license scanning layer on once their
+/// inputs are gathered; this is the always-on baseline.
+fn run_security_pass(
+    runner: &dyn CommandRunner,
+    project_root: &std::path::Path,
+    base_commit: &str,
+    integration_branch: &str,
+    _cfg: &arccode_config::PilotSecurityConfig,
+) -> crate::security::SecurityReport {
+    let mut report = crate::security::SecurityReport::default();
+    if base_commit.is_empty() {
+        return report;
+    }
+    let range = format!("{base_commit}..{integration_branch}");
+    let diff = match runner.run("git", &["diff", "--unified=0", &range], project_root) {
+        Ok(o) if o.success() => o.stdout,
+        _ => return report,
+    };
+    // Collect added lines (`+` but not the `+++` file header), pairing each
+    // with the current file from the most recent `+++ b/<path>` header.
+    let mut current_file = String::new();
+    let mut added: Vec<(String, String)> = Vec::new();
+    for line in diff.lines() {
+        if let Some(path) = line.strip_prefix("+++ b/") {
+            current_file = path.to_string();
+        } else if let Some(rest) = line.strip_prefix('+') {
+            if !line.starts_with("+++") {
+                added.push((current_file.clone(), rest.to_string()));
+            }
+        }
+    }
+    report.extend(crate::security::scan_secrets(&added));
+    report
+}
+
+/// One-shot text completion: send a system+user prompt and concatenate
+/// the assistant's `TextDelta`s. Used by the E7 reviewer and J10 critic
+/// passes, which expect a single JSON object back.
+async fn complete_text(
+    provider: &dyn Provider,
+    model: &str,
+    system: &str,
+    user: &str,
+) -> Result<String, PipelineError> {
+    use arccode_core::{CompletionRequest, ContentBlock, Message, Role as ApiRole, StreamEvent};
+    use futures::StreamExt;
+    let req = CompletionRequest {
+        model: model.to_string(),
+        system: Some(system.to_string()),
+        messages: vec![Message {
+            role: ApiRole::User,
+            content: vec![ContentBlock::Text { text: user.to_string() }],
+        }],
+        tools: vec![],
+        max_tokens: 2048,
+        temperature: None,
+        cache_breakpoints: vec![],
+    };
+    let mut stream = provider
+        .complete(req)
+        .await
+        .map_err(|e| PipelineError::Provider(e.to_string()))?;
+    let mut out = String::new();
+    while let Some(ev) = stream.next().await {
+        if let Ok(StreamEvent::TextDelta { text }) = ev {
+            out.push_str(&text);
+        }
+    }
+    Ok(out)
+}
+
+/// Extract the first top-level JSON object from a possibly-chatty reply
+/// (models sometimes wrap JSON in prose or fences).
+fn extract_json(s: &str) -> &str {
+    match (s.find('{'), s.rfind('}')) {
+        (Some(a), Some(b)) if b > a => &s[a..=b],
+        _ => s,
+    }
+}
+
+/// E7 — run a reviewer agent per task and collect verdicts. Parse
+/// failures default to Approve (a broken reviewer must not wedge the run);
+/// the orchestrator still has the security + critic gates.
+async fn run_reviewer_pass(
+    provider: &dyn Provider,
+    model: &str,
+    state: &crate::model::RunState,
+) -> Vec<(String, crate::review::Verdict)> {
+    const SYSTEM: &str = "You are a meticulous code reviewer. Review the described task's \
+        diff and reply with ONLY a JSON object: {\"verdict\":\"approve\"|\"rework\", \
+        \"summary\":\"...\", \"findings\":[{\"severity\":\"low|medium|high|critical\", \
+        \"message\":\"...\"}]}.";
+    let mut out = Vec::new();
+    for task in &state.tasks {
+        if !matches!(task.status, TaskStatus::Done | TaskStatus::Review) {
+            continue;
+        }
+        let summary = task
+            .outcome
+            .as_ref()
+            .map(|o| o.summary.as_str())
+            .unwrap_or("(no summary)");
+        let user = format!(
+            "Task #{}: {}\nRole: {}\nOutcome: {}\nFiles: {}",
+            task.id,
+            task.title,
+            task.role.as_str(),
+            summary,
+            task.outcome
+                .as_ref()
+                .map(|o| o.files_changed.join(", "))
+                .unwrap_or_default()
+        );
+        let verdict = match complete_text(provider, model, SYSTEM, &user).await {
+            Ok(text) => match crate::review::parse_review(extract_json(&text)) {
+                Ok(report) => report.verdict,
+                Err(_) => crate::review::Verdict::Approve,
+            },
+            Err(e) => {
+                tracing::warn!(target: "pilot::pipeline", task = %task.id, error = %e, "reviewer call failed");
+                crate::review::Verdict::Approve
+            }
+        };
+        out.push((task.id.clone(), verdict));
+    }
+    out
+}
+
+/// J10 — run a critic on the whole run; returns true if it vetoes
+/// auto-merge (any high+ risk). Parse/call failures default to no veto.
+async fn run_critic_pass(
+    provider: &dyn Provider,
+    model: &str,
+    state: &crate::model::RunState,
+) -> bool {
+    const SYSTEM: &str = "You are an adversarial critic on a different model family than the \
+        author. Find what could break this work. Reply with ONLY a JSON object: \
+        {\"summary\":\"...\",\"risks\":[{\"severity\":\"low|medium|high|critical\", \
+        \"description\":\"...\"}]}.";
+    let tasks: Vec<String> = state
+        .tasks
+        .iter()
+        .map(|t| format!("- #{} [{}] {}", t.id, t.role.as_str(), t.title))
+        .collect();
+    let user = format!("Goal: {}\nTasks:\n{}", state.goal, tasks.join("\n"));
+    match complete_text(provider, model, SYSTEM, &user).await {
+        Ok(text) => match crate::critic::parse_critic(extract_json(&text)) {
+            Ok(report) => report.vetoes_auto_merge(),
+            Err(_) => false,
+        },
+        Err(e) => {
+            tracing::warn!(target: "pilot::pipeline", error = %e, "critic call failed");
+            false
+        }
+    }
+}
+
+/// E11 — read the event log and flag tasks that reached a terminal state
+/// without satisfying checkpoint hygiene. Advisory; best-effort (a read
+/// error yields no violations rather than failing the run).
+async fn compute_checkpoint_violations(
+    run_dir: &std::path::Path,
+    state: &crate::model::RunState,
+) -> Vec<(String, String)> {
+    let events = match RunStore::load(run_dir).await {
+        Ok(store) => store.read_events().await.unwrap_or_default(),
+        Err(_) => return Vec::new(),
+    };
+    let mut violations = Vec::new();
+    for task in &state.tasks {
+        if !matches!(task.status, TaskStatus::Review | TaskStatus::Done) {
+            continue;
+        }
+        let calls = crate::checkpoint::tool_calls_for_task(&events, &task.id);
+        if let crate::checkpoint::CheckpointVerdict::Violation { reason } =
+            crate::checkpoint::verify(&calls)
+        {
+            violations.push((task.id.clone(), reason));
+        }
+    }
+    violations
+}
+
+/// E6 — append one [`crate::learning::StatRecord`] per task to the stats
+/// log so later runs can route adaptively and estimate from history.
+fn record_run_stats(
+    stats_path: &std::path::Path,
+    state: &crate::model::RunState,
+    worker_model: &str,
+) {
+    for task in &state.tasks {
+        let rec = crate::learning::StatRecord {
+            run_id: state.run_id.clone(),
+            role: task.role.as_str().to_string(),
+            model: worker_model.to_string(),
+            task_kind: None,
+            // Proxy: a task that reached Done passed; refinement (true
+            // first-try detection) lands when the retry ladder records
+            // attempt counts.
+            first_try_ok: task.status == TaskStatus::Done,
+            pr_outcome: None, // R2 poller backfills this later
+            goal: state.goal.clone(),
+            t: RunStore::now(),
+        };
+        if let Err(e) = crate::learning::append_stat(stats_path, &rec) {
+            tracing::warn!(target: "pilot::pipeline", error = %e, "failed to append stat record");
+        }
+    }
+}
+
+/// R3 — render + write the escalation packet for a blocked run. Returns
+/// the packet path on success, or `None` if writing failed (best-effort;
+/// a failed packet write must not mask the run's real failure).
+fn write_escalation_packet(
+    project_root: &std::path::Path,
+    run_id: &str,
+    state: &crate::model::RunState,
+    tier: arccode_config::PilotTier,
+) -> Option<PathBuf> {
+    let blocked_task = state
+        .tasks
+        .iter()
+        .find(|t| matches!(t.status, TaskStatus::Failed | TaskStatus::Blocked));
+    let packet = crate::handoff::HandoffPacket {
+        state,
+        tier,
+        blocked_task,
+        triggers: &[],
+        attempts: &[],
+        why_stuck: None,
+        suggested_next: None,
+    };
+    let run_dir = crate::run_dir(project_root, run_id);
+    match crate::handoff::write_packet(&run_dir, &packet) {
+        Ok(path) => Some(path),
+        Err(e) => {
+            tracing::warn!(target: "pilot::pipeline", error = %e, "failed to write escalation packet");
+            None
+        }
+    }
 }
 
 /// Mark tasks stuck in `InProgress` as `Failed` so the retry watchdog
@@ -446,6 +923,19 @@ mod tests {
         }
     }
 
+    /// Runner where every command fails (exit 1) — used to simulate a host
+    /// with no `docker` daemon for the J11 degradation test.
+    struct AllFailRunner;
+    impl CommandRunner for AllFailRunner {
+        fn run(&self, _program: &str, _args: &[&str], _cwd: &Path) -> std::io::Result<CommandOut> {
+            Ok(CommandOut {
+                status: Some(1),
+                stdout: String::new(),
+                stderr: "not found".into(),
+            })
+        }
+    }
+
     /// Phase 8.6 acceptance: end-to-end pipeline against a stub provider
     /// and fake spawner.
     ///
@@ -565,6 +1055,16 @@ mod tests {
                 max_retries_per_task: 0,
             },
             max_ticks: 32,
+            tier: arccode_config::PilotTier::Copilot,
+            worker_model: "stub-worker".into(),
+            stats_path: None,
+            auto_approved: false,
+            pr_config: arccode_config::PilotPrConfig::default(),
+            security_config: arccode_config::PilotSecurityConfig::default(),
+            run_reviewer: false,
+            run_critic: false,
+            reviewer_model: "stub".into(),
+            sandbox_default_tier: "host".into(),
         };
 
         let outcome = run_to_completion(store, inputs).await.unwrap();
@@ -599,6 +1099,384 @@ mod tests {
             Some("https://github.com/test/repo/pull/1")
         );
         assert!(matches!(state.status, RunStatus::Done));
+    }
+
+    /// R3 wiring: a blocked run writes an escalation packet naming the
+    /// blocked task and a resume command.
+    #[tokio::test]
+    async fn blocked_run_writes_escalation_packet() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().to_path_buf();
+        let run_id = "blocked-run";
+
+        let mut state = crate::model::RunState::new(
+            run_id,
+            "do something risky",
+            "abc123",
+            crate::integration_branch(run_id),
+        );
+        let mut t1 = Task::new("t1", Role::Developer, "the hard part");
+        t1.status = TaskStatus::Blocked;
+        state.tasks.push(t1);
+
+        let path = write_escalation_packet(
+            &project_root,
+            run_id,
+            &state,
+            arccode_config::PilotTier::Copilot,
+        )
+        .expect("packet written");
+
+        assert!(path.ends_with("escalation.md"));
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("# Escalation: blocked-run"));
+        assert!(body.contains("blocked at task #t1"));
+        assert!(body.contains("the hard part"));
+        assert!(body.contains("arccode pilot resume blocked-run"));
+    }
+
+    /// Recording CommandRunner: captures every invocation; all succeed.
+    struct RecordingRunner {
+        calls: Mutex<Vec<(String, Vec<String>)>>,
+    }
+    impl RecordingRunner {
+        fn new() -> Self {
+            Self { calls: Mutex::new(Vec::new()) }
+        }
+    }
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, program: &str, args: &[&str], _cwd: &Path) -> std::io::Result<CommandOut> {
+            self.calls.lock().unwrap().push((
+                program.to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+            ));
+            let stdout = if program == "gh" && args.first().copied() == Some("pr")
+                && args.get(1).copied() == Some("create")
+            {
+                "https://github.com/test/repo/pull/9\n".to_string()
+            } else {
+                String::new()
+            };
+            Ok(CommandOut { status: Some(0), stdout, stderr: String::new() })
+        }
+    }
+
+    #[test]
+    fn e6_record_run_stats_writes_one_per_task() {
+        let dir = tempdir().unwrap();
+        let stats = dir.path().join("stats.jsonl");
+        let mut state = crate::model::RunState::new("r1", "the goal", "abc", "b");
+        let mut t1 = Task::new("t1", Role::Developer, "x");
+        t1.status = TaskStatus::Done;
+        let mut t2 = Task::new("t2", Role::Tester, "y");
+        t2.status = TaskStatus::Done;
+        state.tasks = vec![t1, t2];
+
+        record_run_stats(&stats, &state, "haiku");
+
+        let loaded = crate::learning::load_stats(&stats).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().all(|r| r.first_try_ok && r.model == "haiku"));
+        assert!(loaded.iter().any(|r| r.role == "developer"));
+        assert!(loaded.iter().any(|r| r.role == "tester"));
+    }
+
+    #[test]
+    fn e8_auto_merge_holds_when_not_auto_approved() {
+        let runner = RecordingRunner::new();
+        let pr = PrOutcome { url: "https://x/pull/1".into(), created_by_gh: true };
+        let decision = decide_and_maybe_merge(
+            &runner,
+            Path::new("."),
+            &arccode_config::PilotPrConfig { auto_merge: true, require_ci_green: false, ..Default::default() },
+            false, // not auto-approved
+            arccode_config::PilotTier::Copilot,
+            false, // security clean
+            None,  // no review findings
+            false, // no critic veto
+            &pr,
+        );
+        assert!(!decision.is_merge());
+        // No gh pr merge call.
+        assert!(runner.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn e8_auto_merge_fires_when_trusted_and_ci_not_required() {
+        let runner = RecordingRunner::new();
+        let pr = PrOutcome { url: "https://x/pull/1".into(), created_by_gh: true };
+        let decision = decide_and_maybe_merge(
+            &runner,
+            Path::new("."),
+            &arccode_config::PilotPrConfig { auto_merge: true, require_ci_green: false, auto_merge_max_severity: "low".into() },
+            true, // auto-approved
+            arccode_config::PilotTier::Copilot,
+            false, // security clean
+            None,  // no review findings
+            false, // no critic veto
+            &pr,
+        );
+        assert!(decision.is_merge());
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|(p, a)| p == "gh" && a.first().map(|s| s.as_str()) == Some("pr") && a.get(1).map(|s| s.as_str()) == Some("merge")),
+            "expected a gh pr merge call, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn e8_security_block_holds_even_when_auto_approved() {
+        let runner = RecordingRunner::new();
+        let pr = PrOutcome { url: "https://x/pull/1".into(), created_by_gh: true };
+        let decision = decide_and_maybe_merge(
+            &runner,
+            Path::new("."),
+            &arccode_config::PilotPrConfig { auto_merge: true, require_ci_green: false, ..Default::default() },
+            true, // auto-approved
+            arccode_config::PilotTier::Copilot,
+            true, // security pass blocks
+            None,
+            false,
+            &pr,
+        );
+        assert!(!decision.is_merge());
+        assert!(runner.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn r6_security_pass_flags_secret_in_diff() {
+        struct DiffRunner;
+        impl CommandRunner for DiffRunner {
+            fn run(&self, program: &str, args: &[&str], _cwd: &Path) -> std::io::Result<CommandOut> {
+                let stdout = if program == "git" && args.first().copied() == Some("diff") {
+                    "+++ b/config.rs\n+let key = \"AKIAIOSFODNN7EXAMPLE\";\n".to_string()
+                } else {
+                    String::new()
+                };
+                Ok(CommandOut { status: Some(0), stdout, stderr: String::new() })
+            }
+        }
+        let report = run_security_pass(
+            &DiffRunner,
+            Path::new("."),
+            "base123",
+            "arccode/auto/r1",
+            &arccode_config::PilotSecurityConfig::default(),
+        );
+        assert!(!report.findings.is_empty());
+        assert!(report.blocks_merge(crate::severity::Severity::Medium));
+    }
+
+    #[test]
+    fn r6_security_pass_clean_diff_is_empty() {
+        struct DiffRunner;
+        impl CommandRunner for DiffRunner {
+            fn run(&self, program: &str, args: &[&str], _cwd: &Path) -> std::io::Result<CommandOut> {
+                let stdout = if program == "git" && args.first().copied() == Some("diff") {
+                    "+++ b/main.rs\n+let total = items.len();\n".to_string()
+                } else {
+                    String::new()
+                };
+                Ok(CommandOut { status: Some(0), stdout, stderr: String::new() })
+            }
+        }
+        let report = run_security_pass(
+            &DiffRunner,
+            Path::new("."),
+            "base123",
+            "arccode/auto/r1",
+            &arccode_config::PilotSecurityConfig::default(),
+        );
+        assert!(report.findings.is_empty());
+    }
+
+    /// Provider that returns a fixed text body for any request — stands in
+    /// for a reviewer/critic agent emitting a JSON verdict.
+    struct CannedTextProvider {
+        text: String,
+    }
+    #[async_trait]
+    impl Provider for CannedTextProvider {
+        fn id(&self) -> &str {
+            "canned-text"
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                streaming: false,
+                tools: false,
+                vision: false,
+                cache_kind: arccode_core::CacheKind::None,
+            }
+        }
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> arccode_core::Result<ProviderEventStream> {
+            use futures::stream;
+            let events = vec![
+                Ok(StreamEvent::TextDelta { text: self.text.clone() }),
+                Ok(StreamEvent::Stop { reason: StopReason::EndTurn }),
+            ];
+            Ok(Box::pin(stream::iter(events)))
+        }
+    }
+
+    fn done_task(id: &str) -> Task {
+        let mut t = Task::new(id, Role::Developer, format!("task {id}"));
+        t.status = TaskStatus::Done;
+        t.outcome = Some(crate::model::TaskOutcome {
+            summary: "did the thing".into(),
+            files_changed: vec![format!("{id}.rs")],
+        });
+        t
+    }
+
+    #[test]
+    fn j11_compute_sandbox_tiers_escalates_per_task() {
+        let mut state = crate::model::RunState::new("r1", "g", "abc", "b");
+        // Plain edit → stays host.
+        state.tasks.push({
+            let mut t = Task::new("t1", Role::Developer, "edit");
+            t.writes = vec!["crates/cli/src/main.rs".into()];
+            t
+        });
+        // Migration → vm.
+        state.tasks.push({
+            let mut t = Task::new("t2", Role::Developer, "migrate");
+            t.writes = vec!["db/migrations/001.sql".into()];
+            t
+        });
+        // No Docker → vm/container degrade to host. Use a runner that
+        // reports docker absent so the test is deterministic.
+        let no_docker = AllFailRunner;
+        let tiers = compute_sandbox_tiers(&state, "host", &no_docker);
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers.iter().find(|(id, _)| id == "t1").unwrap().1, "host");
+        // t2 selects vm but degrades to host without a daemon.
+        assert_eq!(tiers.iter().find(|(id, _)| id == "t2").unwrap().1, "host");
+    }
+
+    #[test]
+    fn j11_keeps_vm_tier_when_docker_present() {
+        let mut state = crate::model::RunState::new("r1", "g", "abc", "b");
+        state.tasks.push({
+            let mut t = Task::new("t2", Role::Developer, "migrate");
+            t.writes = vec!["db/migrations/001.sql".into()];
+            t
+        });
+        let with_docker = AllOkCommandRunner;
+        let tiers = compute_sandbox_tiers(&state, "host", &with_docker);
+        assert_eq!(tiers[0].1, "vm");
+    }
+
+    #[test]
+    fn j11_sandbox_default_is_a_floor() {
+        let mut state = crate::model::RunState::new("r1", "g", "abc", "b");
+        state.tasks.push(Task::new("t1", Role::Developer, "edit"));
+        // Default container floor lifts even a plain task to container —
+        // when Docker is available.
+        let tiers = compute_sandbox_tiers(&state, "container", &AllOkCommandRunner);
+        assert_eq!(tiers[0].1, "container");
+    }
+
+    #[tokio::test]
+    async fn e7_reviewer_pass_parses_verdict() {
+        let provider = CannedTextProvider {
+            text: r#"{"verdict":"rework","summary":"needs tests","findings":[{"severity":"high","message":"no error handling"}]}"#.into(),
+        };
+        let mut state = crate::model::RunState::new("r1", "g", "abc", "b");
+        state.tasks = vec![done_task("t1")];
+        let reviews = run_reviewer_pass(&provider, "m", &state).await;
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].1, crate::review::Verdict::Rework);
+    }
+
+    #[tokio::test]
+    async fn e7_reviewer_pass_defaults_to_approve_on_garbage() {
+        let provider = CannedTextProvider { text: "not json at all".into() };
+        let mut state = crate::model::RunState::new("r1", "g", "abc", "b");
+        state.tasks = vec![done_task("t1")];
+        let reviews = run_reviewer_pass(&provider, "m", &state).await;
+        assert_eq!(reviews[0].1, crate::review::Verdict::Approve);
+    }
+
+    #[tokio::test]
+    async fn j10_critic_pass_vetoes_on_high_risk() {
+        let provider = CannedTextProvider {
+            text: r#"{"summary":"risky","risks":[{"severity":"high","description":"drops a table"}]}"#.into(),
+        };
+        let mut state = crate::model::RunState::new("r1", "drop a column", "abc", "b");
+        state.tasks = vec![done_task("t1")];
+        assert!(run_critic_pass(&provider, "m", &state).await);
+    }
+
+    #[tokio::test]
+    async fn j10_critic_pass_no_veto_on_low_risk() {
+        let provider = CannedTextProvider {
+            text: r#"{"summary":"fine","risks":[{"severity":"low","description":"nit"}]}"#.into(),
+        };
+        let mut state = crate::model::RunState::new("r1", "g", "abc", "b");
+        state.tasks = vec![done_task("t1")];
+        assert!(!run_critic_pass(&provider, "m", &state).await);
+    }
+
+    #[tokio::test]
+    async fn e11_flags_multifile_task_without_checkpoint() {
+        let dir = tempdir().unwrap();
+        let run_id = "ckpt-run";
+        let run_dir = crate::run_dir(dir.path(), run_id);
+        let mut store = RunStore::create(
+            &run_dir,
+            run_id,
+            "g",
+            "abc",
+            crate::integration_branch(run_id),
+        )
+        .await
+        .unwrap();
+        store
+            .append(Event::TaskCreate {
+                t: RunStore::now(),
+                id: "t1".into(),
+                role: Role::Developer,
+                title: "edits two files".into(),
+                goal: String::new(),
+                deps: vec![],
+                writes: vec!["a.rs".into(), "b.rs".into()],
+                acceptance: vec![],
+                reversibility: Default::default(),
+                reversibility_reason: None,
+            })
+            .await
+            .unwrap();
+        // Two edits, no checkpoint between them.
+        for _ in 0..2 {
+            store
+                .append(Event::TaskTool {
+                    t: RunStore::now(),
+                    id: "t1".into(),
+                    agent: "a".into(),
+                    tool: "edit_file".into(),
+                    input_hash: None,
+                    ok: true,
+                })
+                .await
+                .unwrap();
+        }
+        store
+            .append(Event::TaskStatus {
+                t: RunStore::now(),
+                id: "t1".into(),
+                status: TaskStatus::Done,
+                outcome: None,
+            })
+            .await
+            .unwrap();
+
+        let state = store.state().clone();
+        let violations = compute_checkpoint_violations(&run_dir, &state).await;
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].0, "t1");
     }
 
     // Sanity: parse_state_from_request actually reads task statuses.

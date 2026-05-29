@@ -176,6 +176,20 @@ fn render_acceptance(a: &Acceptance) -> String {
         Acceptance::Shell { cmd } => format!("shell: `{cmd}`"),
         Acceptance::Grep { pattern, path } => format!("grep: `{pattern}` in `{path}`"),
         Acceptance::Http { url, .. } => format!("http GET: `{url}`"),
+        Acceptance::Run { target, .. } => format!("run: `{target}`"),
+        Acceptance::Assert {
+            screenshot,
+            must_contain_text,
+        } => {
+            if must_contain_text.is_empty() {
+                format!("assert rendered: `{screenshot}`")
+            } else {
+                format!(
+                    "assert `{screenshot}` contains: {}",
+                    must_contain_text.join(", ")
+                )
+            }
+        }
     }
 }
 

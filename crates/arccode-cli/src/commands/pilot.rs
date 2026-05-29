@@ -112,6 +112,17 @@ pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
     );
     eprint!("\n{}", render_plan(&plan));
 
+    // J9 — surface a cost/time/risk estimate with confidence before the
+    // approval decision. No historical cost samples are wired yet, so this
+    // uses the static per-role priors (low confidence, wide bands) — still
+    // more honest than a bare point estimate.
+    let estimate = arccode_autonomous::estimate::estimate_plan(
+        &plan,
+        &arccode_autonomous::estimate::CostSamples::default(),
+        pilot.max_concurrent_agents,
+    );
+    eprintln!("[pilot] {}", estimate.render().replace('\n', "\n[pilot] "));
+
     // E1 trust-tiered approval. Classifier decides whether to proceed
     // silently (auto), surface a veto window (notify-only), or fall
     // back to the y/e/n prompt (hard).
@@ -123,12 +134,25 @@ pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
             force_auto: opts.yes,
             force_hard: opts.review,
         });
+    // R1 reversibility enforcement: layer the per-tier reversibility
+    // gate over E1's trust decision. An irreversible task always forces a
+    // hard gate; a `hard`-reversibility task hard-gates on copilot and
+    // drops auto→notify-only on autopilot. `final_approval_tier` is a
+    // no-op when the plan carries no elevated reversibility.
+    let effective_tier =
+        arccode_autonomous::escalation::final_approval_tier(&plan, report.tier, pilot.tier);
+    if effective_tier != report.tier {
+        eprintln!(
+            "[pilot] approval: {} → {} (R1 reversibility override)",
+            report.tier, effective_tier
+        );
+    }
     eprintln!(
         "[pilot] approval: {} (est. ${:.2}) — {}",
-        report.tier, report.estimated_usd, report.reason
+        effective_tier, report.estimated_usd, report.reason
     );
 
-    let approve = match report.tier {
+    let approve = match effective_tier {
         arccode_autonomous::approval::ApprovalTier::Auto => true,
         arccode_autonomous::approval::ApprovalTier::NotifyOnly => {
             run_notify_window(
@@ -193,6 +217,24 @@ pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
         no_pr: opts.no_pr,
         orchestrator_cfg: orch_cfg,
         max_ticks: 64,
+        tier: pilot.tier,
+        worker_model: pilot
+            .worker_model
+            .clone()
+            .unwrap_or_else(|| selection.model.clone()),
+        stats_path: arccode_config::global_dir()
+            .ok()
+            .map(|g| g.join("stats.jsonl")),
+        auto_approved: effective_tier == arccode_autonomous::approval::ApprovalTier::Auto,
+        pr_config: pilot.pr.clone(),
+        security_config: pilot.security.clone(),
+        run_reviewer: capability_on(&pilot, "per_task_reviewer"),
+        run_critic: capability_on(&pilot, "critic"),
+        reviewer_model: pilot
+            .default_model
+            .clone()
+            .unwrap_or_else(|| selection.model.clone()),
+        sandbox_default_tier: pilot.sandbox.default_tier.clone(),
     };
 
     eprintln!(
@@ -207,6 +249,9 @@ pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
             "[pilot] some tasks did not reach Done: {:?}",
             outcome.failed_tasks
         );
+        if let Some(packet) = &outcome.escalation_packet {
+            eprintln!("[pilot] escalation packet written: {}", packet.display());
+        }
         return Ok(ExitCode::from(2));
     }
     if let Some(pr) = outcome.pr {
@@ -215,6 +260,24 @@ pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
         eprintln!("[pilot] integration branch ready; PR step skipped (--no-pr).");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Resolve whether a pilot capability is on: an explicit
+/// `[pilot.capabilities]` override wins; otherwise the tier default from
+/// the plan's tier→capability matrix applies.
+fn capability_on(pilot: &arccode_config::PilotConfig, key: &str) -> bool {
+    if let Some(&v) = pilot.capabilities.get(key) {
+        return v;
+    }
+    use arccode_config::PilotTier::*;
+    match key {
+        // Per-task reviewer (E7): on for copilot and autopilot.
+        "per_task_reviewer" => matches!(pilot.tier, Copilot | Autopilot),
+        // Critic (J10): autopilot-only by default.
+        "critic" => matches!(pilot.tier, Autopilot),
+        // Unknown capability defaults off.
+        _ => false,
+    }
 }
 
 /// Resolve the base commit for the run. `--base <REV>` overrides; otherwise
@@ -457,6 +520,28 @@ pub async fn resume(
         no_pr,
         orchestrator_cfg: orch_cfg,
         max_ticks: 64,
+        tier: cfg.pilot.tier,
+        worker_model: cfg
+            .pilot
+            .worker_model
+            .clone()
+            .unwrap_or_else(|| selection.model.clone()),
+        stats_path: arccode_config::global_dir()
+            .ok()
+            .map(|g| g.join("stats.jsonl")),
+        // Resumed runs don't re-run the approval gate; be conservative and
+        // don't auto-merge unless the operator re-approves.
+        auto_approved: false,
+        pr_config: cfg.pilot.pr.clone(),
+        security_config: cfg.pilot.security.clone(),
+        run_reviewer: capability_on(&cfg.pilot, "per_task_reviewer"),
+        run_critic: capability_on(&cfg.pilot, "critic"),
+        reviewer_model: cfg
+            .pilot
+            .default_model
+            .clone()
+            .unwrap_or_else(|| selection.model.clone()),
+        sandbox_default_tier: cfg.pilot.sandbox.default_tier.clone(),
     };
 
     eprintln!("[pilot] resume: driving manager loop for run {run_id}");
@@ -636,4 +721,104 @@ pub async fn watch(run_id: Option<String>, interval_ms: u64) -> Result<ExitCode>
         }
         tokio::time::sleep(interval).await;
     }
+}
+
+/// J2 — always-on discovery daemon. Polls the configured sources each
+/// cycle (via the tested `daemon::run_cycle`), logs each candidate's
+/// auto-run / propose / ignore decision, and appends accepted candidates
+/// to `<project>/.arccode/daemon-queue.jsonl` for follow-up. `cycles == 0`
+/// runs forever (Ctrl-C to stop); a positive value runs that many cycles
+/// then exits (used for one-shot triage / CI).
+pub async fn daemon(cfg: Config, cycles: usize) -> Result<ExitCode> {
+    use std::time::Duration;
+
+    let pilot = &cfg.pilot;
+    if !pilot.daemon.enabled && cycles == 0 {
+        eprintln!(
+            "[pilot] daemon is disabled. Set `[pilot.daemon].enabled = true` in config, \
+             or pass `--cycles N` for a one-shot discovery pass."
+        );
+        return Ok(ExitCode::from(1));
+    }
+
+    let project = ProjectPaths::discover(&std::env::current_dir()?);
+    let runner = arccode_autonomous::pr::SystemCommandRunner;
+    // Mirror the J2 default: propose at ~40% of the auto threshold.
+    let propose_floor = pilot.daemon.auto_threshold * 0.4;
+    let queue_path = project.root.join(".arccode").join("daemon-queue.jsonl");
+    let interval = Duration::from_secs(pilot.daemon.poll_interval_secs.max(1));
+
+    eprintln!(
+        "[pilot] daemon starting (sources: {:?}, auto_threshold: {:.2}, interval: {}s){}",
+        pilot.daemon.sources,
+        pilot.daemon.auto_threshold,
+        pilot.daemon.poll_interval_secs,
+        if cycles == 0 {
+            " — Ctrl-C to stop".to_string()
+        } else {
+            format!(" — {cycles} cycle(s)")
+        }
+    );
+
+    let mut n = 0usize;
+    loop {
+        let results = arccode_autonomous::daemon::run_cycle(
+            &runner,
+            &project.root,
+            &pilot.daemon,
+            propose_floor,
+        );
+        if results.is_empty() {
+            eprintln!("[pilot] daemon cycle {n}: no candidates");
+        }
+        for (cand, action) in &results {
+            eprintln!(
+                "[pilot] daemon cycle {n}: {:?} — {} (score {:.2}, {})",
+                action,
+                cand.title,
+                cand.score(),
+                cand.source
+            );
+            if matches!(
+                action,
+                arccode_autonomous::daemon::DaemonAction::AutoRun
+                    | arccode_autonomous::daemon::DaemonAction::Propose
+            ) {
+                if let Err(e) = append_daemon_queue(&queue_path, cand, *action) {
+                    eprintln!("[pilot] daemon: failed to queue candidate: {e}");
+                }
+            }
+        }
+
+        n += 1;
+        if cycles != 0 && n >= cycles {
+            eprintln!("[pilot] daemon: completed {n} cycle(s), exiting.");
+            return Ok(ExitCode::SUCCESS);
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// Append one accepted daemon candidate to the queue log.
+fn append_daemon_queue(
+    path: &std::path::Path,
+    cand: &arccode_autonomous::daemon::Candidate,
+    action: arccode_autonomous::daemon::DaemonAction,
+) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let line = serde_json::json!({
+        "source": cand.source,
+        "title": cand.title,
+        "score": cand.score(),
+        "action": format!("{action:?}"),
+    });
+    writeln!(f, "{line}")?;
+    Ok(())
 }

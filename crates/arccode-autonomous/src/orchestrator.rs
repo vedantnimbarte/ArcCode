@@ -47,6 +47,8 @@ pub enum OrchestratorError {
     ConcurrencyCap(u32),
     #[error("cost cap reached: spent ${spent:.2} of ${cap:.2}")]
     CostCap { spent: f64, cap: f64 },
+    #[error("task {0} write-set overlaps in-progress task {1}; serialising to avoid a conflict (E4)")]
+    WriteConflict(String, String),
     #[error("orchestrator stopped before this command completed")]
     Shutdown,
     #[error("worker spawn failed: {0}")]
@@ -648,6 +650,24 @@ async fn handle_assign(
             .count() as u32;
         if live >= cfg.max_concurrent_agents {
             return Err(OrchestratorError::ConcurrencyCap(cfg.max_concurrent_agents));
+        }
+
+        // E4 — write-set conflict avoidance: never run two tasks whose
+        // declared `writes` overlap concurrently, so most merge conflicts
+        // are designed out. `writes_overlap` is false when either side has
+        // no declared writes, so tasks that don't declare a write-set are
+        // unaffected (they fall back to the end-of-run merge strategy).
+        if let Some(conflict) = store_g
+            .state()
+            .tasks
+            .iter()
+            .find(|t| {
+                t.status == TaskStatus::InProgress
+                    && crate::scheduler::writes_overlap(&task.writes, &t.writes)
+            })
+            .map(|t| t.id.clone())
+        {
+            return Err(OrchestratorError::WriteConflict(task_id.to_string(), conflict));
         }
 
         let n = *next_agent_seq;
@@ -1285,6 +1305,99 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("task {task_id} never reached review");
+    }
+
+    /// E4 — write-set conflict avoidance: two independent tasks whose
+    /// `writes` overlap must not run concurrently. With t1 held
+    /// in-progress, assigning the overlapping t2 returns WriteConflict;
+    /// a non-overlapping t3 still assigns fine.
+    #[tokio::test]
+    async fn overlapping_writes_serialize_via_write_conflict() {
+        use std::time::Duration;
+        let dir = tempdir().unwrap();
+        let store = RunStore::create(
+            dir.path().join(".arccode/autonomous/e4-run"),
+            "e4-run",
+            "g",
+            "deadbeef",
+            "arccode/auto/e4-run",
+        )
+        .await
+        .unwrap();
+
+        // Spawner that pins the task in-progress for the test window.
+        let hold: WorkerSpawner = Arc::new(|ctx: SpawnContext| {
+            Box::pin(async move {
+                {
+                    let mut store = ctx.store.lock().await;
+                    let _ = store
+                        .append(Event::AgentSpawn {
+                            t: RunStore::now(),
+                            agent: ctx.agent_id.clone(),
+                            role: ctx.task.role.clone(),
+                            pid: Some(0),
+                            session_id: Some(ctx.session_id.clone()),
+                        })
+                        .await;
+                    let _ = store
+                        .append(Event::TaskStatus {
+                            t: RunStore::now(),
+                            id: ctx.task.id.clone(),
+                            status: TaskStatus::InProgress,
+                            outcome: None,
+                        })
+                        .await;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(WorkerSpawnResult {
+                    agent_id: ctx.agent_id,
+                    status: TaskStatus::InProgress,
+                    outcome: None,
+                })
+            })
+        });
+
+        let (handle, join) = spawn(store, cfg(dir.path().to_path_buf()), hold);
+
+        let spec = |id: &str, writes: Vec<&str>| NewTaskSpec {
+            id: Some(id.into()),
+            role: Role::Developer,
+            title: format!("task {id}"),
+            goal: String::new(),
+            deps: vec![],
+            writes: writes.into_iter().map(String::from).collect(),
+            acceptance: Vec::<Acceptance>::new(),
+            reversibility: Default::default(),
+            reversibility_reason: None,
+        };
+        handle.add_task(spec("t1", vec!["shared.rs"])).await.unwrap();
+        handle.add_task(spec("t2", vec!["shared.rs"])).await.unwrap();
+        handle.add_task(spec("t3", vec!["other.rs"])).await.unwrap();
+
+        // Assign t1 and wait for it to be in-progress.
+        handle.assign_task("t1").await.unwrap();
+        for _ in 0..200 {
+            let st = handle.snapshot().await.unwrap();
+            if st.task("t1").map(|t| t.status) == Some(TaskStatus::InProgress) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // t2 overlaps t1's write-set → WriteConflict.
+        match handle.assign_task("t2").await {
+            Err(OrchestratorError::WriteConflict(id, conflict)) => {
+                assert_eq!(id, "t2");
+                assert_eq!(conflict, "t1");
+            }
+            other => panic!("expected WriteConflict for t2, got {other:?}"),
+        }
+
+        // t3 is disjoint → assigns fine.
+        handle.assign_task("t3").await.unwrap();
+
+        handle.shutdown().await;
+        let _ = join.await;
     }
 
     /// Phase 4 acceptance (plan.md line 657): a 3-task plan with one dep

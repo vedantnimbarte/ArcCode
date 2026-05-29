@@ -7,25 +7,53 @@
 
 pub mod acceptance;
 pub mod approval;
+pub mod automerge;
+pub mod checkpoint;
 pub mod child_process;
+pub mod concurrency;
+pub mod critic;
+pub mod daemon;
 pub mod dashboard;
+pub mod escalation;
+pub mod estimate;
+pub mod eval;
+pub mod feedback;
 pub mod grounding;
+pub mod handoff;
+pub mod intake;
+pub mod interject;
+pub mod ipc;
+pub mod knowledge;
+pub mod learning;
 pub mod manager;
 pub mod model;
+pub mod notify;
 pub mod orchestrator;
 pub mod pipeline;
 pub mod planner;
 pub mod pr;
 pub mod provider_support;
+pub mod refine;
+pub mod reporting;
+pub mod review;
 pub mod role;
+pub mod sandbox;
+pub mod scheduler;
+pub mod security;
+pub mod severity;
+pub mod skillpack;
 pub mod store;
+pub mod toolsynth;
 pub mod tools;
+pub mod voice;
+pub mod watcher;
+pub mod webhook;
 pub mod worker;
 pub mod worktree;
 
 pub use model::{
-    apply, tasks_by_id, Acceptance, Agent, AgentStatus, Event, Reversibility, Role, RunState,
-    RunStatus, Task, TaskOutcome, TaskStatus, Totals,
+    apply, tasks_by_id, Acceptance, Agent, AgentStatus, Event, PrOutcomeKind, Reversibility, Role,
+    RunState, RunStatus, Task, TaskOutcome, TaskStatus, Totals,
 };
 pub use store::{RunStore, StoreError};
 

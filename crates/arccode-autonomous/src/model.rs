@@ -98,6 +98,63 @@ pub enum Acceptance {
         #[serde(default)]
         must_match: serde_json::Value,
     },
+    /// J6 — run the app/target to actually exercise the change (not just
+    /// test it). `script` (when given) is the command to run; otherwise
+    /// `target` is treated as the command. Success = exit 0.
+    Run {
+        target: String,
+        #[serde(default)]
+        script: Option<String>,
+    },
+    /// J6 — assert a rendered artifact (screenshot, ratatui SVG dump)
+    /// exists and contains every expected text fragment. Success = file
+    /// present and all `must_contain_text` substrings found.
+    Assert {
+        screenshot: String,
+        #[serde(default)]
+        must_contain_text: Vec<String>,
+    },
+}
+
+/// What happened to a run's PR after it left the orchestrator's hands (R2).
+///
+/// Observed by the post-merge poller/webhook and recorded as a
+/// [`Event::PrOutcome`]. The cross-run learning loop (E6) weights these
+/// far more heavily than the in-process first-try pass rate, because they
+/// reflect production reality rather than what merely survived review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrOutcomeKind {
+    /// PR merged and stuck — the run did its job.
+    Merged,
+    /// A later commit reverted the merge.
+    Reverted,
+    /// PR merged but a hotfix PR landed shortly after to patch it.
+    HotfixFollowed,
+    /// PR closed without ever merging (abandoned).
+    Closed,
+}
+
+impl PrOutcomeKind {
+    /// Weight contributed to the adaptive-routing success score (R2 §3).
+    /// merged = +1, reverted = −5, hotfix-followed = −2, closed = −1.
+    pub fn weight(self) -> f64 {
+        match self {
+            Self::Merged => 1.0,
+            Self::Reverted => -5.0,
+            Self::HotfixFollowed => -2.0,
+            Self::Closed => -1.0,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Merged => "merged",
+            Self::Reverted => "reverted",
+            Self::HotfixFollowed => "hotfix_followed",
+            Self::Closed => "closed",
+        }
+    }
 }
 
 /// Reversibility classification (R1). Orthogonal to `dangerous_paths`.
@@ -410,6 +467,28 @@ pub enum Event {
     /// Run terminated cleanly.
     #[serde(rename = "run.done")]
     RunDone { t: String },
+
+    /// R2 — post-merge feedback. Appended (often long after `run.done`)
+    /// when the poller/webhook observes what happened to this run's PR.
+    /// Drives the weighted cross-run stats in [`crate::feedback`].
+    #[serde(rename = "pr.outcome")]
+    PrOutcome {
+        t: String,
+        run_id: String,
+        kind: PrOutcomeKind,
+        /// SHA of the revert commit, when `kind == reverted`.
+        #[serde(default)]
+        revert_sha: Option<String>,
+        /// Hours between merge and revert, when known.
+        #[serde(default)]
+        hours_to_revert: Option<f64>,
+        /// Identifier of the follow-up hotfix PR, when `kind == hotfix_followed`.
+        #[serde(default)]
+        hotfix_pr: Option<String>,
+        /// Hours between merge and hotfix, when known.
+        #[serde(default)]
+        hours_to_hotfix: Option<f64>,
+    },
 }
 
 fn default_strategy() -> String {
@@ -432,6 +511,7 @@ impl Event {
             | Event::RunMergeStart { t, .. }
             | Event::RunMergeTask { t, .. }
             | Event::RunPr { t, .. }
+            | Event::PrOutcome { t, .. }
             | Event::RunDone { t } => t,
         }
     }
@@ -615,6 +695,12 @@ pub fn apply(state: &mut RunState, event: &Event) {
         }
         Event::RunDone { .. } => {
             state.status = RunStatus::Done;
+        }
+        Event::PrOutcome { .. } => {
+            // Cross-run signal recorded after the run has already ended.
+            // It carries no in-run state mutation; the feedback module
+            // (R2) reads these directly off the event log when computing
+            // weighted stats, so replay is a no-op here.
         }
     }
 }

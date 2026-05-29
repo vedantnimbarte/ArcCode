@@ -253,6 +253,13 @@ pub enum PilotAction {
         #[arg(long)]
         no_pr: bool,
     },
+    /// Always-on discovery daemon (J2): poll configured sources, score
+    /// candidates, and surface/queue work. Requires `[pilot.daemon].enabled`.
+    Daemon {
+        /// Run this many discovery cycles then exit; 0 = run forever.
+        #[arg(long, default_value_t = 0)]
+        cycles: usize,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -453,6 +460,10 @@ pub async fn run() -> Result<ExitCode> {
             PilotAction::Resume { run_id, no_pr } => {
                 let cfg = load_config()?;
                 commands::pilot::resume(cfg, run_id, no_pr, cli.model).await
+            }
+            PilotAction::Daemon { cycles } => {
+                let cfg = load_config()?;
+                commands::pilot::daemon(cfg, cycles).await
             }
         },
         Some(Command::Autonomous {

@@ -249,6 +249,9 @@ fn render_log_line(ev: &Event) -> String {
         }
         Event::RunPr { url, .. } => format!("{short_ts}  run.pr       {url}"),
         Event::RunDone { .. } => format!("{short_ts}  run.done"),
+        Event::PrOutcome { kind, .. } => {
+            format!("{short_ts}  pr.outcome   {}", kind.as_str())
+        }
     }
 }
 
