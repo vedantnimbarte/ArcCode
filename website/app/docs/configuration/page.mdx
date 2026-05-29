@@ -1,0 +1,79 @@
+export const metadata = {
+  title: "Configuration",
+  description: "The layered configuration model and environment variables.",
+};
+
+# Configuration
+
+`arccode` resolves configuration in this order (lowest to highest precedence):
+
+1. Built-in defaults.
+2. `~/.arccode/config.toml` (global).
+3. `<project>/.arccode/config.toml` (project-local).
+4. `ARCCODE_*` environment variables.
+5. CLI flags.
+
+TOML sub-tables are merged at the raw-TOML level, so an absent section in the
+project file does **not** wipe out the global values for that section.
+
+## Example config.toml
+
+```toml
+default_provider = "anthropic"
+permission_mode = "read-only"
+
+[tokens]
+compact_at_tokens = 120000
+tool_output_max_lines = 400
+prompt_cache = true
+
+[router]
+fast_model = "anthropic/claude-haiku-4-5-20251001"
+
+[tui]
+theme = "default"
+show_token_usage = true
+
+[providers.anthropic]
+api_key = "${ANTHROPIC_API_KEY}"
+model = "claude-opus-4-7"
+
+[providers.openai]
+api_key = "${OPENAI_API_KEY}"
+model = "gpt-4.1"
+
+[providers.ollama]
+base_url = "http://localhost:11434/v1"
+model = "llama3.1:8b"
+
+[logging]
+filter = "info,arccode=info"
+file = true
+```
+
+Any string field of the form `${ENV_VAR}` is resolved against the environment
+at load time.
+
+## Environment variables
+
+| Variable                     | Effect                                               |
+| ---------------------------- | ---------------------------------------------------- |
+| `ARCCODE_MODEL`              | Overrides `default_model`. Same syntax as `--model`. |
+| `ARCCODE_PROVIDER`           | Overrides `default_provider`.                        |
+| `ARCCODE_PERMISSION_MODE`    | `read-only` \| `auto-edit` \| `yolo`.                |
+| `ARCCODE_LOG`                | `tracing-subscriber` env-filter directive.           |
+| `ARCCODE_<PROVIDER>_API_KEY` | Sets `providers.<provider>.api_key`.                 |
+| `ARCCODE_<PROVIDER>_BASE_URL`| Sets `providers.<provider>.base_url`.                |
+| `ARCCODE_<PROVIDER>_MODEL`   | Sets `providers.<provider>.model`.                   |
+
+## Model fallback
+
+```toml
+[router]
+fallback_models = [
+  "openai/gpt-4.1",
+  "openrouter/anthropic/claude-opus-4-7",
+]
+```
+
+On primary failure the runtime walks the chain in order.

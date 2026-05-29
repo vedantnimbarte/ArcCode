@@ -1,0 +1,66 @@
+export const metadata = {
+  title: "Quick start",
+  description: "Scaffold a config, set an API key, and run Arc-Code.",
+};
+
+# Quick start
+
+## 1. Scaffold a config
+
+```bash
+arccode config init
+```
+
+This writes a starter `~/.arccode/config.toml` populated with entries for every
+supported provider, each pointing at a `${ENV_VAR}` placeholder for the API key.
+
+## 2. Set an API key
+
+Pick one of the supported providers and export its key. Anthropic is the
+default:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+# or
+export OPENAI_API_KEY=sk-...
+export OPENROUTER_API_KEY=...
+export GOOGLE_API_KEY=...
+```
+
+For local providers (Ollama, LM Studio, vLLM) no key is needed — just point
+the `base_url` at the running instance.
+
+## 3. Use it
+
+```bash
+# Interactive TUI in the current project
+arccode
+
+# Headless one-shot
+arccode --print "explain the agent loop in crates/arccode-core"
+
+# Headless, streaming JSON events (newline-delimited)
+arccode --print "list the public types in arccode-core" --json
+
+# Pick a model for this session only
+arccode --model anthropic/claude-opus-4-7
+arccode --model openai/gpt-4.1
+arccode --model gemini/gemini-2.5-pro
+
+# Loosen the permission model for this session
+arccode --mode auto-edit
+arccode --mode yolo            # no prompts; per-session only
+```
+
+## Inside the TUI
+
+- Type a prompt and hit Enter to send.
+- `/model <provider>/<model-id>` — swap the active model live.
+- `/memory` — list saved memories. `/memory forget <name>` to delete one.
+- `/recall <query>` — search across past sessions for prior context.
+- `/skill stats [name]` — show skill usage and outcome counts.
+- `/learn [status|reset]` — self-learning loop dashboard.
+
+Tell the agent things like "remember that I prefer pnpm over npm" or "from now
+on always run `cargo fmt` before commits" — it will call `save_memory` and the
+next session will see it in the system prompt.

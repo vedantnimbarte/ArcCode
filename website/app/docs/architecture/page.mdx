@@ -1,0 +1,54 @@
+export const metadata = {
+  title: "Architecture",
+  description: "The Cargo workspace and crate responsibilities.",
+};
+
+# Architecture
+
+Arc-Code is a Cargo workspace. Each crate has a narrow, well-defined
+responsibility.
+
+| Crate                | Role                                                                 |
+| -------------------- | ------------------------------------------------------------------- |
+| `arccode-cli`        | Binary entry point. Argument parsing, logging, runtime wiring, headless mode. |
+| `arccode-core`       | Provider-agnostic types: `Message`, `ContentBlock`, `CompletionRequest`, `Provider`, agent loop, streaming events, tool dispatch, token estimation. |
+| `arccode-config`     | TOML config loading, layered merge, env-var resolution, permission model. |
+| `arccode-providers`  | Concrete `Provider` implementations: Anthropic, Gemini, ChatGPT, Cohere, Watsonx, OpenAI-compatible (68 variants). |
+| `arccode-tools`      | Built-in tool implementations and the `ToolRegistry`.               |
+| `arccode-tui`        | `ratatui` interactive surface: composer, transcript, status bar, slash commands. |
+| `arccode-session`    | Append-only JSONL session log + replay/reconstruction for `/resume`. |
+| `arccode-rag`        | SQLite-backed code index with `fastembed` (BGE small) or a deterministic hash embedder fallback. |
+| `arccode-skills`     | Markdown-frontmatter skill files (global + project), auto-loaded into the system prompt. |
+| `arccode-learn`      | Self-improving loop: persistent memory store, skill usage stats, session embedding/recall, agent hooks. |
+| `arccode-mcp`        | MCP host scaffolding.                                               |
+| `arccode-ts`         | Tree-sitter facade: language detection, symbol extraction, semantic chunking, syntax-aware diffs. |
+| `arccode-autonomous` | Pilot mode: multi-agent orchestrator that delegates a goal to worker agents in isolated worktrees and converges into a PR. |
+
+## On-disk layout
+
+Global state lives under `~/.arccode/`:
+
+```text
+~/.arccode/
+├── config.toml             # global config
+├── credentials.toml        # provider credentials (optional)
+├── logs/                   # tracing output
+├── skills/                 # global skills (*.md)
+├── memory/                 # global memories (MEMORY.md index + <slug>.md)
+├── learn.db                # skill usage + outcome stats (SQLite)
+└── sessions.db             # cross-project session embeddings (SQLite)
+```
+
+Project state lives under `<project>/.arccode/`:
+
+```text
+<project-root>/.arccode/
+├── config.toml             # project-local overrides
+├── sessions/               # per-session JSONL logs (append-only)
+├── index.db                # project RAG index (SQLite + embeddings)
+├── skills/                 # project-scoped skills (override globals by name)
+└── memory/                 # project-scoped memories
+```
+
+For the full system design and data flows, see `docs/ARCHITECTURE.md` in the
+repository.

@@ -1,0 +1,41 @@
+export const metadata = {
+  title: "Slash commands",
+  description: "Built-in and user-defined slash commands in the TUI.",
+};
+
+# Slash commands
+
+## Built-in
+
+| Command                  | Effect                                                |
+| ------------------------ | ----------------------------------------------------- |
+| `/model <provider>/<id>` | Swap the active model live; history preserved.        |
+| `/memory`                | List saved memories. `/memory forget <name>` deletes. |
+| `/recall <query>`        | Search across past sessions for prior context.        |
+| `/skill stats [name]`    | Show skill usage and outcome counts.                  |
+| `/learn [status|reset]`  | Self-learning loop dashboard.                         |
+| `/find <query>`          | In-transcript search; `/findnext`, `/findprev`, `/findclear`. |
+
+The file-tree sidebar toggles with `Ctrl+B`: `j`/`k` move, `Tab` descends,
+`Enter` inserts the path into the composer. Mouse-wheel scrolling is enabled.
+
+## User-defined commands
+
+Place markdown files at `~/.arccode/commands/<name>.md` (global) or
+`<project>/.arccode/commands/<name>.md` (project). When you type
+`/<name> rest of line` in the TUI, the markdown body is expanded into the prompt
+with the literal token `$ARGS` replaced by `rest of line`, and submitted as if
+typed directly. Project-local commands shadow globals.
+
+Example `~/.arccode/commands/refactor.md`:
+
+```markdown
+Refactor the following Rust code with these constraints:
+1. Keep the public API unchanged.
+2. Prefer iterators over explicit loops.
+3. Run `cargo clippy` mentally and address obvious lints.
+
+$ARGS
+```
+
+Then in the TUI: `/refactor crates/foo/src/lib.rs` expands to a complete prompt.

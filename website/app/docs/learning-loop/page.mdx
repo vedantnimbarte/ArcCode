@@ -1,0 +1,63 @@
+export const metadata = {
+  title: "Self-improving loop",
+  description: "Memories, skill stats, session recall, and nudges.",
+};
+
+# Self-improving loop
+
+Every session contributes to a small set of files under `~/.arccode/` and
+`<project>/.arccode/` that subsequent runs read on startup. There is no cloud
+component — everything is local-first.
+
+## What's persisted
+
+### Memories
+
+Memories live at `~/.arccode/memory/<slug>.md` (global) or
+`<project>/.arccode/memory/<slug>.md` (project), indexed by a sibling
+`MEMORY.md`. Each memory is markdown with YAML frontmatter (`name`,
+`description`, `type`). Four types:
+
+| Type        | Default scope | Used for                                                |
+| ----------- | ------------- | ------------------------------------------------------- |
+| `user`      | global        | Facts about the human (role, expertise, working style). |
+| `feedback`  | global        | How to behave (terse responses, avoid mocks, etc.).     |
+| `project`   | project       | Facts about this codebase (build commands, conventions). |
+| `reference` | global        | Pointers to external systems (issue tracker, dashboards). |
+
+The memory **index** (one bullet per memory) is rendered into the system prompt
+every turn. Full bodies stay on disk; the agent fetches them via `recall_memory`
+when relevant.
+
+### Skill usage
+
+Skill usage is stored at `~/.arccode/learn.db` (SQLite). Every `invoke_skill`
+call is recorded; the next user turn flips its outcome to `success` or
+`corrected` based on negation heuristics ("no,", "wait,", "wrong,",
+"actually,"…). When a skill crosses 3 invocations with ≥50% correction rate, the
+next session's system prompt suggests a rewrite.
+
+### Session embeddings
+
+Finished session JSONLs are chunked into thread-shaped windows and embedded
+using the same `fastembed`/hash backend that powers `semantic_search`, stored at
+`~/.arccode/sessions.db`. The CLI backfills any unindexed sessions in the
+background at startup.
+
+## Learning tools
+
+| Tool             | When the agent uses it                                          |
+| ---------------- | --------------------------------------------------------------- |
+| `save_memory`    | User says "remember", "from now on", expresses a stable preference. |
+| `recall_memory`  | The memory index hints at relevance and the agent needs the body. |
+| `forget_memory`  | User explicitly asks to forget, or a memory is clearly wrong.   |
+| `invoke_skill`   | A skill from the catalog matches the task.                      |
+| `recall_session` | "Have we discussed X before?" / "How did we fix Y last time?"   |
+| `read_session`   | Drill into a specific session id returned by `recall_session`.  |
+
+## Nudges
+
+After a configurable number of quiet sessions (default 5 — no saves), the system
+prompt for the next turn includes a one-line nudge asking the agent to consider
+proposing a memory if anything surprising came up. `/learn reset` zeros the
+counter; `/learn status` shows where you stand.

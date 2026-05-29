@@ -1,0 +1,38 @@
+export const metadata = {
+  title: "Pilot provider support",
+  description: "Which backends can drive pilot mode's structured tool use.",
+};
+
+# Pilot provider support
+
+Pilot mode requires the model to emit structured tool-use blocks. The table
+below classifies each backend; `untested` providers can still be used, but
+quality depends on the local model's tool-use training.
+
+| Provider      | Tier            | Notes                                                |
+| ------------- | --------------- | ---------------------------------------------------- |
+| Anthropic     | `native`        | First-class tool use. Reference implementation.      |
+| Gemini        | `native`        | `functionCall` shape; first-class.                   |
+| IBM watsonx   | `native`        | Granite + hosted Llama; IAM token exchange.          |
+| Cohere        | `native`        | Command-R/A; native `/v2/chat` with tool calls.      |
+| OpenAI        | `openai-compat` | `tool_calls` shape; works on gpt-4o, gpt-4.1.        |
+| ChatGPT       | `openai-compat` | OAuth-backed; same shape as OpenAI.                  |
+| OpenRouter    | `openai-compat` | Aggregator — pass `provider/model` as the model id.  |
+| Groq          | `openai-compat` | Fast Llama/Mixtral hosting; native `tool_calls`.     |
+| Together      | `openai-compat` | OSS catalog; tool-calls on Llama 3.1/3.3 + Qwen.     |
+| Fireworks     | `openai-compat` | OSS + fine-tunes; documented tool-call support.      |
+| DeepSeek      | `openai-compat` | `deepseek-chat` / `deepseek-reasoner`.               |
+| Mistral       | `openai-compat` | codestral + mistral-large.                           |
+| xAI (Grok)    | `openai-compat` | `grok-2` / `grok-2-vision`; supports `tool_calls`.   |
+| Azure OpenAI  | `openai-compat` | Uses `api-key:` header; set `base_url`.              |
+| AWS Bedrock   | `openai-compat` | Bedrock OpenAI surface + API key.                    |
+| GCP Vertex AI | `openai-compat` | Vertex OpenAPI endpoint + access token.              |
+| Perplexity    | `untested`      | Sonar models are search-augmented; not guaranteed.   |
+| LM Studio     | `untested`      | OpenAI-compat shim; depends on the loaded model.     |
+| vLLM          | `untested`      | Shape works; model has to be tool-trained.           |
+| Ollama        | `untested`      | `/v1` shim; picks up whatever model you've pulled.   |
+| llama.cpp     | `untested`      | `./server`'s `/v1` shim; depends on the loaded gguf. |
+
+`arccode pilot run` prints a one-line support notice at startup and refuses to
+start when the planner provider is `unsupported` (no current backends are; the
+tier exists for future providers that can't emit tool calls at all).

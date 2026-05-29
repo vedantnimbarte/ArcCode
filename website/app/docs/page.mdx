@@ -1,0 +1,45 @@
+export const metadata = {
+  title: "Introduction",
+  description:
+    "What Arc-Code is, how it is positioned, and where to go next.",
+};
+
+# Introduction
+
+`arccode` is a multi-provider, terminal-first **self-improving** coding agent
+written in Rust. It runs as a TUI for interactive sessions and as a headless
+one-shot (`--print "prompt"`) for scripting, talks to 73+ LLM providers behind
+a single streaming interface, ships a built-in tool layer for reading,
+searching, and editing the project tree, and learns from every conversation:
+it builds a persistent model of you and your projects, creates and refines
+skills from observed work, and recalls past sessions across projects.
+
+It is positioned as an open, provider-agnostic alternative to Claude Code,
+Cursor, and Aider — with native support for Anthropic, OpenAI, ChatGPT
+(OAuth), Google Gemini, OpenRouter, LiteLLM, LM Studio, vLLM, and Ollama,
+plus a planned MCP host.
+
+## Why Arc-Code
+
+- **Self-improving learning loop.** Persistent memories, skill usage stats with
+  outcome scoring, cross-session semantic recall, and quiet-session nudges.
+- **73+ providers, one shape.** Anthropic is the reference implementation. A
+  single OpenAI-compatible adapter covers OpenAI, OpenRouter, LM Studio, vLLM,
+  LiteLLM, and Ollama. Gemini and ChatGPT (OAuth) have their own adapters.
+- **Two surfaces.** A `ratatui`-based TUI for interactive coding and a headless
+  `--print` mode that emits text or newline-delimited JSON events.
+- **Built-in tool layer.** File read/write/edit, glob, grep, directory listing,
+  shell execution, semantic search, and the learning tools — each gated by the
+  active permission mode.
+- **Local-first.** There is no cloud component; everything is persisted under
+  `~/.arccode/` and `<project>/.arccode/`.
+
+## Where to go next
+
+- [Installation](/docs/installation) — build from source and install onto your `PATH`.
+- [Quick start](/docs/quick-start) — scaffold a config, set a key, and run.
+- [Configuration](/docs/configuration) — the layered config model.
+- [Pilot mode](/docs/pilot) — multi-agent orchestration into a PR.
+
+> This documentation mirrors the project `README.md`. For deep technical
+> guides, see the `docs/` directory in the repository.

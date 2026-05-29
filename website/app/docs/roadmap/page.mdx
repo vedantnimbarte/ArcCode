@@ -1,0 +1,26 @@
+export const metadata = {
+  title: "Roadmap",
+  description: "Milestone-by-milestone progress for Arc-Code.",
+};
+
+# Roadmap
+
+The project is being built milestone by milestone.
+
+| Milestone | Scope                                                                 | Status      |
+| --------- | --------------------------------------------------------------------- | ----------- |
+| **M0**    | Workspace scaffold, CLI surface, layered config loader.               | shipped     |
+| **M1**    | Headless and TUI agent loop against Anthropic with built-in tools.    | shipped     |
+| **M2**    | Six more providers, token pipeline, live `/model` swap.               | shipped     |
+| **M3**    | Session persistence, `/resume`, MCP host scaffolding.                 | shipped (MCP host in progress) |
+| **M4**    | Repo index / RAG with SQLite store and fastembed/hash fallback.       | shipped     |
+| **M5**    | Skills, ChatGPT OAuth, TUI polish (welcome screen, slash autocomplete). | shipped   |
+| **M6**    | Self-improving learning loop: memories, skill stats, recall, nudges.  | shipped     |
+| **M7**    | Tree-sitter integration across RAG, tools, diff/review, TUI.          | shipped     |
+| **M8**    | Autonomous / pilot mode: multi-task planning, worker agents, merge + PR. | in progress |
+
+## Next
+
+- Interactive TUI approval modal for skill/memory proposals.
+- Session logging from the TUI (currently headless-only).
+- Full MCP host.
