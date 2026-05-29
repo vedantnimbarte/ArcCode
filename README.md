@@ -1,5 +1,7 @@
 # Arc-Code
 
+[![ci](https://github.com/vedantnimbarte/ArcCode/actions/workflows/ci.yml/badge.svg)](https://github.com/vedantnimbarte/ArcCode/actions/workflows/ci.yml)
+
 `arccode` is a multi-provider, terminal-first **self-improving** coding agent
 written in Rust. It runs as a TUI for interactive sessions and as a headless
 one-shot (`--print "prompt"`) for scripting, talks to 73+ LLM providers behind
