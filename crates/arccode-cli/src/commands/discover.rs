@@ -10,6 +10,13 @@ const TARGETS: &[(&str, &str)] = &[
     ("ollama", "http://127.0.0.1:11434/v1/models"),
     ("lmstudio", "http://127.0.0.1:1234/v1/models"),
     ("vllm", "http://127.0.0.1:8000/v1/models"),
+    ("llamacpp", "http://127.0.0.1:8080/v1/models"),
+    ("tgi", "http://127.0.0.1:3000/v1/models"),
+    ("litellm", "http://127.0.0.1:4000/v1/models"),
+    ("gpt4all", "http://127.0.0.1:4891/v1/models"),
+    ("jan", "http://127.0.0.1:1337/v1/models"),
+    ("koboldcpp", "http://127.0.0.1:5001/v1/models"),
+    ("oobabooga", "http://127.0.0.1:5000/v1/models"),
 ];
 
 pub async fn run() -> Result<ExitCode> {

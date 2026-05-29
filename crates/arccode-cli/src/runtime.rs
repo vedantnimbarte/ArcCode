@@ -10,7 +10,10 @@ use arccode_learn::{
     hooks::{LearnConfig, LearnHandles},
     memory::MemoryStore,
 };
-use arccode_providers::{AnthropicProvider, ChatGptProvider, GeminiProvider, OpenAiCompatProvider, OpenAiVariant};
+use arccode_providers::{
+    AnthropicProvider, ChatGptProvider, CohereProvider, GeminiProvider, OpenAiCompatProvider,
+    OpenAiVariant,
+};
 use arccode_rag::{Embedder, HashEmbedder, IndexStore, Indexer};
 use arccode_skills::Skill;
 use arccode_tools::{ToolCtx, ToolRegistry};
@@ -89,6 +92,14 @@ pub fn build_provider(cfg: &Config, provider_id: &str) -> Result<Arc<dyn Provide
             let token = resolve_chatgpt_token(pc)?;
             Ok(Arc::new(ChatGptProvider::new(token)?))
         }
+        "cohere" => {
+            let key = resolve_api_key(pc.api_key.as_deref(), "COHERE_API_KEY")?;
+            let mut p = CohereProvider::new(key)?;
+            if let Some(url) = &pc.base_url {
+                p = p.with_base_url(url);
+            }
+            Ok(Arc::new(p))
+        }
         id if openai_variant(id).is_some() => {
             let variant = openai_variant(id).unwrap();
             let key = resolve_optional_api_key(pc.api_key.as_deref(), variant);
@@ -99,7 +110,7 @@ pub fn build_provider(cfg: &Config, provider_id: &str) -> Result<Arc<dyn Provide
             Ok(Arc::new(p))
         }
         other => Err(anyhow!(
-            "provider '{other}' is not implemented yet (M2 ships Anthropic + OpenAI/OpenRouter/LM Studio/vLLM/LiteLLM/Ollama/ChatGPT; Gemini next)"
+            "provider '{other}' is not implemented yet — see README \"Providers\" table for supported ids"
         )),
     }
 }
@@ -162,10 +173,46 @@ fn openai_variant(id: &str) -> Option<OpenAiVariant> {
     Some(match id {
         "openai" => OpenAiVariant::OpenAI,
         "openrouter" => OpenAiVariant::OpenRouter,
-        "lmstudio" | "lm_studio" => OpenAiVariant::LmStudio,
+        "lmstudio" | "lm_studio" | "lm-studio" => OpenAiVariant::LmStudio,
         "vllm" => OpenAiVariant::Vllm,
         "litellm" => OpenAiVariant::LiteLlm,
         "ollama" => OpenAiVariant::Ollama,
+        "groq" => OpenAiVariant::Groq,
+        "together" | "togetherai" | "together_ai" => OpenAiVariant::Together,
+        "fireworks" | "fireworks_ai" | "fireworksai" => OpenAiVariant::Fireworks,
+        "deepinfra" => OpenAiVariant::DeepInfra,
+        "perplexity" | "pplx" => OpenAiVariant::Perplexity,
+        "xai" | "grok" => OpenAiVariant::XAI,
+        "deepseek" => OpenAiVariant::DeepSeek,
+        "mistral" | "mistralai" => OpenAiVariant::Mistral,
+        "cerebras" => OpenAiVariant::Cerebras,
+        "sambanova" => OpenAiVariant::SambaNova,
+        "azure" | "azure_openai" | "azureopenai" => OpenAiVariant::AzureOpenAI,
+        "github" | "github_models" | "githubmodels" => OpenAiVariant::GithubModels,
+        "llamacpp" | "llama_cpp" | "llama-cpp" => OpenAiVariant::LlamaCpp,
+        "tgi" | "hf_tgi" => OpenAiVariant::Tgi,
+        "anyscale" => OpenAiVariant::Anyscale,
+        "lepton" | "leptonai" => OpenAiVariant::Lepton,
+        "replicate" => OpenAiVariant::Replicate,
+        "novita" => OpenAiVariant::Novita,
+        "hyperbolic" => OpenAiVariant::Hyperbolic,
+        "lambda" | "lambdalabs" => OpenAiVariant::Lambda,
+        "nebius" => OpenAiVariant::Nebius,
+        "hf" | "huggingface" | "hf_inference" => OpenAiVariant::HfInference,
+        "glhf" => OpenAiVariant::Glhf,
+        "featherless" => OpenAiVariant::Featherless,
+        "octoai" => OpenAiVariant::OctoAi,
+        "nvidia" | "nim" | "nvidia_nim" => OpenAiVariant::NvidiaNim,
+        "avian" => OpenAiVariant::Avian,
+        "kluster" => OpenAiVariant::Kluster,
+        "inferencenet" | "inference_net" => OpenAiVariant::InferenceNet,
+        "snowflake" | "cortex" => OpenAiVariant::Snowflake,
+        "databricks" => OpenAiVariant::Databricks,
+        "writer" | "palmyra" => OpenAiVariant::Writer,
+        "gpt4all" => OpenAiVariant::Gpt4All,
+        "jan" | "janai" => OpenAiVariant::Jan,
+        "koboldcpp" | "kobold" => OpenAiVariant::KoboldCpp,
+        "oobabooga" | "ooba" | "textgenwebui" => OpenAiVariant::Oobabooga,
         _ => return None,
     })
 }
@@ -178,7 +225,45 @@ fn resolve_optional_api_key(from_config: Option<&str>, variant: OpenAiVariant) -
         OpenAiVariant::OpenAI => "OPENAI_API_KEY",
         OpenAiVariant::OpenRouter => "OPENROUTER_API_KEY",
         OpenAiVariant::LiteLlm => "LITELLM_API_KEY",
-        OpenAiVariant::LmStudio | OpenAiVariant::Vllm | OpenAiVariant::Ollama => return None,
+        OpenAiVariant::Groq => "GROQ_API_KEY",
+        OpenAiVariant::Together => "TOGETHER_API_KEY",
+        OpenAiVariant::Fireworks => "FIREWORKS_API_KEY",
+        OpenAiVariant::DeepInfra => "DEEPINFRA_API_KEY",
+        OpenAiVariant::Perplexity => "PERPLEXITY_API_KEY",
+        OpenAiVariant::XAI => "XAI_API_KEY",
+        OpenAiVariant::DeepSeek => "DEEPSEEK_API_KEY",
+        OpenAiVariant::Mistral => "MISTRAL_API_KEY",
+        OpenAiVariant::Cerebras => "CEREBRAS_API_KEY",
+        OpenAiVariant::SambaNova => "SAMBANOVA_API_KEY",
+        OpenAiVariant::AzureOpenAI => "AZURE_OPENAI_API_KEY",
+        OpenAiVariant::GithubModels => "GITHUB_TOKEN",
+        OpenAiVariant::Anyscale => "ANYSCALE_API_KEY",
+        OpenAiVariant::Lepton => "LEPTON_API_KEY",
+        OpenAiVariant::Replicate => "REPLICATE_API_TOKEN",
+        OpenAiVariant::Novita => "NOVITA_API_KEY",
+        OpenAiVariant::Hyperbolic => "HYPERBOLIC_API_KEY",
+        OpenAiVariant::Lambda => "LAMBDA_API_KEY",
+        OpenAiVariant::Nebius => "NEBIUS_API_KEY",
+        OpenAiVariant::HfInference => "HF_TOKEN",
+        OpenAiVariant::Glhf => "GLHF_API_KEY",
+        OpenAiVariant::Featherless => "FEATHERLESS_API_KEY",
+        OpenAiVariant::OctoAi => "OCTOAI_API_KEY",
+        OpenAiVariant::NvidiaNim => "NVIDIA_API_KEY",
+        OpenAiVariant::Avian => "AVIAN_API_KEY",
+        OpenAiVariant::Kluster => "KLUSTER_API_KEY",
+        OpenAiVariant::InferenceNet => "INFERENCE_NET_API_KEY",
+        OpenAiVariant::Snowflake => "SNOWFLAKE_API_KEY",
+        OpenAiVariant::Databricks => "DATABRICKS_TOKEN",
+        OpenAiVariant::Writer => "WRITER_API_KEY",
+        OpenAiVariant::LmStudio
+        | OpenAiVariant::Vllm
+        | OpenAiVariant::Ollama
+        | OpenAiVariant::LlamaCpp
+        | OpenAiVariant::Tgi
+        | OpenAiVariant::Gpt4All
+        | OpenAiVariant::Jan
+        | OpenAiVariant::KoboldCpp
+        | OpenAiVariant::Oobabooga => return None,
     };
     std::env::var(env_name).ok()
 }

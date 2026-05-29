@@ -612,6 +612,314 @@ impl Config {
                     ..Default::default()
                 },
             ),
+            (
+                "groq".to_string(),
+                ProviderConfig {
+                    api_key: Some("${GROQ_API_KEY}".into()),
+                    model: Some("llama-3.3-70b-versatile".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "together".to_string(),
+                ProviderConfig {
+                    api_key: Some("${TOGETHER_API_KEY}".into()),
+                    model: Some("meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "fireworks".to_string(),
+                ProviderConfig {
+                    api_key: Some("${FIREWORKS_API_KEY}".into()),
+                    model: Some("accounts/fireworks/models/llama-v3p1-70b-instruct".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "deepinfra".to_string(),
+                ProviderConfig {
+                    api_key: Some("${DEEPINFRA_API_KEY}".into()),
+                    model: Some("meta-llama/Meta-Llama-3.1-70B-Instruct".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "perplexity".to_string(),
+                ProviderConfig {
+                    api_key: Some("${PERPLEXITY_API_KEY}".into()),
+                    model: Some("sonar-pro".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "xai".to_string(),
+                ProviderConfig {
+                    api_key: Some("${XAI_API_KEY}".into()),
+                    model: Some("grok-2-latest".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "deepseek".to_string(),
+                ProviderConfig {
+                    api_key: Some("${DEEPSEEK_API_KEY}".into()),
+                    model: Some("deepseek-chat".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "mistral".to_string(),
+                ProviderConfig {
+                    api_key: Some("${MISTRAL_API_KEY}".into()),
+                    model: Some("mistral-large-latest".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "cerebras".to_string(),
+                ProviderConfig {
+                    api_key: Some("${CEREBRAS_API_KEY}".into()),
+                    model: Some("llama3.1-70b".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "sambanova".to_string(),
+                ProviderConfig {
+                    api_key: Some("${SAMBANOVA_API_KEY}".into()),
+                    model: Some("Meta-Llama-3.1-70B-Instruct".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "azure".to_string(),
+                ProviderConfig {
+                    api_key: Some("${AZURE_OPENAI_API_KEY}".into()),
+                    // Azure requires a per-deployment URL; user must edit.
+                    base_url: Some(
+                        "https://YOUR-RESOURCE.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT"
+                            .into(),
+                    ),
+                    model: Some("gpt-4o".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "github".to_string(),
+                ProviderConfig {
+                    api_key: Some("${GITHUB_TOKEN}".into()),
+                    model: Some("gpt-4o".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "llamacpp".to_string(),
+                ProviderConfig {
+                    base_url: Some("http://localhost:8080/v1".into()),
+                    model: Some("local-model".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "tgi".to_string(),
+                ProviderConfig {
+                    base_url: Some("http://localhost:3000/v1".into()),
+                    model: Some("local-model".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "anyscale".to_string(),
+                ProviderConfig {
+                    api_key: Some("${ANYSCALE_API_KEY}".into()),
+                    model: Some("meta-llama/Meta-Llama-3.1-70B-Instruct".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "lepton".to_string(),
+                ProviderConfig {
+                    api_key: Some("${LEPTON_API_KEY}".into()),
+                    model: Some("llama3-1-70b".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "replicate".to_string(),
+                ProviderConfig {
+                    api_key: Some("${REPLICATE_API_TOKEN}".into()),
+                    model: Some("meta/meta-llama-3.1-405b-instruct".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "novita".to_string(),
+                ProviderConfig {
+                    api_key: Some("${NOVITA_API_KEY}".into()),
+                    model: Some("meta-llama/llama-3.1-70b-instruct".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "hyperbolic".to_string(),
+                ProviderConfig {
+                    api_key: Some("${HYPERBOLIC_API_KEY}".into()),
+                    model: Some("meta-llama/Meta-Llama-3.1-70B-Instruct".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "lambda".to_string(),
+                ProviderConfig {
+                    api_key: Some("${LAMBDA_API_KEY}".into()),
+                    model: Some("llama3.1-70b-instruct-fp8".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "nebius".to_string(),
+                ProviderConfig {
+                    api_key: Some("${NEBIUS_API_KEY}".into()),
+                    model: Some("meta-llama/Meta-Llama-3.1-70B-Instruct-fast".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "hf".to_string(),
+                ProviderConfig {
+                    api_key: Some("${HF_TOKEN}".into()),
+                    model: Some("meta-llama/Llama-3.1-70B-Instruct".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "glhf".to_string(),
+                ProviderConfig {
+                    api_key: Some("${GLHF_API_KEY}".into()),
+                    model: Some("hf:meta-llama/Llama-3.1-70B-Instruct".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "featherless".to_string(),
+                ProviderConfig {
+                    api_key: Some("${FEATHERLESS_API_KEY}".into()),
+                    model: Some("meta-llama/Meta-Llama-3.1-8B-Instruct".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "octoai".to_string(),
+                ProviderConfig {
+                    api_key: Some("${OCTOAI_API_KEY}".into()),
+                    model: Some("meta-llama-3.1-70b-instruct".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "nvidia".to_string(),
+                ProviderConfig {
+                    api_key: Some("${NVIDIA_API_KEY}".into()),
+                    model: Some("meta/llama-3.1-70b-instruct".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "avian".to_string(),
+                ProviderConfig {
+                    api_key: Some("${AVIAN_API_KEY}".into()),
+                    model: Some("Meta-Llama-3.1-405B-Instruct".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "kluster".to_string(),
+                ProviderConfig {
+                    api_key: Some("${KLUSTER_API_KEY}".into()),
+                    model: Some("klusterai/Meta-Llama-3.1-405B-Instruct-Turbo".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "inferencenet".to_string(),
+                ProviderConfig {
+                    api_key: Some("${INFERENCE_NET_API_KEY}".into()),
+                    model: Some("meta-llama/llama-3.1-70b-instruct".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "snowflake".to_string(),
+                ProviderConfig {
+                    api_key: Some("${SNOWFLAKE_API_KEY}".into()),
+                    base_url: Some(
+                        "https://YOUR-ACCOUNT.snowflakecomputing.com/api/v2/cortex/inference/v1"
+                            .into(),
+                    ),
+                    model: Some("llama3.1-70b".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "databricks".to_string(),
+                ProviderConfig {
+                    api_key: Some("${DATABRICKS_TOKEN}".into()),
+                    base_url: Some(
+                        "https://YOUR-WORKSPACE.cloud.databricks.com/serving-endpoints/v1".into(),
+                    ),
+                    model: Some("databricks-meta-llama-3-1-70b-instruct".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "writer".to_string(),
+                ProviderConfig {
+                    api_key: Some("${WRITER_API_KEY}".into()),
+                    model: Some("palmyra-x5".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "cohere".to_string(),
+                ProviderConfig {
+                    api_key: Some("${COHERE_API_KEY}".into()),
+                    model: Some("command-r-plus".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "gpt4all".to_string(),
+                ProviderConfig {
+                    base_url: Some("http://localhost:4891/v1".into()),
+                    model: Some("local-model".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "jan".to_string(),
+                ProviderConfig {
+                    base_url: Some("http://localhost:1337/v1".into()),
+                    model: Some("local-model".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "koboldcpp".to_string(),
+                ProviderConfig {
+                    base_url: Some("http://localhost:5001/v1".into()),
+                    model: Some("local-model".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "oobabooga".to_string(),
+                ProviderConfig {
+                    base_url: Some("http://localhost:5000/v1".into()),
+                    model: Some("local-model".into()),
+                    ..Default::default()
+                },
+            ),
         ]
         .into_iter()
         .collect();

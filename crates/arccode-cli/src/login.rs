@@ -8,7 +8,8 @@
 use arccode_config::{global_config_path, secrets, Config};
 use arccode_core::Provider;
 use arccode_providers::{
-    probe, AnthropicProvider, ChatGptProvider, GeminiProvider, OpenAiCompatProvider, OpenAiVariant,
+    probe, AnthropicProvider, ChatGptProvider, CohereProvider, GeminiProvider, OpenAiCompatProvider,
+    OpenAiVariant,
 };
 use arccode_tui::modal::{LoginPayload, LoginTask};
 use std::sync::Arc;
@@ -93,6 +94,14 @@ fn build_provider(p: &LoginPayload) -> Result<Arc<dyn Provider>, String> {
                 .ok_or("chatgpt: no access token found — complete browser login first")?;
             Ok(Arc::new(ChatGptProvider::new(token).map_err(mk_err)?))
         }
+        "cohere" => {
+            let key = api_key.ok_or("cohere requires an API key")?;
+            let mut prov = CohereProvider::new(key).map_err(mk_err)?;
+            if let Some(url) = base_url {
+                prov = prov.with_base_url(url);
+            }
+            Ok(Arc::new(prov))
+        }
         id => {
             let variant = openai_variant(id).ok_or_else(|| format!("unknown provider '{id}'"))?;
             let mut prov = OpenAiCompatProvider::new(variant, api_key).map_err(mk_err)?;
@@ -108,10 +117,46 @@ fn openai_variant(id: &str) -> Option<OpenAiVariant> {
     Some(match id {
         "openai" => OpenAiVariant::OpenAI,
         "openrouter" => OpenAiVariant::OpenRouter,
-        "lmstudio" | "lm_studio" => OpenAiVariant::LmStudio,
+        "lmstudio" | "lm_studio" | "lm-studio" => OpenAiVariant::LmStudio,
         "vllm" => OpenAiVariant::Vllm,
         "litellm" => OpenAiVariant::LiteLlm,
         "ollama" => OpenAiVariant::Ollama,
+        "groq" => OpenAiVariant::Groq,
+        "together" | "togetherai" | "together_ai" => OpenAiVariant::Together,
+        "fireworks" | "fireworks_ai" | "fireworksai" => OpenAiVariant::Fireworks,
+        "deepinfra" => OpenAiVariant::DeepInfra,
+        "perplexity" | "pplx" => OpenAiVariant::Perplexity,
+        "xai" | "grok" => OpenAiVariant::XAI,
+        "deepseek" => OpenAiVariant::DeepSeek,
+        "mistral" | "mistralai" => OpenAiVariant::Mistral,
+        "cerebras" => OpenAiVariant::Cerebras,
+        "sambanova" => OpenAiVariant::SambaNova,
+        "azure" | "azure_openai" | "azureopenai" => OpenAiVariant::AzureOpenAI,
+        "github" | "github_models" | "githubmodels" => OpenAiVariant::GithubModels,
+        "llamacpp" | "llama_cpp" | "llama-cpp" => OpenAiVariant::LlamaCpp,
+        "tgi" | "hf_tgi" => OpenAiVariant::Tgi,
+        "anyscale" => OpenAiVariant::Anyscale,
+        "lepton" | "leptonai" => OpenAiVariant::Lepton,
+        "replicate" => OpenAiVariant::Replicate,
+        "novita" => OpenAiVariant::Novita,
+        "hyperbolic" => OpenAiVariant::Hyperbolic,
+        "lambda" | "lambdalabs" => OpenAiVariant::Lambda,
+        "nebius" => OpenAiVariant::Nebius,
+        "hf" | "huggingface" | "hf_inference" => OpenAiVariant::HfInference,
+        "glhf" => OpenAiVariant::Glhf,
+        "featherless" => OpenAiVariant::Featherless,
+        "octoai" => OpenAiVariant::OctoAi,
+        "nvidia" | "nim" | "nvidia_nim" => OpenAiVariant::NvidiaNim,
+        "avian" => OpenAiVariant::Avian,
+        "kluster" => OpenAiVariant::Kluster,
+        "inferencenet" | "inference_net" => OpenAiVariant::InferenceNet,
+        "snowflake" | "cortex" => OpenAiVariant::Snowflake,
+        "databricks" => OpenAiVariant::Databricks,
+        "writer" | "palmyra" => OpenAiVariant::Writer,
+        "gpt4all" => OpenAiVariant::Gpt4All,
+        "jan" | "janai" => OpenAiVariant::Jan,
+        "koboldcpp" | "kobold" => OpenAiVariant::KoboldCpp,
+        "oobabooga" | "ooba" | "textgenwebui" => OpenAiVariant::Oobabooga,
         _ => return None,
     })
 }

@@ -2,7 +2,7 @@
 
 `arccode` is a multi-provider, terminal-first **self-improving** coding agent
 written in Rust. It runs as a TUI for interactive sessions and as a headless
-one-shot (`--print "prompt"`) for scripting, talks to nine LLM providers behind
+one-shot (`--print "prompt"`) for scripting, talks to 45+ LLM providers behind
 a single streaming interface, ships a built-in tool layer for reading,
 searching, and editing the project tree, and learns from every conversation:
 it builds a persistent model of you and your projects, creates and refines
@@ -38,7 +38,7 @@ plus a planned MCP host.
   the existing RAG pipeline, and quiet-session nudges that ask the agent to
   consider persisting something when it's been a while since a save. See
   [Self-improving loop](#self-improving-loop) below.
-- **Nine providers, one shape.** Anthropic is the reference implementation
+- **45+ providers, one shape.** Anthropic is the reference implementation
   (streaming, tool use, explicit prompt caching). A single OpenAI-compatible
   adapter covers OpenAI, OpenRouter, LM Studio, vLLM, LiteLLM, and Ollama.
   Gemini and ChatGPT (OAuth) have their own adapters. All speak the same
@@ -133,7 +133,7 @@ This is a Cargo workspace. Each crate has a narrow, well-defined responsibility.
 | `arccode-cli`        | Binary entry point. Argument parsing, logging, runtime wiring, headless mode.                          |
 | `arccode-core`       | Provider-agnostic types: `Message`, `ContentBlock`, `CompletionRequest`, `Provider`, agent loop, streaming events, tool dispatch, token estimation. |
 | `arccode-config`     | TOML config loading, layered merge, env-var resolution, permission model.                              |
-| `arccode-providers`  | Concrete `Provider` implementations: Anthropic, Gemini, OpenAI-compatible (six variants).              |
+| `arccode-providers`  | Concrete `Provider` implementations: Anthropic, Gemini, ChatGPT, Cohere, OpenAI-compatible (40 variants). |
 | `arccode-tools`      | Built-in tool implementations (`read_file`, `write_file`, `edit_file`, `glob`, `grep`, `list_dir`, `run_shell`) and the `ToolRegistry`. |
 | `arccode-tui`        | `ratatui` interactive surface: composer, transcript, status bar, slash commands.                       |
 | `arccode-session`    | Append-only JSONL session log + replay/reconstruction for `/resume`.                                   |
@@ -208,7 +208,7 @@ M1 phases 1–7 are implemented (RunStore, planner, worker subprocess
 with cross-platform supervisor, manager + orchestrator, git worktrees +
 squash-merge, gh PR creation, dashboard). Phase 8 ships cost-cap
 enforcement, the provider-support gate, and this documentation;
-end-to-end runs against the nine providers below need real API keys and
+end-to-end runs against the providers below need real API keys and
 are user-validated rather than CI-validated for now. M2 enhancements
 (E1–E13) and M3 autonomy (J1–J15) are roadmap.
 
@@ -226,9 +226,46 @@ used, but quality depends on the local model's tool-use training.
 | ChatGPT      | `openai-compat` | OAuth-backed; same shape as OpenAI.                                    |
 | OpenRouter   | `openai-compat` | Aggregator — pass `provider/model` as model id.                        |
 | LiteLLM      | `openai-compat` | Self-hosted gateway; works for any backend that LiteLLM speaks to.     |
+| Groq         | `openai-compat` | Fast Llama/Mixtral hosting; native `tool_calls`.                       |
+| Together     | `openai-compat` | OSS model catalog; tool-calls on Llama 3.1/3.3 + Qwen-Coder.           |
+| Fireworks    | `openai-compat` | OSS + fine-tunes; documented tool-call support.                        |
+| DeepInfra    | `openai-compat` | Cheap OSS hosting; OpenAI-shape.                                       |
+| xAI (Grok)   | `openai-compat` | `grok-2` / `grok-2-vision`; supports `tool_calls`.                     |
+| DeepSeek     | `openai-compat` | `deepseek-chat` / `deepseek-reasoner`.                                 |
+| Mistral      | `openai-compat` | La Plateforme; codestral + mistral-large.                              |
+| Cerebras     | `openai-compat` | Very fast Llama inference.                                             |
+| SambaNova    | `openai-compat` | Llama 3.1 8B/70B/405B hosting.                                         |
+| Azure OpenAI | `openai-compat` | Uses `api-key:` header; set `base_url` to your deployment.             |
+| GitHub Models| `openai-compat` | Auth via `GITHUB_TOKEN`; rate-limited but free tier.                   |
+| Perplexity   | `untested`      | Sonar models are search-augmented; tool use not guaranteed.            |
 | LM Studio    | `untested`      | OpenAI-compat shim; depends on the loaded model.                       |
 | vLLM         | `untested`      | Same: shape works, model has to be tool-trained.                       |
 | Ollama       | `untested`      | Same: `/v1` shim, picks up whatever model you've pulled.               |
+| llama.cpp    | `untested`      | `./server`'s `/v1` shim; depends on the loaded gguf.                   |
+| HF TGI       | `untested`      | Text Generation Inference; OpenAI-compat endpoint on `:3000/v1`.       |
+| Cohere       | `native`        | Command-R/A; native `/v2/chat` adapter with tool calls.                |
+| Anyscale     | `openai-compat` | Endpoints hosting Llama 3.1/3.3 + Mixtral.                             |
+| Lepton AI    | `openai-compat` | OSS + custom fine-tunes.                                               |
+| Novita AI    | `openai-compat` | Cheap OSS hosting.                                                     |
+| Hyperbolic   | `openai-compat` | Llama, DeepSeek, Qwen.                                                 |
+| Lambda       | `openai-compat` | Lambda Labs Inference; Llama 3.1/3.3.                                  |
+| Nebius       | `openai-compat` | Nebius AI Studio.                                                      |
+| HF Inference | `openai-compat` | HuggingFace router; one HF token, many backends.                       |
+| NVIDIA NIM   | `openai-compat` | `build.nvidia.com`; Llama-Nemotron, DeepSeek-R1.                       |
+| Databricks   | `openai-compat` | Foundation Model APIs in your Databricks workspace.                    |
+| Snowflake    | `openai-compat` | Cortex inference; set `base_url` to your account.                      |
+| Replicate    | `untested`      | Via OpenAI proxy; tool support is model-dependent.                     |
+| GLHF         | `untested`      | Long-tail HF model hosting.                                            |
+| Featherless  | `untested`      | Long-tail HF model hosting.                                            |
+| OctoAI       | `untested`      | Being deprecated; endpoint still works.                                |
+| Avian        | `untested`      | Llama 3.1 hosting.                                                     |
+| Kluster      | `untested`      | Llama hosting.                                                         |
+| Inference.net| `untested`      | Batch + real-time OSS hosting.                                         |
+| Writer       | `untested`      | Palmyra; tool-use varies by model.                                     |
+| GPT4All      | `untested`      | Local REST server on `:4891/v1`.                                       |
+| Jan / Cortex | `untested`      | Local on `:1337/v1`.                                                   |
+| KoboldCpp    | `untested`      | Local OpenAI shim on `:5001/v1`.                                       |
+| Oobabooga    | `untested`      | text-generation-webui OpenAI shim on `:5000/v1`.                       |
 
 `arccode pilot run` prints a one-line support notice at startup and
 refuses to start when the planner provider is `unsupported` (no current
@@ -239,17 +276,71 @@ tool calls at all).
 
 ## Supported providers
 
-| Provider           | Adapter                  | Notes                                                                    |
-| ------------------ | ------------------------ | ------------------------------------------------------------------------ |
-| Anthropic          | `AnthropicProvider`      | Reference impl. Streaming, tool use, explicit `cache_control` breakpoints. |
-| OpenAI             | `OpenAiCompatProvider`   | Variant: `OpenAi`.                                                        |
-| ChatGPT (OAuth)    | `ChatGptProvider`        | Browser OAuth login via `/login`; token kept in the OS keychain.          |
-| OpenRouter         | `OpenAiCompatProvider`   | Variant: `OpenRouter`. Aggregator — pass `provider/model` as model id.    |
-| LiteLLM            | `OpenAiCompatProvider`   | Variant: `LiteLLM`. Self-hosted gateway.                                  |
-| LM Studio          | `OpenAiCompatProvider`   | Variant: `LmStudio`. Local OpenAI-compatible shim.                        |
-| vLLM               | `OpenAiCompatProvider`   | Variant: `Vllm`. Self-hosted inference server.                            |
-| Ollama             | `OpenAiCompatProvider`   | Variant: `Ollama`. Hits `/v1` shim on localhost:11434.                    |
-| Google Gemini      | `GeminiProvider`         | Native adapter.                                                          |
+| Provider           | id          | Env var                  | Default base URL                                  |
+| ------------------ | ----------- | ------------------------ | ------------------------------------------------- |
+| Anthropic          | `anthropic` | `ANTHROPIC_API_KEY`      | (native adapter)                                  |
+| Google Gemini      | `gemini`    | `GOOGLE_API_KEY`         | (native adapter)                                  |
+| ChatGPT (OAuth)    | `chatgpt`   | OAuth via `/login`       | (token in OS keychain)                            |
+| OpenAI             | `openai`    | `OPENAI_API_KEY`         | `https://api.openai.com/v1`                       |
+| OpenRouter         | `openrouter`| `OPENROUTER_API_KEY`     | `https://openrouter.ai/api/v1`                    |
+| LiteLLM            | `litellm`   | `LITELLM_API_KEY`        | `http://localhost:4000/v1`                        |
+| Groq               | `groq`      | `GROQ_API_KEY`           | `https://api.groq.com/openai/v1`                  |
+| Together AI        | `together`  | `TOGETHER_API_KEY`       | `https://api.together.xyz/v1`                     |
+| Fireworks AI       | `fireworks` | `FIREWORKS_API_KEY`      | `https://api.fireworks.ai/inference/v1`           |
+| DeepInfra          | `deepinfra` | `DEEPINFRA_API_KEY`      | `https://api.deepinfra.com/v1/openai`             |
+| Perplexity         | `perplexity`| `PERPLEXITY_API_KEY`     | `https://api.perplexity.ai`                       |
+| xAI (Grok)         | `xai`       | `XAI_API_KEY`            | `https://api.x.ai/v1`                             |
+| DeepSeek           | `deepseek`  | `DEEPSEEK_API_KEY`       | `https://api.deepseek.com/v1`                     |
+| Mistral            | `mistral`   | `MISTRAL_API_KEY`        | `https://api.mistral.ai/v1`                       |
+| Cerebras           | `cerebras`  | `CEREBRAS_API_KEY`       | `https://api.cerebras.ai/v1`                      |
+| SambaNova          | `sambanova` | `SAMBANOVA_API_KEY`      | `https://api.sambanova.ai/v1`                     |
+| Azure OpenAI       | `azure`     | `AZURE_OPENAI_API_KEY`   | (set to your deployment URL)                      |
+| GitHub Models      | `github`    | `GITHUB_TOKEN`           | `https://models.inference.ai.azure.com`           |
+| LM Studio          | `lmstudio`  | (none — local)           | `http://localhost:1234/v1`                        |
+| vLLM               | `vllm`      | (none — local)           | `http://localhost:8000/v1`                        |
+| Ollama             | `ollama`    | (none — local)           | `http://localhost:11434/v1`                       |
+| llama.cpp server   | `llamacpp`  | (none — local)           | `http://localhost:8080/v1`                        |
+| HF TGI             | `tgi`       | (none — local)           | `http://localhost:3000/v1`                        |
+| Cohere             | `cohere`    | `COHERE_API_KEY`         | `https://api.cohere.com` (native `/v2/chat`)      |
+| Anyscale           | `anyscale`  | `ANYSCALE_API_KEY`       | `https://api.endpoints.anyscale.com/v1`           |
+| Lepton AI          | `lepton`    | `LEPTON_API_KEY`         | `https://api.lepton.ai/api/v1`                    |
+| Replicate          | `replicate` | `REPLICATE_API_TOKEN`    | `https://openai-proxy.replicate.com/v1`           |
+| Novita AI          | `novita`    | `NOVITA_API_KEY`         | `https://api.novita.ai/v3/openai`                 |
+| Hyperbolic         | `hyperbolic`| `HYPERBOLIC_API_KEY`     | `https://api.hyperbolic.xyz/v1`                   |
+| Lambda Inference   | `lambda`    | `LAMBDA_API_KEY`         | `https://api.lambdalabs.com/v1`                   |
+| Nebius AI Studio   | `nebius`    | `NEBIUS_API_KEY`         | `https://api.studio.nebius.ai/v1`                 |
+| HF Inference       | `hf`        | `HF_TOKEN`               | `https://router.huggingface.co/v1`                |
+| GLHF.chat          | `glhf`      | `GLHF_API_KEY`           | `https://glhf.chat/api/openai/v1`                 |
+| Featherless        | `featherless`| `FEATHERLESS_API_KEY`   | `https://api.featherless.ai/v1`                   |
+| OctoAI             | `octoai`    | `OCTOAI_API_KEY`         | `https://text.octoai.run/v1`                      |
+| NVIDIA NIM         | `nvidia`    | `NVIDIA_API_KEY`         | `https://integrate.api.nvidia.com/v1`             |
+| Avian              | `avian`     | `AVIAN_API_KEY`          | `https://api.avian.io/v1`                         |
+| Kluster.ai         | `kluster`   | `KLUSTER_API_KEY`        | `https://api.kluster.ai/v1`                       |
+| Inference.net      | `inferencenet`| `INFERENCE_NET_API_KEY`| `https://api.inference.net/v1`                    |
+| Snowflake Cortex   | `snowflake` | `SNOWFLAKE_API_KEY`      | (set to your account URL)                         |
+| Databricks         | `databricks`| `DATABRICKS_TOKEN`       | (set to your workspace URL)                       |
+| Writer Palmyra     | `writer`    | `WRITER_API_KEY`         | `https://api.writer.com/v1`                       |
+| GPT4All            | `gpt4all`   | (none — local)           | `http://localhost:4891/v1`                        |
+| Jan / Cortex       | `jan`       | (none — local)           | `http://localhost:1337/v1`                        |
+| KoboldCpp          | `koboldcpp` | (none — local)           | `http://localhost:5001/v1`                        |
+| Oobabooga          | `oobabooga` | (none — local)           | `http://localhost:5000/v1`                        |
+
+All non-Anthropic / non-Gemini / non-ChatGPT / non-Cohere entries share the
+`OpenAiCompatProvider` adapter (`crates/arccode-providers/src/openai_compat.rs`).
+Add a new hosted OpenAI-shape clone by extending its `Variant` enum and the
+mapper functions in `runtime.rs` + `login.rs`.
+
+**Planned but not yet implemented** (require non-trivial signing or
+service-account auth — tracked as separate work):
+
+- **AWS Bedrock** — SigV4-signed Converse API; would unlock Claude-on-AWS,
+  Llama-on-Bedrock, Nova, Mistral, Cohere via one credential.
+- **Google Vertex AI** — OAuth2 service-account; would unlock Gemini-on-Vertex
+  and Claude-on-Vertex for GCP-only enterprises.
+- **IBM watsonx.ai** — IAM-token auth; Granite + hosted Llama.
+- **AI21 Jamba** (native) — has an OpenAI-compat endpoint we'll likely add
+  as a Variant before doing the native adapter.
+- **Reka** — partner inference; usually accessed via OpenRouter today.
 
 ---
 

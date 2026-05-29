@@ -57,9 +57,54 @@ pub fn classify(provider_id: &str) -> ProviderSupport {
         "chatgpt" => ProviderSupport::Compat,
         "openrouter" => ProviderSupport::Compat,
         "litellm" => ProviderSupport::Compat,
+        // Hosted OpenAI-shape clouds with documented tool-calling support.
+        "groq" => ProviderSupport::Compat,
+        "together" | "togetherai" | "together_ai" => ProviderSupport::Compat,
+        "fireworks" | "fireworks_ai" | "fireworksai" => ProviderSupport::Compat,
+        "deepinfra" => ProviderSupport::Compat,
+        "xai" | "grok" => ProviderSupport::Compat,
+        "deepseek" => ProviderSupport::Compat,
+        "mistral" | "mistralai" => ProviderSupport::Compat,
+        "cerebras" => ProviderSupport::Compat,
+        "sambanova" => ProviderSupport::Compat,
+        "azure" | "azure_openai" | "azureopenai" => ProviderSupport::Compat,
+        "github" | "github_models" | "githubmodels" => ProviderSupport::Compat,
+        // Perplexity Sonar is search-augmented; tool-use support is
+        // model-dependent and not guaranteed — warn but don't block.
+        "perplexity" | "pplx" => ProviderSupport::Untested,
         "lmstudio" | "lm_studio" | "lm-studio" => ProviderSupport::Untested,
         "vllm" => ProviderSupport::Untested,
         "ollama" => ProviderSupport::Untested,
+        "llamacpp" | "llama_cpp" | "llama-cpp" => ProviderSupport::Untested,
+        "tgi" | "hf_tgi" => ProviderSupport::Untested,
+        // Wave 2 hosted clouds. Llama/Qwen-Coder on OpenAI-shape tool_calls.
+        "anyscale" => ProviderSupport::Compat,
+        "lepton" | "leptonai" => ProviderSupport::Compat,
+        "novita" => ProviderSupport::Compat,
+        "hyperbolic" => ProviderSupport::Compat,
+        "lambda" | "lambdalabs" => ProviderSupport::Compat,
+        "nebius" => ProviderSupport::Compat,
+        "hf" | "huggingface" | "hf_inference" => ProviderSupport::Compat,
+        "nvidia" | "nim" | "nvidia_nim" => ProviderSupport::Compat,
+        "databricks" => ProviderSupport::Compat,
+        "snowflake" | "cortex" => ProviderSupport::Compat,
+        // Cohere (native adapter) supports tool calls natively.
+        "cohere" => ProviderSupport::Native,
+        // Replicate's proxy + the long-tail OSS hosts are model-dependent;
+        // mark untested so users get a warning, not a block.
+        "replicate" => ProviderSupport::Untested,
+        "glhf" => ProviderSupport::Untested,
+        "featherless" => ProviderSupport::Untested,
+        "octoai" => ProviderSupport::Untested,
+        "avian" => ProviderSupport::Untested,
+        "kluster" => ProviderSupport::Untested,
+        "inferencenet" | "inference_net" => ProviderSupport::Untested,
+        "writer" | "palmyra" => ProviderSupport::Untested,
+        // Wave 2 local runtimes.
+        "gpt4all" => ProviderSupport::Untested,
+        "jan" | "janai" => ProviderSupport::Untested,
+        "koboldcpp" | "kobold" => ProviderSupport::Untested,
+        "oobabooga" | "ooba" | "textgenwebui" => ProviderSupport::Untested,
         _ => ProviderSupport::Untested,
     }
 }
@@ -119,10 +164,79 @@ mod tests {
 
     #[test]
     fn unknown_provider_is_untested_not_unsupported() {
-        // Future providers should not be blocked — they just get a
+        // Truly-unknown providers should not be blocked — they just get a
         // warning and the user can try them.
-        assert_eq!(classify("xai"), ProviderSupport::Untested);
-        assert_eq!(classify("groq"), ProviderSupport::Untested);
+        assert_eq!(classify("brand-new-llm-host"), ProviderSupport::Untested);
+    }
+
+    #[test]
+    fn new_hosted_clouds_are_compat() {
+        for id in [
+            "groq",
+            "together",
+            "fireworks",
+            "deepinfra",
+            "xai",
+            "deepseek",
+            "mistral",
+            "cerebras",
+            "sambanova",
+            "azure",
+            "github",
+        ] {
+            assert_eq!(
+                classify(id),
+                ProviderSupport::Compat,
+                "{id} should be Compat for pilot"
+            );
+        }
+    }
+
+    #[test]
+    fn perplexity_is_untested_not_compat() {
+        // Sonar models are search-augmented; tool-use is not guaranteed.
+        assert_eq!(classify("perplexity"), ProviderSupport::Untested);
+    }
+
+    #[test]
+    fn new_local_runtimes_are_untested() {
+        for id in [
+            "llamacpp",
+            "tgi",
+            "gpt4all",
+            "jan",
+            "koboldcpp",
+            "oobabooga",
+        ] {
+            assert_eq!(classify(id), ProviderSupport::Untested);
+        }
+    }
+
+    #[test]
+    fn cohere_is_native() {
+        assert_eq!(classify("cohere"), ProviderSupport::Native);
+    }
+
+    #[test]
+    fn wave2_hosted_clouds_are_compat() {
+        for id in [
+            "anyscale",
+            "lepton",
+            "novita",
+            "hyperbolic",
+            "lambda",
+            "nebius",
+            "hf",
+            "nvidia",
+            "databricks",
+            "snowflake",
+        ] {
+            assert_eq!(
+                classify(id),
+                ProviderSupport::Compat,
+                "{id} should be Compat"
+            );
+        }
     }
 
     #[test]

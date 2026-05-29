@@ -1,9 +1,12 @@
 //! OpenAI-compatible chat completions provider.
 //!
 //! One adapter covers the OpenAI Chat Completions API and every API-shape
-//! clone that arccode supports: OpenRouter, LM Studio, vLLM, LiteLLM
-//! (self-hosted proxy), and Ollama (via its `/v1` shim). The provider id
-//! and default base URL are picked up from [`Variant`].
+//! clone that arccode supports. Hosted clouds: OpenAI, OpenRouter, Groq,
+//! Together AI, Fireworks, DeepInfra, Perplexity, xAI (Grok), DeepSeek,
+//! Mistral La Plateforme, Cerebras, SambaNova, Azure OpenAI, GitHub Models.
+//! Self-hosted / local: LM Studio, vLLM, LiteLLM proxy, Ollama, llama.cpp
+//! server, HuggingFace TGI. The provider id and default base URL are
+//! picked up from [`Variant`].
 //!
 //! - Streaming via SSE (`eventsource-stream`); supports `stream_options:
 //!   { include_usage: true }` so we get a final usage event before `[DONE]`.
@@ -38,6 +41,44 @@ pub enum Variant {
     Vllm,
     LiteLlm,
     Ollama,
+    Groq,
+    Together,
+    Fireworks,
+    DeepInfra,
+    Perplexity,
+    XAI,
+    DeepSeek,
+    Mistral,
+    Cerebras,
+    SambaNova,
+    AzureOpenAI,
+    GithubModels,
+    LlamaCpp,
+    Tgi,
+    // Wave 2: hosted OpenAI-shape clouds.
+    Anyscale,
+    Lepton,
+    Replicate,
+    Novita,
+    Hyperbolic,
+    Lambda,
+    Nebius,
+    HfInference,
+    Glhf,
+    Featherless,
+    OctoAi,
+    NvidiaNim,
+    Avian,
+    Kluster,
+    InferenceNet,
+    Snowflake,
+    Databricks,
+    Writer,
+    // Wave 2: local runtimes.
+    Gpt4All,
+    Jan,
+    KoboldCpp,
+    Oobabooga,
 }
 
 impl Variant {
@@ -49,6 +90,42 @@ impl Variant {
             Variant::Vllm => "vllm",
             Variant::LiteLlm => "litellm",
             Variant::Ollama => "ollama",
+            Variant::Groq => "groq",
+            Variant::Together => "together",
+            Variant::Fireworks => "fireworks",
+            Variant::DeepInfra => "deepinfra",
+            Variant::Perplexity => "perplexity",
+            Variant::XAI => "xai",
+            Variant::DeepSeek => "deepseek",
+            Variant::Mistral => "mistral",
+            Variant::Cerebras => "cerebras",
+            Variant::SambaNova => "sambanova",
+            Variant::AzureOpenAI => "azure",
+            Variant::GithubModels => "github",
+            Variant::LlamaCpp => "llamacpp",
+            Variant::Tgi => "tgi",
+            Variant::Anyscale => "anyscale",
+            Variant::Lepton => "lepton",
+            Variant::Replicate => "replicate",
+            Variant::Novita => "novita",
+            Variant::Hyperbolic => "hyperbolic",
+            Variant::Lambda => "lambda",
+            Variant::Nebius => "nebius",
+            Variant::HfInference => "hf",
+            Variant::Glhf => "glhf",
+            Variant::Featherless => "featherless",
+            Variant::OctoAi => "octoai",
+            Variant::NvidiaNim => "nvidia",
+            Variant::Avian => "avian",
+            Variant::Kluster => "kluster",
+            Variant::InferenceNet => "inferencenet",
+            Variant::Snowflake => "snowflake",
+            Variant::Databricks => "databricks",
+            Variant::Writer => "writer",
+            Variant::Gpt4All => "gpt4all",
+            Variant::Jan => "jan",
+            Variant::KoboldCpp => "koboldcpp",
+            Variant::Oobabooga => "oobabooga",
         }
     }
 
@@ -60,13 +137,96 @@ impl Variant {
             Variant::Vllm => "http://localhost:8000/v1",
             Variant::LiteLlm => "http://localhost:4000/v1",
             Variant::Ollama => "http://localhost:11434/v1",
+            Variant::Groq => "https://api.groq.com/openai/v1",
+            Variant::Together => "https://api.together.xyz/v1",
+            Variant::Fireworks => "https://api.fireworks.ai/inference/v1",
+            Variant::DeepInfra => "https://api.deepinfra.com/v1/openai",
+            Variant::Perplexity => "https://api.perplexity.ai",
+            Variant::XAI => "https://api.x.ai/v1",
+            Variant::DeepSeek => "https://api.deepseek.com/v1",
+            Variant::Mistral => "https://api.mistral.ai/v1",
+            Variant::Cerebras => "https://api.cerebras.ai/v1",
+            Variant::SambaNova => "https://api.sambanova.ai/v1",
+            // Azure OpenAI: users MUST override with their resource URL,
+            // e.g. https://<resource>.openai.azure.com/openai/deployments/<deployment>.
+            Variant::AzureOpenAI => "https://example.openai.azure.com/openai/deployments/REPLACE-ME",
+            Variant::GithubModels => "https://models.inference.ai.azure.com",
+            Variant::LlamaCpp => "http://localhost:8080/v1",
+            Variant::Tgi => "http://localhost:3000/v1",
+            Variant::Anyscale => "https://api.endpoints.anyscale.com/v1",
+            Variant::Lepton => "https://api.lepton.ai/api/v1",
+            Variant::Replicate => "https://openai-proxy.replicate.com/v1",
+            Variant::Novita => "https://api.novita.ai/v3/openai",
+            Variant::Hyperbolic => "https://api.hyperbolic.xyz/v1",
+            Variant::Lambda => "https://api.lambdalabs.com/v1",
+            Variant::Nebius => "https://api.studio.nebius.ai/v1",
+            Variant::HfInference => "https://router.huggingface.co/v1",
+            Variant::Glhf => "https://glhf.chat/api/openai/v1",
+            Variant::Featherless => "https://api.featherless.ai/v1",
+            Variant::OctoAi => "https://text.octoai.run/v1",
+            Variant::NvidiaNim => "https://integrate.api.nvidia.com/v1",
+            Variant::Avian => "https://api.avian.io/v1",
+            Variant::Kluster => "https://api.kluster.ai/v1",
+            Variant::InferenceNet => "https://api.inference.net/v1",
+            // Snowflake Cortex: user must override with their account URL,
+            // e.g. https://<account>.snowflakecomputing.com/api/v2/cortex/inference.
+            Variant::Snowflake => "https://example.snowflakecomputing.com/api/v2/cortex/inference/v1",
+            // Databricks: user must override with their workspace URL,
+            // e.g. https://<workspace>.cloud.databricks.com/serving-endpoints.
+            Variant::Databricks => "https://example.cloud.databricks.com/serving-endpoints/v1",
+            Variant::Writer => "https://api.writer.com/v1",
+            Variant::Gpt4All => "http://localhost:4891/v1",
+            Variant::Jan => "http://localhost:1337/v1",
+            Variant::KoboldCpp => "http://localhost:5001/v1",
+            Variant::Oobabooga => "http://localhost:5000/v1",
         }
     }
 
     /// Whether a real API key is mandatory for this variant. Local
     /// providers accept any string (or none) and we send a dummy token.
     pub fn requires_api_key(self) -> bool {
-        matches!(self, Variant::OpenAI | Variant::OpenRouter)
+        matches!(
+            self,
+            Variant::OpenAI
+                | Variant::OpenRouter
+                | Variant::Groq
+                | Variant::Together
+                | Variant::Fireworks
+                | Variant::DeepInfra
+                | Variant::Perplexity
+                | Variant::XAI
+                | Variant::DeepSeek
+                | Variant::Mistral
+                | Variant::Cerebras
+                | Variant::SambaNova
+                | Variant::AzureOpenAI
+                | Variant::GithubModels
+                | Variant::Anyscale
+                | Variant::Lepton
+                | Variant::Replicate
+                | Variant::Novita
+                | Variant::Hyperbolic
+                | Variant::Lambda
+                | Variant::Nebius
+                | Variant::HfInference
+                | Variant::Glhf
+                | Variant::Featherless
+                | Variant::OctoAi
+                | Variant::NvidiaNim
+                | Variant::Avian
+                | Variant::Kluster
+                | Variant::InferenceNet
+                | Variant::Snowflake
+                | Variant::Databricks
+                | Variant::Writer
+        )
+    }
+
+    /// Azure OpenAI is OpenAI-shape but uses `api-key:` header (not Bearer)
+    /// and a deployment-name path; we keep the same `/chat/completions`
+    /// suffix and let the user point `base_url` at their deployment.
+    fn uses_api_key_header(self) -> bool {
+        matches!(self, Variant::AzureOpenAI)
     }
 }
 
@@ -108,7 +268,23 @@ impl Provider for OpenAiCompatProvider {
         ProviderCapabilities {
             streaming: true,
             tools: true,
-            vision: matches!(self.variant, Variant::OpenAI | Variant::OpenRouter),
+            vision: matches!(
+                self.variant,
+                Variant::OpenAI
+                    | Variant::OpenRouter
+                    | Variant::Together
+                    | Variant::Fireworks
+                    | Variant::XAI
+                    | Variant::Mistral
+                    | Variant::AzureOpenAI
+                    | Variant::GithubModels
+                    | Variant::Hyperbolic
+                    | Variant::Nebius
+                    | Variant::HfInference
+                    | Variant::NvidiaNim
+                    | Variant::DeepInfra
+                    | Variant::Novita
+            ),
             cache_kind: CacheKind::Automatic,
         }
     }
@@ -127,7 +303,11 @@ impl Provider for OpenAiCompatProvider {
 
         if let Some(key) = &self.api_key {
             if !key.is_empty() {
-                builder = builder.header("authorization", format!("Bearer {key}"));
+                if self.variant.uses_api_key_header() {
+                    builder = builder.header("api-key", key.as_str());
+                } else {
+                    builder = builder.header("authorization", format!("Bearer {key}"));
+                }
             }
         } else if self.variant.requires_api_key() {
             return Err(ArccodeError::Provider(format!(
@@ -409,16 +589,111 @@ mod tests {
 
     #[test]
     fn variants_have_distinct_ids_and_defaults() {
-        for v in [
+        let all = [
             Variant::OpenAI,
             Variant::OpenRouter,
             Variant::LmStudio,
             Variant::Vllm,
             Variant::LiteLlm,
             Variant::Ollama,
-        ] {
-            assert!(!v.id().is_empty());
+            Variant::Groq,
+            Variant::Together,
+            Variant::Fireworks,
+            Variant::DeepInfra,
+            Variant::Perplexity,
+            Variant::XAI,
+            Variant::DeepSeek,
+            Variant::Mistral,
+            Variant::Cerebras,
+            Variant::SambaNova,
+            Variant::AzureOpenAI,
+            Variant::GithubModels,
+            Variant::LlamaCpp,
+            Variant::Tgi,
+            Variant::Anyscale,
+            Variant::Lepton,
+            Variant::Replicate,
+            Variant::Novita,
+            Variant::Hyperbolic,
+            Variant::Lambda,
+            Variant::Nebius,
+            Variant::HfInference,
+            Variant::Glhf,
+            Variant::Featherless,
+            Variant::OctoAi,
+            Variant::NvidiaNim,
+            Variant::Avian,
+            Variant::Kluster,
+            Variant::InferenceNet,
+            Variant::Snowflake,
+            Variant::Databricks,
+            Variant::Writer,
+            Variant::Gpt4All,
+            Variant::Jan,
+            Variant::KoboldCpp,
+            Variant::Oobabooga,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for v in all {
+            assert!(!v.id().is_empty(), "variant has empty id");
             assert!(v.default_base_url().starts_with("http"));
+            assert!(seen.insert(v.id()), "duplicate variant id {}", v.id());
+        }
+    }
+
+    #[test]
+    fn hosted_variants_require_api_key() {
+        for v in [
+            Variant::Groq,
+            Variant::Together,
+            Variant::Fireworks,
+            Variant::DeepInfra,
+            Variant::Perplexity,
+            Variant::XAI,
+            Variant::DeepSeek,
+            Variant::Mistral,
+            Variant::Cerebras,
+            Variant::SambaNova,
+            Variant::AzureOpenAI,
+            Variant::GithubModels,
+            Variant::Anyscale,
+            Variant::Lepton,
+            Variant::Replicate,
+            Variant::Novita,
+            Variant::Hyperbolic,
+            Variant::Lambda,
+            Variant::Nebius,
+            Variant::HfInference,
+            Variant::Glhf,
+            Variant::Featherless,
+            Variant::OctoAi,
+            Variant::NvidiaNim,
+            Variant::Avian,
+            Variant::Kluster,
+            Variant::InferenceNet,
+            Variant::Snowflake,
+            Variant::Databricks,
+            Variant::Writer,
+        ] {
+            assert!(v.requires_api_key(), "{} should require api key", v.id());
+        }
+    }
+
+    #[test]
+    fn local_variants_do_not_require_api_key() {
+        for v in [
+            Variant::LmStudio,
+            Variant::Vllm,
+            Variant::Ollama,
+            Variant::LiteLlm,
+            Variant::LlamaCpp,
+            Variant::Tgi,
+            Variant::Gpt4All,
+            Variant::Jan,
+            Variant::KoboldCpp,
+            Variant::Oobabooga,
+        ] {
+            assert!(!v.requires_api_key(), "{} should not require api key", v.id());
         }
     }
 
