@@ -342,7 +342,11 @@ mod tests {
             a_path = a.display()
         );
         let out = ApplyPatch.run(json!({"patch": patch}), &ctx).await;
-        assert!(out.is_error, "expected error outcome, got ok: {}", out.content);
+        assert!(
+            out.is_error,
+            "expected error outcome, got ok: {}",
+            out.content
+        );
         assert!(
             out.content.contains("matches 2"),
             "expected error to mention 'matches 2'; got: {}",
