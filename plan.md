@@ -16,6 +16,38 @@ This builds on existing pieces:
 
 ---
 
+## Implementation status (Session 3 — as of 2026-06-01)
+
+> **Session 3 update (2026-06-01):** landed a round of **live
+> orchestrator/CLI wiring** that turns previously logic-only modules into
+> live pipeline behaviour, each as a small, separately-committed change:
+>
+> - **E8 (CI gate):** replaced the hardcoded `ci_green: None` with a real
+>   `gh pr checks --json state` query (`pipeline::query_ci_status`) feeding
+>   the auto-merge gate when `[pilot.pr].require_ci_green` is set.
+> - **E6 (adaptive routing):** `learning::route_model` is now read back at
+>   spawn time — the live worker spawner picks the base model per role from
+>   `~/.arccode/stats.jsonl` history, escalating roles whose cheap-model
+>   success rate is below threshold.
+> - **E6 (planner priming):** `learning::render_priming` +
+>   `planner::plan_from_goal_with_priming` inject the most similar past runs
+>   (with merged/reverted outcomes) ahead of the E2 draft pass.
+> - **J1 (goal refinement):** `pilot run` runs the refinement agent before
+>   planning (gated by the `goal_refinement` capability, autopilot default);
+>   `refine::decide` drives Proceed / NotifyWindow / AskUser.
+> - **J5 + R5 (reporting/routing):** a completion/failure report
+>   (`reporting::render_run_*`) is now pushed at run end, routed by severity
+>   through `[pilot.notifications]` (`notify::route`) to the terminal or the
+>   `.arccode/pilot-digest.jsonl` digest.
+> - **E12 (`--watch`):** wired into `pilot run` for an in-terminal tail.
+>
+> **413 tests** green in `arccode-autonomous`; `cargo check --workspace`
+> and `cargo clippy` clean. What remains is the residue below: a handful of
+> deeper orchestrator changes (E7 during-run spawn, E11 hard gate,
+> rebase-as-you-go, J8 knowledge-keeper) and the external-I/O items that
+> need a Docker daemon, audio hardware, third-party accounts, or live
+> provider API keys.
+
 ## Implementation status (as of 2026-05-29)
 
 > **Session 2 update (2026-05-29):** landed the decision/logic cores for
@@ -103,7 +135,7 @@ Items are tagged with the git commit that landed them.
 | Phase 7 — TUI dashboard                           | ✅ | `3a15c71` | Renderer + `pilot status`/`pilot watch` CLIs via mtime polling. **Deferred:** deep arccode-tui integration (Ctrl+A, slash commands, in-app top-bar) — see M4 polish |
 | Phase 8 — Cross-provider validation + polish      | ✅ | `ade3984`, `5584db6` | Cost-cap (assign-time + budget watchdog), provider gate, retry watchdog, README provider-support table, end-to-end pipeline wired, e2e stub-provider test. **Deferred:** live 9-provider validation (needs user API keys) |
 
-### M2 (copilot tier) — E1/E2/E3/E5/E13 shipped; E4/E6/E7/E8/E11 logic-complete (session 2); E9/E10/E12 remain
+### M2 (copilot tier) — E1/E2/E3/E5/E12/E13 shipped; E4/E6/E7/E8/E11 wired (sessions 2–3); E9/E10 remain (logic-complete)
 
 | Item | Status | Commit | Notes |
 | ---- | :----: | ------ | ----- |
@@ -112,24 +144,24 @@ Items are tagged with the git commit that landed them.
 | E3 — Executable acceptance + self-verify| ✅ | `0bfd84d` | `run_acceptance` builtin tool + orchestrator gates Review→Done on green results |
 | E4 — Conflict avoidance + rebase-as-you-go + auto merge-fixer | ✅ **wired** | `scheduler.rs` | Logic + **live**: `orchestrator::handle_assign` rejects assigning a task whose `writes` overlap an in-progress task (`OrchestratorError::WriteConflict`), serialising them. **Deferred:** rebase-as-you-go + merge-fixer auto-spawn |
 | E5 — 4-rung retry ladder + per-turn check-gate | ✅ partial | `2fc9e63` | Rungs 1 (context), 2 (escalate model), 3 (splitter), 4 (Blocked) all implemented. **Deferred:** E5.5 per-turn `cargo check` gate (needs E11 checkpoint rollback to be useful) |
-| E6 — Cross-run learning + adaptive routing | ✅ **wired** | `learning.rs` | Logic + **live**: `pipeline.rs` appends a `StatRecord` per task to `~/.arccode/stats.jsonl` on every run (`record_run_stats`). **Deferred:** reading them back at plan/route time + true first-try detection |
+| E6 — Cross-run learning + adaptive routing | ✅ **wired** | `learning.rs` | Logic + **live**: `pipeline.rs` appends a `StatRecord` per task to `~/.arccode/stats.jsonl` on every run (`record_run_stats`); **session 3** reads them back — the live worker spawner routes the base model per role via `learning::route_model`, and `pilot run` primes the planner with similar past runs via `learning::render_priming` + `planner::plan_from_goal_with_priming`. **Deferred:** true first-try detection (still proxied by Done-status) + per-role lessons file load |
 | E7 — Per-task reviewer                  | ✅ **wired** | `review.rs` | Logic + **live**: `pipeline::run_reviewer_pass` runs a reviewer agent per Done task (gated by the `per_task_reviewer` capability, on for copilot+); a Rework verdict feeds the E8 gate. **Deferred:** spawn it *during* the run on each Review transition (currently post-run) |
-| E8 — PR-side automation                 | ✅ **wired** | `automerge.rs` | Logic + **live**: `pipeline.rs` calls `decide_auto_merge` after PR open and issues `gh pr merge --squash --auto` when it passes (`decide_and_maybe_merge`). **Deferred:** CI status + per-task-review + critic signals into the gate; `arccode review` PR comments |
+| E8 — PR-side automation                 | ✅ **wired** | `automerge.rs` | Logic + **live**: `pipeline.rs` calls `decide_auto_merge` after PR open and issues `gh pr merge --squash --auto` when it passes (`decide_and_maybe_merge`); **session 3** plumbs real **CI status** via `gh pr checks --json state` (`query_ci_status`) into the gate. Per-task-review + critic signals already feed it. **Deferred:** `arccode review` inline PR comments |
 | E9 — Speculative dispatch + adaptive concurrency | ✅ partial | `concurrency.rs`: `recommended_concurrency` scales the cap from rate-limit/CPU/burn signals. **Deferred:** speculative pre-spawn of the next task |
 | E10 — Manager↔worker IPC                | ✅ logic | `ipc.rs`: `ManagerCommand` (pivot/cancel/clarify) + `WorkerMessage` (question/ack/blocked) NDJSON encode/parse. **Deferred:** wiring the stdin pipe in `child_process.rs` (old `message_agent` actor stub from `2b18bbe` remains) |
 | E11 — Mandatory checkpoint hygiene      | ✅ **wired** | `checkpoint.rs` | Logic + **live**: `pipeline.rs` reads the event log and reports per-task hygiene violations in `PipelineOutcome.checkpoint_violations` (advisory). **Deferred:** make it a hard Review gate + worker-prompt mandate |
-| E12 — `--watch` mode                    | ✅ partial | `3a15c71` | `arccode pilot watch <id>` ships. **Deferred:** flag wired into `pilot run` for in-terminal tail of an in-process run |
+| E12 — `--watch` mode                    | ✅ **wired** | `3a15c71` | `arccode pilot watch <id>` ships; **session 3** wired `--watch` into `pilot run` (`run_with_watch`) for an in-terminal compact tail of the in-process run via a `select!` loop |
 | E13 — Role lineup                       | ✅ | `33e4ab9` | All 6 roles shipped with default prompts (developer/designer/tester/reviewer/refactorer/merge-fixer) |
 
 ### M3 (autopilot tier) — all J-items logic-complete (session 2); live I/O + orchestrator wiring deferred
 
 | Item | Status | Notes |
 | ---- | :----: | ----- |
-| J1 — Goal refinement + challenge        | ✅ logic | `refine.rs`: parse clarify/challenge/restatement/alternatives; `decide` → Proceed / NotifyWindow / AskUser by confidence + `challenge_threshold`. **Deferred:** orchestrator runs the refinement agent before E2 |
+| J1 — Goal refinement + challenge        | ✅ **wired** | `refine.rs`: parse clarify/challenge/restatement/alternatives; `decide` → Proceed / NotifyWindow / AskUser by confidence + `challenge_threshold`. **Live (session 3):** `pilot run` runs the refinement agent before E2 (gated by the `goal_refinement` capability, autopilot default); `refine_goal`/`ask_user_refinement` render the negotiation and feed the (possibly restated) goal into the run |
 | J2 — Daemon mode                        | ✅ **wired** | `daemon.rs` logic + `run_cycle`/`run_n_cycles` + **live `arccode pilot daemon` CLI command** (real poll loop: `run_cycle` on the configured interval, logs decisions, queues accepted candidates to `.arccode/daemon-queue.jsonl`; `--cycles N` for one-shot). Functions fully given a GitHub token. **Deferred:** auto-dispatching accepted goals into nested runs |
 | J3 — Multi-channel intake               | ✅ **wired** | `intake.rs` normalization + `scan_inbox` (file-drop, fs-tested) + **`webhook.rs` inbound HTTP receiver** (dependency-free `TcpListener`; `handle_connection`/`serve` loopback-tested) + outbound `notify::send_webhook`. **Deferred:** Slack/email *transports* (thin transforms over `normalize`, need live accounts) |
 | J4 — Mid-run interjection               | ✅ logic | `interject.rs`: parse `tell`/`ask` → `Dispatch` over E10 `ipc`. **Deferred:** CLI subcommands + live channel delivery |
-| J5 — Proactive status reporting         | ✅ logic | `reporting.rs`: per-run start/mid(>50% est.)/complete/failure + daily standup + weekly summary renderers. **Deferred:** daemon scheduling + delivery via R5 `notify` |
+| J5 — Proactive status reporting         | ✅ **wired** | `reporting.rs`: per-run start/mid(>50% est.)/complete/failure + daily standup + weekly summary renderers. **Live (session 3):** `pilot run` pushes a completion/failure report at run end, routed by severity through `[pilot.notifications]` (`report_run_outcome` → `notify::route`) to the terminal or the `.arccode/pilot-digest.jsonl` digest. **Deferred:** daemon-scheduled standup/weekly cron + Slack/email transports |
 | J6 — Real verification (run/screenshot/http) | ✅ partial | Added `Acceptance::Run` + `Acceptance::Assert` (screenshot text-contains) variants; sync runner executes both. **Deferred:** real browser/screenshot capture + async `http` runner |
 | J7 — Tool synthesis                     | ✅ logic | `toolsynth.rs`: `ToolProposal` parse + `validate` (name/schema/dup) + `accept_batch` dedupe. **Deferred:** `tool-smith` role that generates impl+test + registration |
 | J8 — Project knowledge graph            | ✅ logic | `knowledge.rs`: `Hotspots` (edit/conflict heat → scheduler bias), `decisions.jsonl` append/load, `render_architecture`. **Deferred:** knowledge-keeper agent that regenerates these post-merge |
@@ -149,7 +181,7 @@ Items are tagged with the git commit that landed them.
 | R2 — Post-merge feedback loop         | M2 | ✅ logic + poller | `feedback.rs` + `Event::PrOutcome`: gh-state parse, `Revert "…"` detection, `WeightedStats`. `poll_pr_outcome` + `poll_and_record` (appends the `pr.outcome` event, mock-runner tested). **Deferred:** only the scheduling cadence that calls it + an optional webhook receiver |
 | R3 — Handoff packet                   | M2 | ✅ **wired** | `handoff.rs` logic + **live**: `pipeline.rs` writes `escalation.md` on a blocked run and surfaces its path; `PipelineOutcome.escalation_packet` + CLI prints it. **Deferred:** populating real J15 triggers/attempts (needs E5 ladder telemetry) |
 | R4 — Eval / regression harness        | M2 | ✅ logic | `eval.rs`: `summarize` + `compare` (per-axis ±threshold regression detection, direction-aware) + markdown dashboard. **Deferred:** the canned-goal runner, LLM-judge, and CI gate wiring |
-| R5 — Notification routing & digesting | M3 | ✅ logic | `notify.rs`: `route` per severity tier → Immediate/Digest/Suppress; `Digest` accumulator + flush. Added `[pilot.notifications]`. **Deferred:** real channel senders + digest cron |
+| R5 — Notification routing & digesting | M3 | ✅ **wired** | `notify.rs`: `route` per severity tier → Immediate/Digest/Suppress; `Digest` accumulator + flush. Added `[pilot.notifications]`. **Live (session 3):** `pilot run`'s end-of-run report is routed through `notify::route` (terminal delivery + `.arccode/pilot-digest.jsonl` queue). **Deferred:** real Slack/email channel senders + digest cron |
 | R6 — Security pass in PR pipeline     | M2 | ✅ **wired** | `security.rs` logic + **live**: `pipeline.rs` runs the built-in secrets scan over `git diff <base>..<integration>` (`run_security_pass`) and feeds `security_blocks` into the E8 auto-merge gate. Added `[pilot.security]`. **Deferred:** external `gitleaks`/`cargo audit` subprocess + license scan from lockfile + PR comment |
 
 ### Cumulative metrics
