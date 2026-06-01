@@ -396,10 +396,18 @@ fn decide_and_maybe_merge(
     // from a clean auto-approve. We model "trusted from the start" as
     // auto_approved, relaxed for autopilot.
     let tier_was_auto = auto_approved || tier == arccode_config::PilotTier::Autopilot;
+    // CI status only matters when the gate requires it and `gh` actually
+    // opened the PR (otherwise there's nothing to query). A pending/unknown
+    // result maps to `None`, which `decide_auto_merge` treats as "hold".
+    let ci_green = if pr_config.require_ci_green && pr_outcome.created_by_gh {
+        query_ci_status(runner, project_root, &pr_outcome.url)
+    } else {
+        None
+    };
     let decision = crate::automerge::decide_auto_merge(&crate::automerge::AutoMergeInputs {
         config_auto_merge: pr_config.auto_merge,
         tier_was_auto,
-        ci_green: None, // CI status not plumbed yet
+        ci_green,
         require_ci_green: pr_config.require_ci_green,
         review_max_severity, // E7 per-task reviewer (wired below)
         security_blocks,     // R6 security pass (wired below)
@@ -422,6 +430,48 @@ fn decide_and_maybe_merge(
         }
     }
     decision
+}
+
+/// E8 — query CI status for an opened PR via `gh pr checks <url> --json
+/// state`. Returns `Some(true)` when every check passed (treating
+/// `SKIPPED`/`NEUTRAL` as passing), `Some(false)` when any check failed,
+/// and `None` when checks are still pending, none are configured, or `gh`
+/// is unavailable. `gh pr checks` exits non-zero while checks are
+/// failing/pending but still prints the JSON, so we parse stdout regardless
+/// of the exit status.
+fn query_ci_status(
+    runner: &dyn CommandRunner,
+    project_root: &std::path::Path,
+    pr_url: &str,
+) -> Option<bool> {
+    let out = runner
+        .run(
+            "gh",
+            &["pr", "checks", pr_url, "--json", "state"],
+            project_root,
+        )
+        .ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(out.stdout.trim()).ok()?;
+    let arr = parsed.as_array()?;
+    if arr.is_empty() {
+        return None; // no checks configured → nothing to gate on
+    }
+    let mut any_pending = false;
+    for c in arr {
+        match c.get("state").and_then(|s| s.as_str()) {
+            Some("SUCCESS") | Some("SKIPPED") | Some("NEUTRAL") => {}
+            Some("PENDING") | Some("QUEUED") | Some("IN_PROGRESS") | Some("REQUESTED")
+            | Some("WAITING") | Some("EXPECTED") => any_pending = true,
+            // FAILURE, ERROR, CANCELLED, TIMED_OUT, ACTION_REQUIRED, STALE…
+            Some(_) => return Some(false),
+            None => any_pending = true,
+        }
+    }
+    if any_pending {
+        None
+    } else {
+        Some(true)
+    }
 }
 
 /// R6 — run the security pass over the integration diff. Currently the
@@ -1222,6 +1272,114 @@ mod tests {
             calls.iter().any(|(p, a)| p == "gh" && a.first().map(|s| s.as_str()) == Some("pr") && a.get(1).map(|s| s.as_str()) == Some("merge")),
             "expected a gh pr merge call, got {calls:?}"
         );
+    }
+
+    /// Runner that returns a canned `gh pr checks --json state` body and an
+    /// all-ok `gh pr create`/`gh pr merge`. Used to drive the CI gate.
+    struct CiRunner {
+        checks_json: String,
+        calls: Mutex<Vec<(String, Vec<String>)>>,
+    }
+    impl CiRunner {
+        fn new(checks_json: &str) -> Self {
+            Self {
+                checks_json: checks_json.to_string(),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+    impl CommandRunner for CiRunner {
+        fn run(&self, program: &str, args: &[&str], _cwd: &Path) -> std::io::Result<CommandOut> {
+            self.calls.lock().unwrap().push((
+                program.to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+            ));
+            let is_checks = program == "gh"
+                && args.first().copied() == Some("pr")
+                && args.get(1).copied() == Some("checks");
+            let stdout = if is_checks {
+                self.checks_json.clone()
+            } else {
+                String::new()
+            };
+            Ok(CommandOut { status: Some(0), stdout, stderr: String::new() })
+        }
+    }
+
+    #[test]
+    fn query_ci_status_all_success_is_green() {
+        let runner = CiRunner::new(r#"[{"state":"SUCCESS"},{"state":"SKIPPED"}]"#);
+        assert_eq!(
+            query_ci_status(&runner, Path::new("."), "https://x/pull/1"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn query_ci_status_any_failure_is_red() {
+        let runner = CiRunner::new(r#"[{"state":"SUCCESS"},{"state":"FAILURE"}]"#);
+        assert_eq!(
+            query_ci_status(&runner, Path::new("."), "https://x/pull/1"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn query_ci_status_pending_is_unknown() {
+        let runner = CiRunner::new(r#"[{"state":"SUCCESS"},{"state":"IN_PROGRESS"}]"#);
+        assert_eq!(
+            query_ci_status(&runner, Path::new("."), "https://x/pull/1"),
+            None
+        );
+    }
+
+    #[test]
+    fn query_ci_status_no_checks_is_unknown() {
+        let runner = CiRunner::new("[]");
+        assert_eq!(
+            query_ci_status(&runner, Path::new("."), "https://x/pull/1"),
+            None
+        );
+    }
+
+    #[test]
+    fn e8_auto_merge_fires_when_ci_required_and_green() {
+        let runner = CiRunner::new(r#"[{"state":"SUCCESS"}]"#);
+        let pr = PrOutcome { url: "https://x/pull/1".into(), created_by_gh: true };
+        let decision = decide_and_maybe_merge(
+            &runner,
+            Path::new("."),
+            &arccode_config::PilotPrConfig { auto_merge: true, require_ci_green: true, auto_merge_max_severity: "low".into() },
+            true,
+            arccode_config::PilotTier::Copilot,
+            false,
+            None,
+            false,
+            &pr,
+        );
+        assert!(decision.is_merge());
+        let calls = runner.calls.lock().unwrap();
+        assert!(calls.iter().any(|(p, a)| p == "gh" && a.first().map(|s| s.as_str()) == Some("pr") && a.get(1).map(|s| s.as_str()) == Some("checks")));
+        assert!(calls.iter().any(|(p, a)| p == "gh" && a.get(1).map(|s| s.as_str()) == Some("merge")));
+    }
+
+    #[test]
+    fn e8_auto_merge_holds_when_ci_required_and_red() {
+        let runner = CiRunner::new(r#"[{"state":"FAILURE"}]"#);
+        let pr = PrOutcome { url: "https://x/pull/1".into(), created_by_gh: true };
+        let decision = decide_and_maybe_merge(
+            &runner,
+            Path::new("."),
+            &arccode_config::PilotPrConfig { auto_merge: true, require_ci_green: true, auto_merge_max_severity: "low".into() },
+            true,
+            arccode_config::PilotTier::Copilot,
+            false,
+            None,
+            false,
+            &pr,
+        );
+        assert!(!decision.is_merge());
+        assert!(!runner.calls.lock().unwrap().iter().any(|(p, a)| p == "gh" && a.get(1).map(|s| s.as_str()) == Some("merge")));
     }
 
     #[test]
