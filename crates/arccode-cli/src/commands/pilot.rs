@@ -97,6 +97,23 @@ pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
     let provider = runtime::build_provider(&cfg, &selection.provider_id)
         .with_context(|| format!("building provider for {}", selection.provider_id))?;
 
+    // J1 — goal refinement & negotiation (autopilot, or wherever the
+    // `goal_refinement` capability is enabled). Runs a refinement agent
+    // before planning; it may restate an ambiguous goal, challenge it, or
+    // ask clarifying questions. The (possibly restated) goal flows into the
+    // rest of the run. `None` means the user vetoed → abort cleanly.
+    let goal = if capability_on(&pilot, "goal_refinement") {
+        match refine_goal(provider.as_ref(), &selection.model, &opts.goal, &pilot).await {
+            Some(g) => g,
+            None => {
+                eprintln!("[pilot] goal refinement: aborted before planning.");
+                return Ok(ExitCode::from(2));
+            }
+        }
+    } else {
+        opts.goal.clone()
+    };
+
     // Pin the run to the current git HEAD (or the user's --base override).
     let project = ProjectPaths::discover(&std::env::current_dir()?);
     let base_commit = resolve_base_commit(&project.root, opts.base.as_deref())?;
@@ -113,7 +130,7 @@ pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
     );
     eprintln!("[pilot] planning…");
 
-    let mut store = RunStore::create(&run_path, &run_id, &opts.goal, &base_commit, &integration)
+    let mut store = RunStore::create(&run_path, &run_id, &goal, &base_commit, &integration)
         .await
         .context("opening run store")?;
 
@@ -132,13 +149,13 @@ pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
         .map(|g| g.join("stats.jsonl"))
         .and_then(|p| arccode_autonomous::learning::load_stats(&p).ok())
         .filter(|records| !records.is_empty())
-        .and_then(|records| arccode_autonomous::learning::render_priming(&opts.goal, &records, 5));
+        .and_then(|records| arccode_autonomous::learning::render_priming(&goal, &records, 5));
     if priming.is_some() {
         eprintln!("[pilot] priming planner with similar past runs (E6).");
     }
     let plan = arccode_autonomous::planner::plan_from_goal_with_priming(
         &llm as &dyn PlannerLlm,
-        &opts.goal,
+        &goal,
         &project.root,
         priming.as_deref(),
     )
@@ -196,7 +213,7 @@ pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
         arccode_autonomous::approval::ApprovalTier::NotifyOnly => {
             run_notify_window(
                 &plan,
-                &opts.goal,
+                &goal,
                 pilot.approval.notify_only_window_secs,
                 &pilot.approval.notify_channel,
             )
@@ -207,7 +224,7 @@ pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
                 eprintln!("[pilot] hard-gate required and no TTY — refusing to auto-approve plan.");
                 false
             } else {
-                prompt_for_approval(&plan, &opts.goal)?
+                prompt_for_approval(&plan, &goal)?
             }
         }
     };
@@ -317,8 +334,142 @@ fn capability_on(pilot: &arccode_config::PilotConfig, key: &str) -> bool {
         "per_task_reviewer" => matches!(pilot.tier, Copilot | Autopilot),
         // Critic (J10): autopilot-only by default.
         "critic" => matches!(pilot.tier, Autopilot),
+        // Goal refinement / negotiation (J1): autopilot-only by default.
+        "goal_refinement" => matches!(pilot.tier, Autopilot),
         // Unknown capability defaults off.
         _ => false,
+    }
+}
+
+/// Slice out the first balanced top-level JSON object from a chatty reply
+/// (models sometimes wrap JSON in prose or code fences). Falls back to the
+/// whole string when no clear object is found.
+fn extract_first_json_object(s: &str) -> &str {
+    match (s.find('{'), s.rfind('}')) {
+        (Some(a), Some(b)) if b > a => &s[a..=b],
+        _ => s,
+    }
+}
+
+/// J1 — run the refinement agent and act on its verdict. Returns the
+/// effective goal to plan against (the original or a restated one), or
+/// `None` if the user vetoed/declined and the run should abort.
+///
+/// The refinement *decision* logic lives in (and is unit-tested by)
+/// [`arccode_autonomous::refine`]; this function is the live wiring: it
+/// makes the LLM call, parses the report, and renders the interactive
+/// negotiation. A failed/garbled agent call degrades gracefully to "plan
+/// the original goal" — refinement must never wedge a run.
+async fn refine_goal(
+    provider: &dyn arccode_core::Provider,
+    model: &str,
+    original_goal: &str,
+    pilot: &arccode_config::PilotConfig,
+) -> Option<String> {
+    use arccode_autonomous::refine::{decide, parse_refinement, RefineAction};
+
+    const SYSTEM: &str = "You are a senior engineer refining a work request before it is \
+        planned. Read the goal and reply with ONLY a JSON object: \
+        {\"clarifying_questions\":[\"…\"],\"goal_restatement\":\"…\"|null,\
+        \"restatement_confidence\":\"low|medium|high\",\
+        \"challenges\":[{\"severity\":\"low|medium|high|critical\",\"message\":\"…\"}],\
+        \"alternatives\":[{\"description\":\"…\",\"tradeoff\":\"…\"}]}. \
+        Only ask questions whose answer would materially change the plan. \
+        Restate only when the goal is ambiguous but inferable. Be terse.";
+
+    eprintln!("[pilot] refining goal (J1)…");
+    let llm = ProviderLlm {
+        provider,
+        model: model.to_string(),
+        max_tokens: 1024,
+    };
+    let raw = match (&llm as &dyn PlannerLlm)
+        .complete(SYSTEM.to_string(), format!("GOAL:\n{original_goal}"))
+        .await
+    {
+        Ok(r) if !r.trim().is_empty() => r,
+        _ => {
+            eprintln!("[pilot] refinement: agent returned nothing; planning the goal as stated.");
+            return Some(original_goal.to_string());
+        }
+    };
+    let report = match parse_refinement(extract_first_json_object(&raw)) {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("[pilot] refinement: unparseable report; planning the goal as stated.");
+            return Some(original_goal.to_string());
+        }
+    };
+
+    match decide(&report, &pilot.refine, original_goal) {
+        RefineAction::Proceed { goal } => {
+            if goal != original_goal {
+                eprintln!("[pilot] refinement: proceeding with restated goal — {goal}");
+            }
+            Some(goal)
+        }
+        RefineAction::NotifyWindow { goal, note } => {
+            eprintln!("[pilot] refinement: {note}");
+            // Reuse the same veto window the approval gate uses.
+            if run_notify_window(
+                &[],
+                &goal,
+                pilot.approval.notify_only_window_secs,
+                &pilot.approval.notify_channel,
+            )
+            .await
+            .unwrap_or(true)
+            {
+                Some(goal)
+            } else {
+                None
+            }
+        }
+        RefineAction::AskUser {
+            questions,
+            challenges,
+            alternatives,
+        } => ask_user_refinement(original_goal, &questions, &challenges, &alternatives),
+    }
+}
+
+/// Render the J1 negotiation to the operator and collect a decision. On a
+/// non-interactive session we cannot ask, so we conservatively abort — the
+/// agent itself flagged this goal as needing human input.
+fn ask_user_refinement(
+    original_goal: &str,
+    questions: &[String],
+    challenges: &[String],
+    alternatives: &[arccode_autonomous::refine::Alternative],
+) -> Option<String> {
+    for c in challenges {
+        eprintln!("[pilot] ⚠️  challenge: {c}");
+    }
+    for q in questions {
+        eprintln!("[pilot] ❓ {q}");
+    }
+    for a in alternatives {
+        let tradeoff = if a.tradeoff.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", a.tradeoff)
+        };
+        eprintln!("[pilot] 💡 alternative: {}{tradeoff}", a.description);
+    }
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "[pilot] refinement needs input but there's no TTY — aborting. \
+             Re-run with a clarified goal."
+        );
+        return None;
+    }
+    eprint!("Proceed with the original goal anyway? [y / N] ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).ok();
+    match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Some(original_goal.to_string()),
+        _ => None,
     }
 }
 
