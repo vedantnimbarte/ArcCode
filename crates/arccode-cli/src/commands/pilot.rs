@@ -303,6 +303,16 @@ pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
     let outcome = arccode_autonomous::pipeline::run_to_completion(store, inputs)
         .await
         .context("pipeline run_to_completion")?;
+    // J5 — push a proactive status report (routed by R5). Best-effort: a
+    // notification failure must not change the run's exit status.
+    if let Ok(final_store) = RunStore::load(&run_path).await {
+        report_run_outcome(
+            &project.root,
+            final_store.state(),
+            &pilot.notifications,
+            !outcome.failed_tasks.is_empty(),
+        );
+    }
     if !outcome.failed_tasks.is_empty() {
         eprintln!(
             "[pilot] some tasks did not reach Done: {:?}",
@@ -319,6 +329,59 @@ pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
         eprintln!("[pilot] integration branch ready; PR step skipped (--no-pr).");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// J5 + R5 — emit a proactive status report for a finished run, routed by
+/// severity through `[pilot.notifications]`. `Immediate` channels are
+/// delivered to the terminal (the always-available channel; Slack/email
+/// transports are a deferred leaf that needs live accounts); `Digest`
+/// notifications are appended to `<project>/.arccode/pilot-digest.jsonl` for
+/// a later flush; `Suppress` drops silently.
+fn report_run_outcome(
+    project_root: &std::path::Path,
+    state: &arccode_autonomous::RunState,
+    cfg: &arccode_config::PilotNotificationsConfig,
+    failed: bool,
+) {
+    use arccode_autonomous::notify::{route, NotificationSeverity, RoutingDecision};
+    let (severity, body) = if failed {
+        (
+            NotificationSeverity::Escalation,
+            arccode_autonomous::reporting::render_run_failure(state, "tasks did not reach Done"),
+        )
+    } else {
+        (
+            NotificationSeverity::Progress,
+            arccode_autonomous::reporting::render_run_complete(state),
+        )
+    };
+    match route(severity, cfg) {
+        RoutingDecision::Immediate(channels) => {
+            eprintln!("[pilot] 🔔 ({}) {body}", channels.join(","));
+        }
+        RoutingDecision::Digest => {
+            let path = project_root.join(".arccode").join("pilot-digest.jsonl");
+            if let Err(e) = append_digest_line(&path, severity.as_str(), &body) {
+                eprintln!("[pilot] failed to queue digest notification: {e}");
+            } else {
+                eprintln!("[pilot] queued completion notice to digest.");
+            }
+        }
+        RoutingDecision::Suppress => {}
+    }
+}
+
+/// Append one digested notification line for a later `flush`.
+fn append_digest_line(path: &std::path::Path, severity: &str, body: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let line = serde_json::json!({ "severity": severity, "body": body });
+    writeln!(f, "{line}")
 }
 
 /// Resolve whether a pilot capability is on: an explicit
