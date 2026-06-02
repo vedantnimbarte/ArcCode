@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::model::Role;
+use crate::model::{Role, RunState};
 use crate::planner::PlannedTask;
 
 /// Historical per-role USD cost samples, gathered from past runs.
@@ -33,6 +33,33 @@ impl CostSamples {
     fn samples(&self, role: &str) -> Option<&[f64]> {
         self.per_role.get(role).map(|v| v.as_slice()).filter(|v| !v.is_empty())
     }
+
+    /// Total number of samples across all roles.
+    pub fn total(&self) -> usize {
+        self.per_role.values().map(Vec::len).sum()
+    }
+}
+
+/// J9 — build per-role cost samples from past run snapshots, so the
+/// estimator can produce tight, high-confidence bands once a project has
+/// history (instead of falling back to the static priors).
+///
+/// Each task that recorded a positive USD spend contributes one sample to
+/// its role's bucket. A task's `usd` field is itself the replayed sum of the
+/// `agent.usd` events attributed to it (see [`crate::model::apply`]), so
+/// this is exactly "samples fed from past runs' `agent.usd` events" — just
+/// pre-aggregated per task at the granularity the estimator reasons about
+/// (one sample == one task's all-in cost).
+pub fn cost_samples_from_runs<'a>(runs: impl IntoIterator<Item = &'a RunState>) -> CostSamples {
+    let mut samples = CostSamples::default();
+    for run in runs {
+        for task in &run.tasks {
+            if task.usd > 0.0 {
+                samples.add(task.role.as_str(), task.usd);
+            }
+        }
+    }
+    samples
 }
 
 /// Static per-role fallback rate (mirrors the M2 placeholder).
@@ -333,6 +360,53 @@ mod tests {
         // high ≈ 0.075; under $1 cap, not under $0.05.
         assert!(est.upper_bound_under(1.00));
         assert!(!est.upper_bound_under(0.05));
+    }
+
+    fn run_with_costs(run_id: &str, tasks: &[(Role, f64)]) -> RunState {
+        let mut s = RunState::new(run_id, "g", "abc", "b");
+        for (i, (role, usd)) in tasks.iter().enumerate() {
+            let mut t = crate::model::Task::new(format!("t{i}"), role.clone(), "x");
+            t.usd = *usd;
+            s.tasks.push(t);
+        }
+        s
+    }
+
+    #[test]
+    fn cost_samples_from_runs_buckets_by_role() {
+        let runs = vec![
+            run_with_costs("r1", &[(Role::Developer, 0.08), (Role::Tester, 0.02)]),
+            run_with_costs("r2", &[(Role::Developer, 0.12)]),
+        ];
+        let samples = cost_samples_from_runs(&runs);
+        assert_eq!(samples.per_role["developer"], vec![0.08, 0.12]);
+        assert_eq!(samples.per_role["tester"], vec![0.02]);
+        assert_eq!(samples.total(), 3);
+    }
+
+    #[test]
+    fn cost_samples_skips_zero_cost_tasks() {
+        // A task that never ran (or whose cost wasn't recorded) is not a
+        // sample — it would bias the band toward zero.
+        let runs = vec![run_with_costs("r1", &[(Role::Developer, 0.0), (Role::Developer, 0.10)])];
+        let samples = cost_samples_from_runs(&runs);
+        assert_eq!(samples.per_role["developer"], vec![0.10]);
+    }
+
+    #[test]
+    fn history_from_runs_feeds_the_estimator() {
+        // Four developer tasks at ~0.10 across past runs → Medium+
+        // confidence and a band centred on history, not the 0.05 prior.
+        let runs = vec![
+            run_with_costs("r1", &[(Role::Developer, 0.09), (Role::Developer, 0.11)]),
+            run_with_costs("r2", &[(Role::Developer, 0.10), (Role::Developer, 0.10)]),
+        ];
+        let samples = cost_samples_from_runs(&runs);
+        let plan = vec![task(Role::Developer, Reversibility::Trivial)];
+        let est = estimate_plan(&plan, &samples, 4);
+        assert_eq!(est.confidence, Confidence::Medium);
+        assert!(est.usd_point > 0.08 && est.usd_point < 0.12);
+        assert_eq!(est.sample_count, 4);
     }
 
     #[test]

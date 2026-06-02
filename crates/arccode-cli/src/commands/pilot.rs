@@ -169,12 +169,16 @@ pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
     eprint!("\n{}", render_plan(&plan));
 
     // J9 — surface a cost/time/risk estimate with confidence before the
-    // approval decision. No historical cost samples are wired yet, so this
-    // uses the static per-role priors (low confidence, wide bands) — still
-    // more honest than a bare point estimate.
+    // approval decision. Derive per-role cost samples from prior runs'
+    // recorded per-task spend so the bands tighten (and confidence rises)
+    // once the project has history; with no history this gracefully falls
+    // back to the static per-role priors (low confidence, wide bands).
+    let cost_samples = arccode_autonomous::estimate::cost_samples_from_runs(
+        arccode_autonomous::dashboard::load_all_run_states(&project.root).iter(),
+    );
     let estimate = arccode_autonomous::estimate::estimate_plan(
         &plan,
-        &arccode_autonomous::estimate::CostSamples::default(),
+        &cost_samples,
         pilot.max_concurrent_agents,
     );
     eprintln!("[pilot] {}", estimate.render().replace('\n', "\n[pilot] "));

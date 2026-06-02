@@ -323,6 +323,28 @@ pub fn list_runs(project_root: &Path) -> Result<Vec<RunSummary>, DashboardError>
     Ok(out)
 }
 
+/// Load the full [`RunState`] snapshot of every run on disk under
+/// `<project>/.arccode/autonomous/`. Corrupt or unreadable snapshots are
+/// skipped (best-effort), so callers can use this for history-derived
+/// signals (e.g. J9 cost samples) without a single bad run wedging them.
+pub fn load_all_run_states(project_root: &Path) -> Vec<RunState> {
+    let dir = project_root.join(".arccode").join("autonomous");
+    let Ok(read) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in read {
+        let Ok(e) = e else { continue };
+        if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        if let Ok(state) = load_state(&e.path()) {
+            out.push(state);
+        }
+    }
+    out
+}
+
 fn read_run_summary(run_dir: &Path) -> Result<RunSummary, DashboardError> {
     let state = load_state(run_dir)?;
     let done = state
