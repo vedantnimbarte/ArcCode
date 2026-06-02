@@ -79,6 +79,15 @@ impl EscalationTrigger {
         }
     }
 
+    /// True when this trigger must block an automatic merge. Every J15
+    /// trigger is blocking by definition (they are the non-negotiable
+    /// lines) *except* the cost **warning** at 0.8×, which is advisory —
+    /// the run continues but the operator is told. `CostHalt` (1.0×) still
+    /// blocks.
+    pub fn blocks_auto_merge(&self) -> bool {
+        !matches!(self, Self::CostWarn { .. })
+    }
+
     /// Plain-text rendering for the R3 escalation packet + the
     /// notification body.
     pub fn render(&self) -> String {
@@ -205,6 +214,134 @@ pub fn check_runtime(signals: &RuntimeSignals<'_>) -> Vec<EscalationTrigger> {
     }
 
     triggers
+}
+
+// ---------------------------------------------------------------------------
+// J15 static (plan + diff) triggers
+//
+// `check_runtime` above covers the numeric/state signals available after a
+// task completes (test deltas, spend, failure streaks). The functions below
+// cover the signals that live in the *plan* (a dangerous path the goal never
+// asked for) or in the *diff* (a leaked secret, a touched license header) or
+// in a *git operation* (a force-push outside the pilot's namespace).
+// ---------------------------------------------------------------------------
+
+/// License / copyright header markers. A changed diff line containing any
+/// of these (case-insensitive) is treated as touching a license header.
+const LICENSE_MARKERS: &[&str] = &[
+    "copyright",
+    "spdx-license-identifier",
+    "licensed under",
+    "all rights reserved",
+    "permission is hereby granted", // MIT body
+    "redistribution and use in source", // BSD body
+    "gnu general public license",
+    "apache license",
+    "mozilla public license",
+];
+
+/// True when the goal text plausibly refers to `path` — either the path
+/// verbatim or a meaningful component (directory / filename segment) of it.
+/// Used to decide whether a `dangerous_paths` hit was *intended* by the user
+/// (mentioned in the goal) or sneaked in (escalation required).
+pub fn goal_mentions_path(goal: &str, path: &str) -> bool {
+    let goal_lc = goal.to_ascii_lowercase();
+    let path_lc = path.to_ascii_lowercase();
+    if goal_lc.contains(&path_lc) {
+        return true;
+    }
+    // Structural / extension segments carry no signal about *what* is being
+    // touched, so a goal that merely says "rust" shouldn't excuse an edit to
+    // `crates/auth/src/login.rs`.
+    const NOISE: &[&str] = &[
+        "src", "crates", "crate", "lib", "mod", "rs", "toml", "md", "txt", "json", "yaml", "yml",
+        "tests", "test", "main", "the", "and", "for",
+    ];
+    for seg in path_lc.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if seg.len() < 3 || NOISE.contains(&seg) {
+            continue;
+        }
+        if goal_lc.contains(seg) {
+            return true;
+        }
+    }
+    false
+}
+
+/// J15 — for each dangerous-path hit (already matched against
+/// `[pilot.approval].dangerous_paths` by [`crate::approval::paths_matching`]),
+/// raise a [`EscalationTrigger::DangerousPathTouched`] when the goal text
+/// doesn't mention it. Hits the goal *does* mention are intentional and don't
+/// escalate. Deduplicates by path.
+pub fn dangerous_path_triggers(dangerous_hits: &[String], goal: &str) -> Vec<EscalationTrigger> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for path in dangerous_hits {
+        if !seen.insert(path.as_str()) {
+            continue;
+        }
+        if !goal_mentions_path(goal, path) {
+            out.push(EscalationTrigger::DangerousPathTouched {
+                path: path.clone(),
+                goal_mentions: false,
+            });
+        }
+    }
+    out
+}
+
+/// J15 — map the built-in secrets scan ([`crate::security::scan_secrets`])
+/// over the added diff lines into [`EscalationTrigger::SecretsDetected`].
+/// `added` is `(file, line_text)` for the `+` lines of a diff (sans the `+`).
+pub fn secret_triggers(added: &[(String, String)]) -> Vec<EscalationTrigger> {
+    crate::security::scan_secrets(added)
+        .into_iter()
+        .filter(|f| f.kind == "secret")
+        .map(|f| EscalationTrigger::SecretsDetected {
+            kind: f.message,
+            file: f.file.unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// J15 — flag any changed diff line that touches a license / copyright
+/// header. `changed` is `(file, line_text)` for every added *or removed* line
+/// (a removed header line matters as much as an added one). One trigger per
+/// file.
+pub fn license_header_triggers(changed: &[(String, String)]) -> Vec<EscalationTrigger> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (file, line) in changed {
+        let l = line.to_ascii_lowercase();
+        if LICENSE_MARKERS.iter().any(|m| l.contains(m)) && seen.insert(file.clone()) {
+            out.push(EscalationTrigger::LicenseHeaderModified { file: file.clone() });
+        }
+    }
+    out
+}
+
+/// True when `branch` is inside the pilot's own `arccode/auto/*` namespace,
+/// where force-pushes are routine and safe. Tolerates `refs/heads/` and
+/// `origin/` prefixes.
+pub fn is_pilot_namespace(branch: &str) -> bool {
+    let b = branch
+        .trim()
+        .trim_start_matches("refs/heads/")
+        .trim_start_matches("origin/");
+    b.starts_with("arccode/auto/")
+}
+
+/// J15 — a force-push is allowed only inside the `arccode/auto/*` namespace.
+/// Returns a trigger when a force-push targets any other branch. `branch` may
+/// be a bare name or a `refs/heads/...` ref.
+pub fn force_push_trigger(branch: &str, is_force: bool) -> Option<EscalationTrigger> {
+    if is_force && !is_pilot_namespace(branch) {
+        Some(EscalationTrigger::ForcePushOutsideNamespace {
+            branch: branch.to_string(),
+        })
+    } else {
+        None
+    }
 }
 
 /// R1 plan-time gate. Given the proposed plan + tier + the
@@ -479,5 +616,122 @@ mod tests {
         let s = t.render();
         assert!(s.contains("$12.00"));
         assert!(s.contains("$10.00"));
+    }
+
+    // --- J15 static triggers --------------------------------------------
+
+    #[test]
+    fn goal_mention_matches_meaningful_segment() {
+        assert!(goal_mentions_path(
+            "harden the auth login flow",
+            "crates/auth/src/login.rs"
+        ));
+        assert!(goal_mentions_path(
+            "tweak the github actions workflow",
+            ".github/workflows/ci.yml"
+        ));
+        // Verbatim path mention.
+        assert!(goal_mentions_path("edit Cargo.lock by hand", "Cargo.lock"));
+    }
+
+    #[test]
+    fn goal_mention_ignores_structural_noise() {
+        // "rust" / "src" don't excuse touching an auth file.
+        assert!(!goal_mentions_path(
+            "do some rust cleanup in src",
+            "crates/auth/src/login.rs"
+        ));
+        assert!(!goal_mentions_path("update the readme", "Cargo.lock"));
+    }
+
+    #[test]
+    fn dangerous_path_triggers_only_when_goal_silent() {
+        let hits = vec![
+            "crates/auth/src/login.rs".to_string(),
+            "Cargo.lock".to_string(),
+        ];
+        // Goal mentions auth → only Cargo.lock escalates.
+        let trips = dangerous_path_triggers(&hits, "refactor the auth module");
+        assert_eq!(trips.len(), 1);
+        assert!(matches!(
+            &trips[0],
+            EscalationTrigger::DangerousPathTouched { path, goal_mentions: false } if path == "Cargo.lock"
+        ));
+    }
+
+    #[test]
+    fn dangerous_path_triggers_dedupe() {
+        let hits = vec![".github/ci.yml".to_string(), ".github/ci.yml".to_string()];
+        let trips = dangerous_path_triggers(&hits, "unrelated goal");
+        assert_eq!(trips.len(), 1);
+    }
+
+    #[test]
+    fn secret_triggers_from_added_lines() {
+        let added = vec![(
+            "config.rs".to_string(),
+            r#"let k = "AKIAIOSFODNN7EXAMPLE";"#.to_string(),
+        )];
+        let trips = secret_triggers(&added);
+        assert!(trips
+            .iter()
+            .any(|t| matches!(t, EscalationTrigger::SecretsDetected { file, .. } if file == "config.rs")));
+    }
+
+    #[test]
+    fn secret_triggers_clean_on_prose() {
+        let added = vec![("README.md".to_string(), "An ordinary sentence.".to_string())];
+        assert!(secret_triggers(&added).is_empty());
+    }
+
+    #[test]
+    fn license_header_triggers_flag_per_file() {
+        let changed = vec![
+            (
+                "src/lib.rs".to_string(),
+                "// SPDX-License-Identifier: MIT".to_string(),
+            ),
+            (
+                "src/lib.rs".to_string(),
+                "// Copyright 2026 Someone".to_string(),
+            ),
+            ("src/main.rs".to_string(), "let x = 1;".to_string()),
+        ];
+        let trips = license_header_triggers(&changed);
+        // Two markers, same file → one trigger.
+        assert_eq!(trips.len(), 1);
+        assert!(matches!(
+            &trips[0],
+            EscalationTrigger::LicenseHeaderModified { file } if file == "src/lib.rs"
+        ));
+    }
+
+    #[test]
+    fn force_push_allowed_inside_pilot_namespace() {
+        assert!(force_push_trigger("arccode/auto/2026-06-02-x", true).is_none());
+        assert!(force_push_trigger("refs/heads/arccode/auto/r1", true).is_none());
+        // Non-force push to any branch is fine.
+        assert!(force_push_trigger("main", false).is_none());
+    }
+
+    #[test]
+    fn force_push_outside_namespace_triggers() {
+        let t = force_push_trigger("main", true);
+        assert!(matches!(
+            t,
+            Some(EscalationTrigger::ForcePushOutsideNamespace { ref branch }) if branch == "main"
+        ));
+    }
+
+    #[test]
+    fn cost_warn_is_advisory_others_block() {
+        assert!(!EscalationTrigger::CostWarn { spent: 8.0, cap: 10.0 }.blocks_auto_merge());
+        assert!(EscalationTrigger::CostHalt { spent: 11.0, cap: 10.0 }.blocks_auto_merge());
+        assert!(EscalationTrigger::SecretsDetected {
+            kind: "x".into(),
+            file: "y".into()
+        }
+        .blocks_auto_merge());
+        assert!(EscalationTrigger::LicenseHeaderModified { file: "z".into() }.blocks_auto_merge());
     }
 }
