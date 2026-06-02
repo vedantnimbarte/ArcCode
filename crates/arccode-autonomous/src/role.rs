@@ -40,6 +40,34 @@ pub fn load_role_prompt(role: &Role) -> String {
     builtin_default(role).to_string()
 }
 
+/// Resolve a role's system prompt and append its accumulated lessons
+/// (E6) when present. This is the variant the live worker spawner should
+/// use: it folds prior reverted/rewritten-task takeaways from
+/// `~/.arccode/agents/<role>.lessons.md` onto the base prompt so a worker
+/// doesn't reproduce a mistake the same role already learned from. Falls
+/// back to exactly [`load_role_prompt`] when there are no lessons (or the
+/// global dir can't be resolved).
+pub fn load_role_prompt_with_lessons(role: &Role) -> String {
+    let mut prompt = load_role_prompt(role);
+    if let Some(appendix) = role_lessons_appendix(role) {
+        prompt.push_str(&appendix);
+    }
+    prompt
+}
+
+/// Load + render the lessons appendix for a role, or `None` when there's
+/// no global dir, no lessons file, or it's empty. The lessons file sits
+/// beside the role prompt at `<global>/agents/<role>.lessons.md` — built
+/// the same way as [`user_prompt_path`] so the two stay in lockstep
+/// (`global_dir()` is already `~/.arccode`, so we don't go through
+/// [`crate::learning::lessons_path`], which expects a HOME base).
+fn role_lessons_appendix(role: &Role) -> Option<String> {
+    let dir = arccode_config::global_dir().ok()?;
+    let path = dir.join("agents").join(format!("{}.lessons.md", role.as_str()));
+    let body = crate::learning::load_lessons(&path).ok().flatten()?;
+    crate::learning::render_lessons_appendix(&body)
+}
+
 /// Resolve the planner system prompt.
 pub fn load_planner_prompt() -> String {
     if let Some(path) = user_prompt_path("manager-planner") {
@@ -96,5 +124,15 @@ mod tests {
         }
         assert!(!load_planner_prompt().trim().is_empty());
         assert!(!load_manager_prompt().trim().is_empty());
+    }
+
+    #[test]
+    fn lessons_aware_loader_includes_base_prompt() {
+        // With no lessons file the lessons-aware loader must reduce to the
+        // base prompt (its first slice is the base prompt verbatim), so a
+        // fresh install behaves exactly as before.
+        let base = load_role_prompt(&Role::Developer);
+        let with = load_role_prompt_with_lessons(&Role::Developer);
+        assert!(with.starts_with(&base));
     }
 }

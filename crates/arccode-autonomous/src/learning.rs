@@ -259,6 +259,42 @@ pub fn append_lesson(path: &Path, lesson: &Lesson) -> io::Result<()> {
     writeln!(f, "- ({}) {} — run `{}`", lesson.t, lesson.text, lesson.run_id)
 }
 
+/// Load a role's accumulated lessons (the raw markdown body), or `None`
+/// when the file is missing or has no content beyond whitespace. The
+/// counterpart to [`append_lesson`]: this is what later runs read back to
+/// fold prior mistakes into the role's system prompt.
+pub fn load_lessons(path: &Path) -> io::Result<Option<String>> {
+    let body = match fs::read_to_string(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if body.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(body))
+    }
+}
+
+/// Render a role's lessons as a system-prompt appendix the worker should
+/// heed, or `None` when there are no lessons. Pure: takes the already-read
+/// lessons body so it's testable without a filesystem.
+///
+/// The wording frames the lessons as hard-won constraints from prior
+/// reverted/rewritten work, not optional suggestions — a worker that
+/// ignores them tends to reproduce the exact failure that generated them.
+pub fn render_lessons_appendix(lessons_body: &str) -> Option<String> {
+    let trimmed = lessons_body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "\n\n---\n\nLESSONS FROM PRIOR RUNS BY THIS ROLE (these are constraints learned the \
+         hard way from reverted or heavily-rewritten work — honour them unless the task \
+         explicitly overrides):\n\n{trimmed}"
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Planner priming: lexical similarity over goals
 // ---------------------------------------------------------------------------
@@ -636,5 +672,32 @@ mod tests {
         // Heading only once.
         assert_eq!(body.matches("# Lessons").count(), 1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_lessons_roundtrips_what_append_wrote() {
+        let dir = std::env::temp_dir().join(format!("arccode-lessons-load-{}", std::process::id()));
+        let path = lessons_path(&dir, "tester");
+        let _ = fs::remove_file(&path);
+        // Missing file → None.
+        assert!(load_lessons(&path).unwrap().is_none());
+        append_lesson(
+            &path,
+            &Lesson { run_id: "r1".into(), t: "2026-06-02".into(), text: "always assert on stderr too".into() },
+        )
+        .unwrap();
+        let body = load_lessons(&path).unwrap().expect("lessons present");
+        assert!(body.contains("always assert on stderr too"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_lessons_appendix_wraps_body_or_returns_none() {
+        assert!(render_lessons_appendix("   \n  ").is_none());
+        let appendix = render_lessons_appendix("- avoid unwrap in tools").unwrap();
+        assert!(appendix.contains("LESSONS FROM PRIOR RUNS"));
+        assert!(appendix.contains("avoid unwrap in tools"));
+        // Starts with a separator so it appends cleanly onto a base prompt.
+        assert!(appendix.starts_with("\n\n---"));
     }
 }

@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arccode_autonomous::model::{Acceptance, Role, Task};
-use arccode_autonomous::role::load_role_prompt;
+use arccode_autonomous::role::load_role_prompt_with_lessons;
 use arccode_config::{Config, PermissionMode, ProjectPaths};
 use arccode_core::{AgentConfig, AgentEvent, AgentLoop, Compactor, ToolOutputBudget};
 use arccode_tools::{ToolCtx, ToolRegistry};
@@ -141,7 +141,10 @@ pub async fn run(cfg: Config, opts: WorkerOptions) -> Result<ExitCode> {
 /// orchestrator. The role markdown lays out hard rules; the task block
 /// answers "what specifically am I doing?"
 fn compose_worker_system_prompt(role: &Role, task: &Task) -> String {
-    let mut s = load_role_prompt(role);
+    // E6 — fold this role's accumulated lessons (from prior reverted /
+    // rewritten work) onto the base role prompt so the worker doesn't
+    // repeat a mistake the same role already learned from.
+    let mut s = load_role_prompt_with_lessons(role);
     s.push_str("\n\n# This task\n\n");
     s.push_str(&format!("- id: {}\n", task.id));
     s.push_str(&format!("- title: {}\n", task.title));
