@@ -294,6 +294,7 @@ pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
             .clone()
             .unwrap_or_else(|| selection.model.clone()),
         sandbox_default_tier: pilot.sandbox.default_tier.clone(),
+        dangerous_paths: pilot.approval.dangerous_paths.clone(),
     };
 
     eprintln!(
@@ -863,6 +864,7 @@ pub async fn resume(
             .clone()
             .unwrap_or_else(|| selection.model.clone()),
         sandbox_default_tier: cfg.pilot.sandbox.default_tier.clone(),
+        dangerous_paths: cfg.pilot.approval.dangerous_paths.clone(),
     };
 
     eprintln!("[pilot] resume: driving manager loop for run {run_id}");

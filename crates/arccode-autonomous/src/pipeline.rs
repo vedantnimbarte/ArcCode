@@ -85,6 +85,10 @@ pub struct PipelineInputs {
     /// J11 default sandbox tier ("host" | "container" | "vm"); per-task
     /// tiers are escalated from this floor by `sandbox::select_tier`.
     pub sandbox_default_tier: String,
+    /// J15 `[pilot.approval].dangerous_paths` globs. A write to one of these
+    /// that the goal text never mentions raises a hard escalation trigger
+    /// and blocks auto-merge. Empty disables the check.
+    pub dangerous_paths: Vec<String>,
 }
 
 /// Outcome of one full pipeline run.
@@ -112,6 +116,10 @@ pub struct PipelineOutcome {
     /// Selection is always computed; actual container/vm execution is a
     /// Docker/Firecracker-gated leaf invoked per tier.
     pub sandbox_tiers: Vec<(String, String)>,
+    /// J15 hard escalation triggers detected over the integration diff +
+    /// plan (dangerous-path-without-goal-mention, secrets, license-header
+    /// edits). Empty on a clean run. Any blocking trigger vetoes auto-merge.
+    pub escalation_triggers: Vec<crate::escalation::EscalationTrigger>,
 }
 
 /// Drive the run from its current state to completion.
@@ -198,6 +206,7 @@ pub async fn run_to_completion(
             reviews: Vec::new(),
             critic_vetoed: false,
             sandbox_tiers,
+            escalation_triggers: Vec::new(),
         });
     }
 
@@ -258,6 +267,7 @@ pub async fn run_to_completion(
             reviews: Vec::new(),
             critic_vetoed: false,
             sandbox_tiers,
+            escalation_triggers: Vec::new(),
         });
     }
 
@@ -295,6 +305,30 @@ pub async fn run_to_completion(
         );
     }
 
+    // J15 — hard escalation triggers over the plan + integration diff
+    // (dangerous-path-without-goal-mention, secrets, license-header edits).
+    // Any blocking trigger vetoes auto-merge regardless of the other gates.
+    let escalation_triggers = detect_escalation_triggers(
+        inputs.command_runner.as_ref(),
+        &project_root,
+        &snapshot_for_pr.base_commit,
+        &integration_branch,
+        &snapshot_for_pr,
+        &inputs.dangerous_paths,
+    );
+    let dangerous_paths_touched = escalation_triggers.iter().any(|t| {
+        matches!(t, crate::escalation::EscalationTrigger::DangerousPathTouched { .. })
+    });
+    let escalation_blocks = escalation_triggers.iter().any(|t| t.blocks_auto_merge());
+    if !escalation_triggers.is_empty() {
+        tracing::warn!(
+            target: "pilot::pipeline",
+            triggers = ?escalation_triggers.iter().map(|t| t.short_label()).collect::<Vec<_>>(),
+            blocks_merge = escalation_blocks,
+            "J15 escalation triggers fired"
+        );
+    }
+
     // E7 — per-task reviewer pass (opt-in). Runs a reviewer agent per
     // task and records its verdict; the worst finding severity feeds the
     // auto-merge gate.
@@ -327,9 +361,11 @@ pub async fn run_to_completion(
         &inputs.pr_config,
         inputs.auto_approved,
         inputs.tier,
-        security_blocks,
+        // J15 blocking triggers veto the merge alongside the R6 security gate.
+        security_blocks || escalation_blocks,
         review_max_severity,
         critic_vetoed,
+        dangerous_paths_touched,
         &pr_outcome,
     );
 
@@ -343,6 +379,7 @@ pub async fn run_to_completion(
         reviews,
         critic_vetoed,
         sandbox_tiers,
+        escalation_triggers,
     })
 }
 
@@ -385,6 +422,7 @@ fn decide_and_maybe_merge(
     security_blocks: bool,
     review_max_severity: Option<crate::severity::Severity>,
     critic_vetoes: bool,
+    dangerous_paths_touched: bool,
     pr_outcome: &PrOutcome,
 ) -> crate::automerge::AutoMergeDecision {
     use crate::severity::Severity;
@@ -410,9 +448,9 @@ fn decide_and_maybe_merge(
         ci_green,
         require_ci_green: pr_config.require_ci_green,
         review_max_severity, // E7 per-task reviewer (wired below)
-        security_blocks,     // R6 security pass (wired below)
+        security_blocks,     // R6 security pass + J15 blocking triggers
         critic_vetoes,       // J10 critic (wired below)
-        dangerous_paths_touched: false,
+        dangerous_paths_touched, // J15 dangerous-path-without-goal-mention
         merge_max_severity: gate,
     });
     if decision.is_merge() && pr_outcome.created_by_gh {
@@ -487,29 +525,92 @@ fn run_security_pass(
     _cfg: &arccode_config::PilotSecurityConfig,
 ) -> crate::security::SecurityReport {
     let mut report = crate::security::SecurityReport::default();
+    let diff = collect_diff_lines(runner, project_root, base_commit, integration_branch);
+    report.extend(crate::security::scan_secrets(&diff.added));
+    report
+}
+
+/// Parsed lines from `git diff <base>..<branch>`, used by both the R6
+/// security pass and the J15 escalation checks. `added` is the `+` lines
+/// (sans `+`); `changed` is every `+` *and* `-` line — license-header
+/// detection cares about removals too. Each line is paired with its file.
+#[derive(Debug, Default)]
+struct DiffLines {
+    added: Vec<(String, String)>,
+    changed: Vec<(String, String)>,
+}
+
+/// Run `git diff --unified=0 <base>..<branch>` and split it into added /
+/// changed lines. Returns empty on an empty base commit or a failed diff.
+fn collect_diff_lines(
+    runner: &dyn CommandRunner,
+    project_root: &std::path::Path,
+    base_commit: &str,
+    integration_branch: &str,
+) -> DiffLines {
+    let mut out = DiffLines::default();
     if base_commit.is_empty() {
-        return report;
+        return out;
     }
     let range = format!("{base_commit}..{integration_branch}");
     let diff = match runner.run("git", &["diff", "--unified=0", &range], project_root) {
         Ok(o) if o.success() => o.stdout,
-        _ => return report,
+        _ => return out,
     };
-    // Collect added lines (`+` but not the `+++` file header), pairing each
-    // with the current file from the most recent `+++ b/<path>` header.
-    let mut current_file = String::new();
-    let mut added: Vec<(String, String)> = Vec::new();
+    // Track both the a-side and b-side file so removals in a deleted file
+    // (`+++ /dev/null`) still attribute to the original path.
+    let mut file_a = String::new();
+    let mut file_b = String::new();
     for line in diff.lines() {
-        if let Some(path) = line.strip_prefix("+++ b/") {
-            current_file = path.to_string();
+        if let Some(p) = line.strip_prefix("--- a/") {
+            file_a = p.to_string();
+        } else if let Some(p) = line.strip_prefix("+++ b/") {
+            file_b = p.to_string();
+        } else if let Some(p) = line.strip_prefix("--- ") {
+            file_a = p.to_string(); // e.g. "/dev/null"
+        } else if let Some(p) = line.strip_prefix("+++ ") {
+            file_b = p.to_string();
         } else if let Some(rest) = line.strip_prefix('+') {
-            if !line.starts_with("+++") {
-                added.push((current_file.clone(), rest.to_string()));
-            }
+            let f = if file_b == "/dev/null" { &file_a } else { &file_b };
+            out.added.push((f.clone(), rest.to_string()));
+            out.changed.push((f.clone(), rest.to_string()));
+        } else if let Some(rest) = line.strip_prefix('-') {
+            let f = if file_b == "/dev/null" { &file_a } else { &file_b };
+            out.changed.push((f.clone(), rest.to_string()));
         }
     }
-    report.extend(crate::security::scan_secrets(&added));
-    report
+    out
+}
+
+/// J15 — detect the static (plan + diff) hard-escalation triggers over the
+/// integration diff and this run's recorded writes. `goal` gates the
+/// dangerous-path check (a touched dangerous path the goal never mentioned
+/// escalates; one it asked for doesn't). Pure aside from the `git diff`
+/// shellout in [`collect_diff_lines`].
+fn detect_escalation_triggers(
+    runner: &dyn CommandRunner,
+    project_root: &std::path::Path,
+    base_commit: &str,
+    integration_branch: &str,
+    state: &crate::model::RunState,
+    dangerous_paths: &[String],
+) -> Vec<crate::escalation::EscalationTrigger> {
+    let mut triggers = Vec::new();
+    // Dangerous-path-without-goal-mention, from the run's recorded writes.
+    if !dangerous_paths.is_empty() {
+        let writes: Vec<String> = state
+            .tasks
+            .iter()
+            .flat_map(|t| t.writes.iter().cloned())
+            .collect();
+        let hits = crate::approval::paths_matching(&writes, dangerous_paths);
+        triggers.extend(crate::escalation::dangerous_path_triggers(&hits, &state.goal));
+    }
+    // Secrets + license-header edits, from the diff.
+    let diff = collect_diff_lines(runner, project_root, base_commit, integration_branch);
+    triggers.extend(crate::escalation::secret_triggers(&diff.added));
+    triggers.extend(crate::escalation::license_header_triggers(&diff.changed));
+    triggers
 }
 
 /// One-shot text completion: send a system+user prompt and concatenate
@@ -1115,6 +1216,7 @@ mod tests {
             run_critic: false,
             reviewer_model: "stub".into(),
             sandbox_default_tier: "host".into(),
+            dangerous_paths: Vec::new(),
         };
 
         let outcome = run_to_completion(store, inputs).await.unwrap();
@@ -1244,6 +1346,7 @@ mod tests {
             false, // security clean
             None,  // no review findings
             false, // no critic veto
+            false, // no dangerous paths (J15)
             &pr,
         );
         assert!(!decision.is_merge());
@@ -1264,6 +1367,7 @@ mod tests {
             false, // security clean
             None,  // no review findings
             false, // no critic veto
+            false, // no dangerous paths (J15)
             &pr,
         );
         assert!(decision.is_merge());
@@ -1355,6 +1459,7 @@ mod tests {
             false,
             None,
             false,
+            false, // no dangerous paths (J15)
             &pr,
         );
         assert!(decision.is_merge());
@@ -1376,6 +1481,7 @@ mod tests {
             false,
             None,
             false,
+            false, // no dangerous paths (J15)
             &pr,
         );
         assert!(!decision.is_merge());
@@ -1395,6 +1501,7 @@ mod tests {
             true, // security pass blocks
             None,
             false,
+            false, // no dangerous paths (J15)
             &pr,
         );
         assert!(!decision.is_merge());
@@ -1446,6 +1553,90 @@ mod tests {
             &arccode_config::PilotSecurityConfig::default(),
         );
         assert!(report.findings.is_empty());
+    }
+
+    /// Runner returning a diff that both leaks a secret and edits a license
+    /// header — exercises the J15 diff-side detection.
+    struct J15DiffRunner;
+    impl CommandRunner for J15DiffRunner {
+        fn run(&self, program: &str, args: &[&str], _cwd: &Path) -> std::io::Result<CommandOut> {
+            let stdout = if program == "git" && args.first().copied() == Some("diff") {
+                concat!(
+                    "--- a/LICENSE\n+++ b/LICENSE\n",
+                    "-Copyright 2025 Old Owner\n+Copyright 2026 New Owner\n",
+                    "--- a/cfg.rs\n+++ b/cfg.rs\n",
+                    "+let key = \"AKIAIOSFODNN7EXAMPLE\";\n",
+                )
+                .to_string()
+            } else {
+                String::new()
+            };
+            Ok(CommandOut { status: Some(0), stdout, stderr: String::new() })
+        }
+    }
+
+    #[test]
+    fn j15_detects_secret_and_license_and_dangerous_path() {
+        let mut state = crate::model::RunState::new(
+            "r1",
+            "speed up the parser",
+            "base123",
+            "arccode/auto/r1",
+        );
+        // A write to a dangerous path the goal never mentioned.
+        state.tasks.push({
+            let mut t = Task::new("t1", Role::Developer, "edit auth");
+            t.writes = vec!["crates/auth/src/login.rs".into()];
+            t
+        });
+        let triggers = detect_escalation_triggers(
+            &J15DiffRunner,
+            Path::new("."),
+            "base123",
+            "arccode/auto/r1",
+            &state,
+            &["**/auth/**".to_string()],
+        );
+        use crate::escalation::EscalationTrigger as T;
+        assert!(triggers.iter().any(|t| matches!(t, T::SecretsDetected { .. })));
+        assert!(triggers.iter().any(|t| matches!(t, T::LicenseHeaderModified { .. })));
+        assert!(triggers.iter().any(|t| matches!(t, T::DangerousPathTouched { .. })));
+        assert!(triggers.iter().any(|t| t.blocks_auto_merge()));
+    }
+
+    #[test]
+    fn j15_quiet_when_goal_mentions_path_and_diff_clean() {
+        struct CleanRunner;
+        impl CommandRunner for CleanRunner {
+            fn run(&self, program: &str, args: &[&str], _cwd: &Path) -> std::io::Result<CommandOut> {
+                let stdout = if program == "git" && args.first().copied() == Some("diff") {
+                    "+++ b/auth.rs\n+let total = items.len();\n".to_string()
+                } else {
+                    String::new()
+                };
+                Ok(CommandOut { status: Some(0), stdout, stderr: String::new() })
+            }
+        }
+        let mut state = crate::model::RunState::new(
+            "r1",
+            "refactor the auth login flow",
+            "base123",
+            "arccode/auto/r1",
+        );
+        state.tasks.push({
+            let mut t = Task::new("t1", Role::Developer, "edit auth");
+            t.writes = vec!["crates/auth/src/login.rs".into()];
+            t
+        });
+        let triggers = detect_escalation_triggers(
+            &CleanRunner,
+            Path::new("."),
+            "base123",
+            "arccode/auto/r1",
+            &state,
+            &["**/auth/**".to_string()],
+        );
+        assert!(triggers.is_empty(), "goal mentions auth + clean diff → no triggers, got {triggers:?}");
     }
 
     /// Provider that returns a fixed text body for any request — stands in
