@@ -503,6 +503,34 @@ impl Config {
         base_url: Option<&str>,
         with_keyring: bool,
     ) -> Result<(), ConfigError> {
+        Self::write_provider_layer(path, provider_id, model, base_url, with_keyring, true)
+    }
+
+    /// Persist a single provider's model / base URL / keyring marker to the
+    /// config file *without* changing the default provider or model. Used by
+    /// `arccode login --no-default` to register an additional provider while
+    /// leaving the current default selection untouched.
+    pub fn set_provider_and_save(
+        path: &Path,
+        provider_id: &str,
+        model: &str,
+        base_url: Option<&str>,
+        with_keyring: bool,
+    ) -> Result<(), ConfigError> {
+        Self::write_provider_layer(path, provider_id, model, base_url, with_keyring, false)
+    }
+
+    /// Shared implementation for the two `*_provider_and_save` entry points.
+    /// Edits only this one config layer (re-reads the raw file, not the merged
+    /// config) and optionally promotes the provider to the default.
+    fn write_provider_layer(
+        path: &Path,
+        provider_id: &str,
+        model: &str,
+        base_url: Option<&str>,
+        with_keyring: bool,
+        set_default: bool,
+    ) -> Result<(), ConfigError> {
         let mut cfg = if path.exists() {
             // Re-read the raw file (not the merged config) so we only edit
             // and write this one layer.
@@ -517,8 +545,10 @@ impl Config {
             Config::default()
         };
 
-        cfg.default_provider = Some(provider_id.to_string());
-        cfg.default_model = Some(format!("{provider_id}/{model}"));
+        if set_default {
+            cfg.default_provider = Some(provider_id.to_string());
+            cfg.default_model = Some(format!("{provider_id}/{model}"));
+        }
 
         let entry = cfg.providers.entry(provider_id.to_string()).or_default();
         entry.model = Some(model.to_string());
@@ -554,9 +584,9 @@ impl Config {
             (
                 "chatgpt".to_string(),
                 ProviderConfig {
-                    // Token stored in keychain after `arccode auth login` /
-                    // the /login wizard OAuth flow. Set via CHATGPT_ACCESS_TOKEN
-                    // env var as an alternative.
+                    // Token stored in keychain after `arccode login chatgpt
+                    // --oauth` / the /login wizard OAuth flow. Set via
+                    // CHATGPT_ACCESS_TOKEN env var as an alternative.
                     api_key: Some("${CHATGPT_ACCESS_TOKEN}".into()),
                     model: Some("gpt-4o".into()),
                     ..Default::default()
@@ -1564,6 +1594,47 @@ mod tests {
                 .and_then(|p| p.api_key.as_deref()),
             Some("sk-test"),
         );
+    }
+
+    #[test]
+    fn set_provider_variants_respect_default_flag() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let path = dir.join(format!("arccode-cfg-test-{pid}.toml"));
+        let _ = std::fs::remove_file(&path);
+
+        // Seed an existing default, then register a second provider without
+        // promoting it — the default must be untouched, the section present.
+        Config::set_default_provider_and_save(&path, "anthropic", "claude-opus-4-7", None, true)
+            .unwrap();
+        Config::set_provider_and_save(
+            &path,
+            "openai",
+            "gpt-4.1",
+            None,
+            true,
+        )
+        .unwrap();
+
+        let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.default_provider.as_deref(), Some("anthropic"));
+        assert_eq!(cfg.default_model.as_deref(), Some("anthropic/claude-opus-4-7"));
+        assert_eq!(
+            cfg.providers.get("openai").and_then(|p| p.model.as_deref()),
+            Some("gpt-4.1")
+        );
+        assert_eq!(
+            cfg.providers.get("openai").and_then(|p| p.api_key.as_deref()),
+            Some("keyring:openai")
+        );
+
+        // Now promote openai — default flips, anthropic section remains.
+        Config::set_default_provider_and_save(&path, "openai", "gpt-4.1", None, true).unwrap();
+        let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.default_provider.as_deref(), Some("openai"));
+        assert!(cfg.providers.contains_key("anthropic"));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
