@@ -285,7 +285,15 @@ fn resolve_optional_api_key(from_config: Option<&str>, variant: OpenAiVariant) -
     if let Some(key) = check_config_value(from_config) {
         return Some(key);
     }
-    let env_name = match variant {
+    let env_name = openai_env_name(variant)?;
+    std::env::var(env_name).ok()
+}
+
+/// The conventional environment variable that holds the API key for an
+/// OpenAI-compatible provider variant. Returns `None` for local providers
+/// that don't require a key (LM Studio, Ollama, vLLM, …).
+fn openai_env_name(variant: OpenAiVariant) -> Option<&'static str> {
+    Some(match variant {
         OpenAiVariant::OpenAI => "OPENAI_API_KEY",
         OpenAiVariant::OpenRouter => "OPENROUTER_API_KEY",
         OpenAiVariant::LiteLlm => "LITELLM_API_KEY",
@@ -361,8 +369,22 @@ fn resolve_optional_api_key(from_config: Option<&str>, variant: OpenAiVariant) -
         | OpenAiVariant::LocalAi
         | OpenAiVariant::Aphrodite
         | OpenAiVariant::MistralRs => return None,
-    };
-    std::env::var(env_name).ok()
+    })
+}
+
+/// The conventional environment variable that holds the API key for a
+/// provider id, if one is defined. Used by `arccode login` to auto-read a
+/// key when `--api-key` isn't passed. Returns `None` for local providers
+/// that need no key and for unknown ids.
+pub fn api_key_env_var(provider_id: &str) -> Option<&'static str> {
+    match provider_id {
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "gemini" => Some("GOOGLE_API_KEY"),
+        "cohere" => Some("COHERE_API_KEY"),
+        "watsonx" => Some("WATSONX_API_KEY"),
+        "chatgpt" => Some("CHATGPT_ACCESS_TOKEN"),
+        id => openai_variant(id).and_then(openai_env_name),
+    }
 }
 
 fn resolve_api_key(from_config: Option<&str>, env_name: &str) -> Result<String> {
