@@ -50,6 +50,14 @@ impl Tool for ReadFile {
             Err(e) => return ToolOutcome::err(format!("invalid args: {e}")),
         };
         let path = ctx.resolve(&args.path);
+        if !ctx.allows_read(&path) {
+            return ToolOutcome::err(format!(
+                "read denied for {} — outside the project tree under permission mode {} \
+                 (use --yolo to allow reads anywhere)",
+                path.display(),
+                ctx.mode
+            ));
+        }
         let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
             Err(e) => return ToolOutcome::err(format!("read {}: {e}", path.display())),
@@ -245,5 +253,48 @@ mod tests {
         assert!(!out.is_error, "got error: {}", out.content);
         assert!(out.content.contains("x = 1"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn refuses_read_outside_project_tree() {
+        // A secret living outside the project root.
+        let outside = std::env::temp_dir().join(format!(
+            "arccode-secret-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&outside, "TOP SECRET").unwrap();
+
+        let project = std::env::temp_dir().join(format!(
+            "arccode-proj-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&project).unwrap();
+
+        // ReadOnly mode: the read must be denied (outside the tree).
+        let ro = ToolCtx::new(PermissionMode::ReadOnly, project.clone(), project.clone());
+        let denied = ReadFile
+            .run(json!({ "path": outside.to_string_lossy() }), &ro)
+            .await;
+        assert!(denied.is_error);
+        assert!(denied.content.contains("denied"));
+
+        // Yolo mode: the escape hatch — read is allowed.
+        let yolo = ToolCtx::new(PermissionMode::Yolo, project.clone(), project.clone());
+        let allowed = ReadFile
+            .run(json!({ "path": outside.to_string_lossy() }), &yolo)
+            .await;
+        assert!(!allowed.is_error, "got error: {}", allowed.content);
+        assert!(allowed.content.contains("TOP SECRET"));
+
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&project);
     }
 }

@@ -70,18 +70,22 @@ impl Provider for GeminiProvider {
         let body = build_request_body(&req);
         tracing::debug!(target: "arccode::gemini", "request: {body}");
 
+        // Pass the key via the `x-goog-api-key` header rather than the `?key=`
+        // query param. reqwest's error Display includes the request URL, so a
+        // key in the query string would leak into error messages and logs on
+        // any network failure.
         let url = format!(
-            "{}/{}/models/{}:streamGenerateContent?alt=sse&key={}",
+            "{}/{}/models/{}:streamGenerateContent?alt=sse",
             self.base_url.trim_end_matches('/'),
             API_VERSION,
             req.model,
-            self.api_key,
         );
         let response = self
             .http
             .post(&url)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
+            .header("x-goog-api-key", &self.api_key)
             .json(&body)
             .send()
             .await
