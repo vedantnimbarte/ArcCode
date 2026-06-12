@@ -130,6 +130,8 @@ pub enum AgentStop {
     EndTurn,
     MaxTurns,
     MaxTokens,
+    /// The session's estimated spend crossed `AgentConfig::budget_usd`.
+    Budget,
     Error,
 }
 
@@ -159,6 +161,10 @@ pub struct AgentConfig {
     /// Tool names that count as "mutating" for gate purposes. A successful
     /// call to any of these arms the gate for the rest of the user turn.
     pub mutating_tools: Vec<String>,
+    /// Hard USD ceiling for the session (estimated from the static pricing
+    /// table). `None` = unlimited. Checked before each provider call;
+    /// crossing it stops the loop with `AgentStop::Budget`.
+    pub budget_usd: Option<f64>,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -176,6 +182,7 @@ impl std::fmt::Debug for AgentConfig {
             .field("gate", &self.gate.as_ref().map(|g| g.label()))
             .field("gate_max_retries", &self.gate_max_retries)
             .field("mutating_tools", &self.mutating_tools)
+            .field("budget_usd", &self.budget_usd)
             .finish()
     }
 }
@@ -194,6 +201,7 @@ impl Default for AgentConfig {
             learning: None,
             gate: None,
             gate_max_retries: 2,
+            budget_usd: None,
             mutating_tools: vec![
                 "write_file".into(),
                 "edit_file".into(),
@@ -214,6 +222,9 @@ pub struct AgentLoop {
     /// Per-turn tool output cache. Keyed by (tool_name, canonical_json_args).
     /// Cleared at the start of each call to `run`.
     tool_cache: std::collections::HashMap<(String, String), ToolOutcome>,
+    /// Estimated cumulative USD spend for this session (across `run` calls),
+    /// from the static pricing table. Unknown models accrue 0.
+    spent_usd: f64,
 }
 
 impl AgentLoop {
@@ -228,6 +239,7 @@ impl AgentLoop {
             config,
             history: Vec::new(),
             tool_cache: Default::default(),
+            spent_usd: 0.0,
         }
     }
 
@@ -245,6 +257,7 @@ impl AgentLoop {
             config,
             history,
             tool_cache: Default::default(),
+            spent_usd: 0.0,
         }
     }
 
@@ -291,6 +304,12 @@ impl AgentLoop {
         &self.config.model
     }
 
+    /// Estimated cumulative session spend in USD (static pricing table;
+    /// unknown/local models accrue 0).
+    pub fn spent_usd(&self) -> f64 {
+        self.spent_usd
+    }
+
     /// Drive a single user turn to completion. The returned stream yields
     /// events live and terminates after a `Stop` event.
     pub fn run(&mut self, user_prompt: String) -> BoxStream<'_, AgentEvent> {
@@ -303,6 +322,7 @@ impl AgentLoop {
         let config = self.config.clone();
         let history = &mut self.history;
         let tool_cache = &mut self.tool_cache;
+        let spent_usd = &mut self.spent_usd;
 
         let stream = async_stream::stream! {
             let specs = tools.specs();
@@ -311,6 +331,22 @@ impl AgentLoop {
             let mut mutated = false;
             let mut gate_attempts: usize = 0;
             for turn in 0..config.max_turns {
+                // Budget check — refuse to issue another provider call once
+                // the session's estimated spend has crossed the ceiling.
+                if let Some(limit) = config.budget_usd {
+                    if *spent_usd >= limit {
+                        yield AgentEvent::Error {
+                            message: format!(
+                                "session budget exhausted: ~${:.2} spent of ${:.2} limit \
+                                 ([budget] max_usd_per_session)",
+                                *spent_usd, limit
+                            ),
+                        };
+                        yield AgentEvent::Stop { reason: AgentStop::Budget };
+                        return;
+                    }
+                }
+
                 // Compaction pass — fold the oldest non-recap span into a single
                 // recap message when we cross the trigger budget.
                 if let Some(CompactPlan { recap, replaced }) =
@@ -362,6 +398,7 @@ impl AgentLoop {
                 let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
                 let mut current_text = String::new();
                 let mut stop_reason: StopReason = StopReason::EndTurn;
+                let mut turn_usage: Option<Usage> = None;
 
                 while let Some(evt) = event_stream.next().await {
                     let evt = match evt {
@@ -392,6 +429,9 @@ impl AgentLoop {
                             assistant_blocks.push(block);
                         }
                         StreamEvent::Usage { usage } => {
+                            // Usage is cumulative within a provider response;
+                            // keep the last snapshot for cost accounting.
+                            turn_usage = Some(usage.clone());
                             yield AgentEvent::Usage { usage };
                         }
                         StreamEvent::Stop { reason } => {
@@ -402,6 +442,12 @@ impl AgentLoop {
 
                 if !current_text.is_empty() {
                     assistant_blocks.push(ContentBlock::text(std::mem::take(&mut current_text)));
+                }
+
+                if let (Some(usage), Some(price)) =
+                    (&turn_usage, crate::pricing::price_for(&config.model))
+                {
+                    *spent_usd += price.cost(usage);
                 }
 
                 // Persist the assistant turn.
@@ -869,6 +915,58 @@ mod tests {
         let _ = collect_events(&mut agent).await;
 
         assert_eq!(probe.max_in_flight.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn budget_stops_session_once_exhausted() {
+        // claude-opus-4-7 output is $75/MTok; 1M output tokens ≈ $75.
+        let expensive_response = vec![
+            StreamEvent::TextDelta {
+                text: "pricey".into(),
+            },
+            StreamEvent::Usage {
+                usage: Usage {
+                    output_tokens: 1_000_000,
+                    ..Default::default()
+                },
+            },
+            StreamEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ];
+        let mut agent = AgentLoop::new(
+            Arc::new(ScriptedProvider::new(vec![expensive_response])),
+            Arc::new(OkDispatcher),
+            AgentConfig {
+                model: "anthropic/claude-opus-4-7".into(),
+                budget_usd: Some(1.0),
+                ..Default::default()
+            },
+        );
+
+        // First user turn completes (spend accrues after the response)…
+        let events = collect_events(&mut agent).await;
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Stop {
+                reason: AgentStop::EndTurn
+            })
+        ));
+        assert!(agent.spent_usd() > 70.0);
+
+        // …the next user turn is refused without a provider call (the
+        // scripted provider would panic if called again).
+        let events = collect_events(&mut agent).await;
+        assert!(matches!(
+            events.first(),
+            Some(AgentEvent::Error { message }) if message.contains("budget exhausted")
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Stop {
+                reason: AgentStop::Budget
+            })
+        ));
     }
 
     #[tokio::test]

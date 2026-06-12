@@ -162,6 +162,10 @@ pub struct Config {
     /// Post-edit verification (turn gate + receipts).
     #[serde(default)]
     pub verify: VerifyConfig,
+
+    /// Session spend limits.
+    #[serde(default)]
+    pub budget: BudgetConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -350,6 +354,23 @@ impl RouterConfig {
             Some("fast") => self.fast_model.clone(),
             Some("default") | None => None,
             Some(explicit) => Some(explicit.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BudgetConfig {
+    /// Hard USD ceiling per session, estimated from the static pricing
+    /// table. When cumulative spend crosses this, the agent stops with a
+    /// budget receipt instead of issuing more provider calls. 0 = unlimited.
+    pub max_usd_per_session: f64,
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_usd_per_session: 0.0,
         }
     }
 }
