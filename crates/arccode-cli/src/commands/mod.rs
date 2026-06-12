@@ -16,5 +16,6 @@ pub mod review_multi;
 pub mod schedule;
 pub mod session;
 pub mod skill;
+pub mod stats;
 pub mod worker;
 pub mod worktree;

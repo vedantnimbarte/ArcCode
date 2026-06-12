@@ -132,6 +132,13 @@ pub enum Command {
     /// Show what Arc-Code knows about this project: memories, skills,
     /// model routing, the verification gate, and index freshness.
     Knows,
+    /// Usage and learning metrics: sessions, skill outcome scores,
+    /// memory growth, routing and budget setup.
+    Stats {
+        /// Emit machine-readable JSON instead of the human summary.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run any [[schedule]] entries whose cadence is due.
     Schedule {
         /// Force-run all configured schedule entries regardless of cadence.
@@ -467,6 +474,7 @@ pub async fn run() -> Result<ExitCode> {
         Some(Command::Logout { provider }) => commands::login::logout(provider).await,
         Some(Command::Discover) => commands::discover::run().await,
         Some(Command::Knows) => commands::knows::run(load_config()?).await,
+        Some(Command::Stats { json }) => commands::stats::run(load_config()?, json).await,
         Some(Command::Schedule { all }) => commands::schedule::run(all).await,
         Some(Command::Skill { action }) => match action {
             SkillAction::Extract { min, force } => commands::skill::extract(min, force).await,
