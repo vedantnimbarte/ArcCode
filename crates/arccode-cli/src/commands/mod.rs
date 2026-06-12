@@ -9,6 +9,7 @@ pub mod headless;
 pub mod init;
 pub mod knows;
 pub mod login;
+pub mod mcp_serve;
 pub mod memory;
 pub mod pilot;
 pub mod review;

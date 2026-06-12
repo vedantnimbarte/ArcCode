@@ -139,6 +139,14 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Serve Arc-Code's tools as an MCP server over stdio, so MCP hosts
+    /// (Claude Desktop, editors, other agents) can call them.
+    McpServe {
+        /// Permission mode for served tools (default read-only; the
+        /// project policy ceiling still applies).
+        #[arg(long, value_name = "MODE")]
+        mode: Option<String>,
+    },
     /// Run any [[schedule]] entries whose cadence is due.
     Schedule {
         /// Force-run all configured schedule entries regardless of cadence.
@@ -491,6 +499,9 @@ pub async fn run() -> Result<ExitCode> {
         Some(Command::Discover) => commands::discover::run().await,
         Some(Command::Knows) => commands::knows::run(load_config()?).await,
         Some(Command::Stats { json }) => commands::stats::run(load_config()?, json).await,
+        Some(Command::McpServe { mode }) => {
+            commands::mcp_serve::run(load_config()?, parse_mode(mode.as_deref())?).await
+        }
         Some(Command::Schedule { all }) => commands::schedule::run(all).await,
         Some(Command::Skill { action }) => match action {
             SkillAction::Extract { min, force } => commands::skill::extract(min, force).await,
