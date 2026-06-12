@@ -33,6 +33,12 @@ pub struct Cli {
     #[arg(long)]
     pub json: bool,
 
+    /// Dry run: execute the `--print` session in a fresh detached git
+    /// worktree and print the resulting diff instead of touching the
+    /// working tree.
+    #[arg(long)]
+    pub dry_run: bool,
+
     /// Run as a pilot-mode worker subprocess: load the role's system prompt,
     /// read the task spec from `--task-file`, run the agent loop with the
     /// task as the user prompt, emit a final `task_complete` event. Hidden
@@ -447,6 +453,7 @@ pub async fn run() -> Result<ExitCode> {
             json: cli.json,
             mode_override,
             model_override: cli.model,
+            worktree: cli.dry_run,
         };
         return commands::headless::run(cfg, opts).await;
     }
