@@ -27,6 +27,7 @@ pub mod knowledge;
 pub mod learning;
 pub mod manager;
 pub mod model;
+pub mod names;
 pub mod notify;
 pub mod orchestrator;
 pub mod pipeline;

@@ -256,6 +256,11 @@ pub struct TaskOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
     pub id: String,
+    /// Docker-style friendly display name (e.g. `brave_otter`), derived
+    /// deterministically from `(run_id, id)`. Empty for runs created before
+    /// this field existed — the dashboard falls back to `id` in that case.
+    #[serde(default)]
+    pub name: String,
     pub role: Role,
     /// Task currently being executed by this worker, if any.
     #[serde(default)]
@@ -542,6 +547,24 @@ impl Event {
     }
 }
 
+/// Friendly name for a freshly-created agent, guaranteed unique within the
+/// run. The generator is collision-free for realistic agent counts; the
+/// numeric-suffix loop is a belt-and-suspenders guard that never triggers in
+/// practice but keeps the invariant total.
+fn fresh_agent_name(state: &RunState, agent_id: &str) -> String {
+    let base = crate::names::agent_name(&state.run_id, agent_id);
+    if !state.agents.iter().any(|a| a.name == base) {
+        return base;
+    }
+    for i in 2.. {
+        let candidate = format!("{base}_{i}");
+        if !state.agents.iter().any(|a| a.name == candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("suffix loop always finds a free name")
+}
+
 /// Apply one event to `state` in-place.
 ///
 /// Used both by the live writer (after appending) and by `RunStore::load`
@@ -622,8 +645,10 @@ pub fn apply(state: &mut RunState, event: &Event) {
             // the manager isn't required to emit spawn-before-assign.
             if state.agent(agent).is_none() {
                 if let Some(role) = role {
+                    let name = fresh_agent_name(state, agent);
                     state.agents.push(Agent {
                         id: agent.clone(),
+                        name,
                         role,
                         current_task: Some(id.clone()),
                         pid: None,
@@ -686,7 +711,13 @@ pub fn apply(state: &mut RunState, event: &Event) {
         } => {
             // Preserve `current_task` if the agent was auto-registered by an
             // earlier TaskAssign — spawn only refreshes pid / session_id.
-            if let Some(existing) = state.agent_mut(agent) {
+            let already = state.agent(agent).is_some();
+            let needs_name = state.agent(agent).map(|a| a.name.is_empty()).unwrap_or(false);
+            // Compute the name up front to avoid holding a mutable borrow of
+            // `state` across the immutable read `fresh_agent_name` needs.
+            let refreshed_name = needs_name.then(|| fresh_agent_name(state, agent));
+            if already {
+                let existing = state.agent_mut(agent).expect("just checked present");
                 existing.role = role.clone();
                 if pid.is_some() {
                     existing.pid = *pid;
@@ -697,9 +728,14 @@ pub fn apply(state: &mut RunState, event: &Event) {
                 if existing.spawned_at.is_none() {
                     existing.spawned_at = Some(ts.clone());
                 }
+                if let Some(name) = refreshed_name {
+                    existing.name = name;
+                }
             } else {
+                let name = fresh_agent_name(state, agent);
                 state.agents.push(Agent {
                     id: agent.clone(),
+                    name,
                     role: role.clone(),
                     current_task: None,
                     pid: *pid,
