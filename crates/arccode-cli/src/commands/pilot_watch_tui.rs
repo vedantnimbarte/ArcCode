@@ -234,6 +234,13 @@ struct WatchUi {
     last_mtime: Option<SystemTime>,
     model: Option<DashboardModel>,
     finished: bool,
+    /// Failed-task count last seen, so a *new* failure rings the bell once.
+    seen_failed: usize,
+    /// Whether the finish bell has already fired for the watched run.
+    bell_finish_sent: bool,
+    /// Set when something noteworthy happened this reload; the loop rings the
+    /// terminal bell and clears it.
+    ring_bell: bool,
     /// Animation frame, advanced off wall-clock time so the in-progress
     /// spinner rotates smoothly regardless of the state-poll cadence.
     frame: u64,
@@ -305,6 +312,9 @@ impl WatchUi {
             last_mtime: None,
             model: None,
             finished: false,
+            seen_failed: 0,
+            bell_finish_sent: false,
+            ring_bell: false,
             frame: 0,
             spend_samples: Vec::new(),
             hit: HitAreas::default(),
@@ -340,8 +350,31 @@ impl WatchUi {
             // Keep the selection in-bounds as tasks come and go.
             self.tasks_sel = self.tasks_sel.min(self.tasks_len.saturating_sub(1));
             self.push_spend_sample(model.header.usd);
+
+            // Ring the bell once on a new failure and once when the run ends,
+            // so an unattended watch surfaces trouble without staring at it.
+            self.note_bell_events(model.header.failed, self.finished);
+
             self.model = Some(model);
         }
+    }
+
+    /// Set `ring_bell` when the failed-task count grows or the run first
+    /// reaches a terminal state. Pure so it's unit-testable without file IO.
+    fn note_bell_events(&mut self, failed: usize, finished: bool) {
+        if failed > self.seen_failed {
+            self.ring_bell = true;
+        }
+        self.seen_failed = failed;
+        if finished && !self.bell_finish_sent {
+            self.ring_bell = true;
+            self.bell_finish_sent = true;
+        }
+    }
+
+    /// Consume the pending-bell flag (true at most once per noteworthy event).
+    fn take_bell(&mut self) -> bool {
+        std::mem::take(&mut self.ring_bell)
     }
 
     /// Record the current cumulative spend for the header sparkline, keeping
@@ -361,8 +394,10 @@ impl WatchUi {
             self.current = idx;
             self.tasks_sel = 0;
             self.detail = None;
-            // The sparkline is per-run; start fresh on a switch.
+            // The sparkline and bell state are per-run; start fresh.
             self.spend_samples.clear();
+            self.seen_failed = 0;
+            self.bell_finish_sent = false;
             self.reload();
         }
     }
@@ -608,6 +643,11 @@ fn run_loop(
         // ~8 frames/sec: one spinner step per redraw at the 120 ms cap.
         ui.frame = (started.elapsed().as_millis() / 120) as u64;
         terminal.draw(|f| draw(f, &mut ui))?;
+
+        // Audible cue for a new failure or run completion, unless muted.
+        if ui.take_bell() {
+            emit_bell();
+        }
 
         // Drain input first so keys feel responsive.
         if event::poll(poll)? {
@@ -1436,6 +1476,18 @@ fn fmt_dur(secs: i64) -> String {
 // Terminal setup / teardown
 // ---------------------------------------------------------------------------
 
+/// Ring the terminal bell (BEL) unless `ARCCODE_NO_BELL` is set. Writing the
+/// control byte is safe under raw mode — it doesn't disturb the cursor.
+fn emit_bell() {
+    if std::env::var_os("ARCCODE_NO_BELL").is_some() {
+        return;
+    }
+    use std::io::Write;
+    let mut out = io::stdout();
+    let _ = out.write_all(b"\x07");
+    let _ = out.flush();
+}
+
 fn setup() -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1918,6 +1970,28 @@ mod tests {
         assert!(s.contains("brave_otter"), "worker name missing:\n{s}");
         assert!(s.contains("Wire up the editor"), "full title missing:\n{s}");
         assert!(s.contains("edit_file"), "recent log line missing:\n{s}");
+    }
+
+    #[test]
+    fn bell_fires_once_per_new_failure_and_on_finish() {
+        let mut ui = WatchUi::new(vec![summary("only", RunStatus::Running)], 0, UNI);
+        // No change → no bell.
+        ui.note_bell_events(0, false);
+        assert!(!ui.take_bell());
+        // First failure → bell.
+        ui.note_bell_events(1, false);
+        assert!(ui.take_bell());
+        // Same failure count → no repeat.
+        ui.note_bell_events(1, false);
+        assert!(!ui.take_bell());
+        // Another failure → bell again.
+        ui.note_bell_events(2, false);
+        assert!(ui.take_bell());
+        // Finish → bell once, then never again.
+        ui.note_bell_events(2, true);
+        assert!(ui.take_bell());
+        ui.note_bell_events(2, true);
+        assert!(!ui.take_bell());
     }
 
     #[test]
