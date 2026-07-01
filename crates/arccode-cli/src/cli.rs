@@ -275,6 +275,10 @@ pub enum PilotAction {
         /// Poll interval in milliseconds.
         #[arg(long, default_value_t = 250)]
         interval_ms: u64,
+        /// Force plain-ASCII glyphs (for terminals that can't render the
+        /// unicode status/spinner glyphs). Auto-detected when omitted.
+        #[arg(long)]
+        ascii: bool,
     },
     /// Resume an interrupted run.
     ///
@@ -515,7 +519,11 @@ pub async fn run() -> Result<ExitCode> {
             PilotAction::Watch {
                 run_id,
                 interval_ms,
-            } => commands::pilot::watch(run_id, interval_ms).await,
+                ascii,
+            } => {
+                commands::pilot::watch(run_id, interval_ms, commands::pilot::resolve_ascii(ascii))
+                    .await
+            }
             PilotAction::Resume { run_id, no_pr } => {
                 let cfg = load_config()?;
                 commands::pilot::resume(cfg, run_id, no_pr, cli.model).await
