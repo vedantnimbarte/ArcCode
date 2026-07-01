@@ -35,7 +35,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 use arccode_autonomous::dashboard::{
@@ -214,8 +214,13 @@ struct WatchUi {
     /// Index into `runs` of the run being watched.
     current: usize,
     focus: Focus,
-    tasks_scroll: u16,
+    /// Highlighted row in the Tasks pane; `Enter` opens its detail overlay.
+    tasks_sel: usize,
+    /// Task count from the last reload, so selection nav can clamp.
+    tasks_len: usize,
     log: LogView,
+    /// When `Some`, a task-detail overlay is open for this task id.
+    detail: Option<String>,
     last_mtime: Option<SystemTime>,
     model: Option<DashboardModel>,
     finished: bool,
@@ -232,8 +237,10 @@ impl WatchUi {
             runs,
             current,
             focus: Focus::default(),
-            tasks_scroll: 0,
+            tasks_sel: 0,
+            tasks_len: 0,
             log: LogView::new(),
+            detail: None,
             last_mtime: None,
             model: None,
             finished: false,
@@ -265,7 +272,11 @@ impl WatchUi {
                 state.status,
                 RunStatus::Done | RunStatus::Failed | RunStatus::Aborted
             );
-            self.model = Some(dashboard::build_model(&state, &recent, Some(Utc::now())));
+            let model = dashboard::build_model(&state, &recent, Some(Utc::now()));
+            self.tasks_len = model.tasks.len();
+            // Keep the selection in-bounds as tasks come and go.
+            self.tasks_sel = self.tasks_sel.min(self.tasks_len.saturating_sub(1));
+            self.model = Some(model);
         }
     }
 
@@ -273,7 +284,8 @@ impl WatchUi {
     fn switch_to(&mut self, idx: usize) {
         if idx < self.runs.len() && idx != self.current {
             self.current = idx;
-            self.tasks_scroll = 0;
+            self.tasks_sel = 0;
+            self.detail = None;
             self.reload();
         }
     }
@@ -301,11 +313,16 @@ impl WatchUi {
         };
     }
 
+    /// Largest valid task-selection index (0 when there are no tasks).
+    fn tasks_max(&self) -> usize {
+        self.tasks_len.saturating_sub(1)
+    }
+
     /// `↑` / `k` in the focused pane.
     fn nav_up(&mut self) {
         match self.focus {
             Focus::Runs => self.select_prev(),
-            Focus::Tasks => self.tasks_scroll = self.tasks_scroll.saturating_sub(1),
+            Focus::Tasks => self.tasks_sel = self.tasks_sel.saturating_sub(1),
             Focus::Log => {
                 self.log.follow = false;
                 self.log.scroll = self.log.scroll.saturating_sub(1);
@@ -317,7 +334,7 @@ impl WatchUi {
     fn nav_down(&mut self) {
         match self.focus {
             Focus::Runs => self.select_next(),
-            Focus::Tasks => self.tasks_scroll = self.tasks_scroll.saturating_add(1),
+            Focus::Tasks => self.tasks_sel = (self.tasks_sel + 1).min(self.tasks_max()),
             Focus::Log => {
                 self.log.follow = false;
                 self.log.scroll = self.log.scroll.saturating_add(1);
@@ -325,25 +342,24 @@ impl WatchUi {
         }
     }
 
-    /// Page-sized jump (`PgUp`/`PgDn`) in the focused scroll pane. Runs, which
-    /// select rather than scroll, ignore it.
+    /// Page-sized jump (`PgUp`/`PgDn`) in the focused scroll pane.
     fn nav_page(&mut self, down: bool) {
-        const PAGE: u16 = 10;
+        const PAGE: usize = 10;
         match self.focus {
             Focus::Runs => {}
             Focus::Tasks => {
-                self.tasks_scroll = if down {
-                    self.tasks_scroll.saturating_add(PAGE)
+                self.tasks_sel = if down {
+                    (self.tasks_sel + PAGE).min(self.tasks_max())
                 } else {
-                    self.tasks_scroll.saturating_sub(PAGE)
+                    self.tasks_sel.saturating_sub(PAGE)
                 };
             }
             Focus::Log => {
                 self.log.follow = false;
                 self.log.scroll = if down {
-                    self.log.scroll.saturating_add(PAGE)
+                    self.log.scroll.saturating_add(PAGE as u16)
                 } else {
-                    self.log.scroll.saturating_sub(PAGE)
+                    self.log.scroll.saturating_sub(PAGE as u16)
                 };
             }
         }
@@ -353,7 +369,7 @@ impl WatchUi {
     fn nav_home(&mut self) {
         match self.focus {
             Focus::Runs => self.switch_to(0),
-            Focus::Tasks => self.tasks_scroll = 0,
+            Focus::Tasks => self.tasks_sel = 0,
             Focus::Log => {
                 self.log.follow = false;
                 self.log.scroll = 0;
@@ -362,13 +378,21 @@ impl WatchUi {
     }
 
     /// `End` / `G`: jump to the bottom of the focused pane. For the log this
-    /// re-attaches follow-mode; for tasks the renderer clamps the overshoot.
+    /// re-attaches follow-mode.
     fn nav_end(&mut self) {
         match self.focus {
             Focus::Runs => self.switch_to(self.runs.len().saturating_sub(1)),
-            Focus::Tasks => self.tasks_scroll = u16::MAX,
+            Focus::Tasks => self.tasks_sel = self.tasks_max(),
             Focus::Log => self.log.follow = true,
         }
+    }
+
+    /// The currently highlighted task id, if any.
+    fn selected_task_id(&self) -> Option<String> {
+        self.model
+            .as_ref()
+            .and_then(|m| m.tasks.get(self.tasks_sel))
+            .map(|t| t.id.clone())
     }
 
     /// Re-list runs (active + the watched one), preserving the current
@@ -458,6 +482,17 @@ fn run_loop(
                 if let (KeyCode::Char('c'), KeyModifiers::CONTROL) = (k.code, k.modifiers) {
                     return Ok(ExitCode::SUCCESS);
                 }
+                // A detail overlay is modal: Esc/Enter/q dismiss it, everything
+                // else is swallowed so it doesn't drive the panes underneath.
+                if ui.detail.is_some() {
+                    if matches!(
+                        k.code,
+                        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')
+                    ) {
+                        ui.detail = None;
+                    }
+                    continue;
+                }
                 // While typing a `/` search, keys edit the query instead of
                 // driving the panes.
                 if ui.log.editing {
@@ -484,6 +519,8 @@ fn run_loop(
                     (KeyCode::PageDown, _) => ui.nav_page(true),
                     (KeyCode::Home | KeyCode::Char('g'), _) => ui.nav_home(),
                     (KeyCode::End | KeyCode::Char('G'), _) => ui.nav_end(),
+                    // Enter opens the detail overlay for the highlighted task.
+                    (KeyCode::Enter, _) => ui.detail = ui.selected_task_id(),
                     // Log filtering: `/` opens the search box, `f` cycles the
                     // severity filter. Both focus the log so the effect is
                     // visible immediately.
@@ -557,12 +594,12 @@ fn draw(f: &mut Frame, ui: &mut WatchUi) {
     };
     let top = Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)]).split(work);
 
-    let tasks_focused = ui.show_runs() && ui.focus == Focus::Tasks;
+    let tasks_focused = ui.focus == Focus::Tasks;
     render_tasks(
         f,
         top[0],
         &model.tasks,
-        &mut ui.tasks_scroll,
+        ui.tasks_sel,
         ui.frame,
         tasks_focused,
         g,
@@ -571,6 +608,11 @@ fn draw(f: &mut Frame, ui: &mut WatchUi) {
     let log_focused = ui.focus == Focus::Log;
     render_log(f, grid[1], &model.log, &mut ui.log, log_focused);
     render_footer(f, rows[2], ui.finished, ui.show_runs());
+
+    // The detail overlay floats above the grid when open.
+    if let Some(id) = &ui.detail {
+        render_detail(f, area, &model, id, g);
+    }
 }
 
 /// The Runs sidebar: one row per active run, the watched one marked and the
@@ -686,23 +728,54 @@ fn render_tasks(
     f: &mut Frame,
     area: Rect,
     tasks: &[TaskRow],
-    scroll: &mut u16,
+    selected: usize,
     frame: u64,
     focused: bool,
     g: Glyphs,
 ) {
-    let lines: Vec<Line> = tasks.iter().map(|t| task_line(t, frame, g)).collect();
-    // Clamp scroll so we never page past the end.
-    let inner_h = area.height.saturating_sub(2);
-    let max = (lines.len() as u16).saturating_sub(inner_h);
-    if *scroll > max {
-        *scroll = max;
-    }
+    let lines: Vec<Line> = tasks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let line = task_line(t, frame, g);
+            // Highlight the selection: a solid bar when the pane has focus,
+            // an underline otherwise so you can still see where you are.
+            if i == selected {
+                let hl = if focused {
+                    Style::default().bg(Color::DarkGray)
+                } else {
+                    Style::default().add_modifier(Modifier::UNDERLINED)
+                };
+                line.patch_style(hl)
+            } else {
+                line
+            }
+        })
+        .collect();
+
+    // Scroll so the selected row stays visible.
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let scroll = scroll_to_reveal(selected, tasks.len(), inner_h);
     let title = format!("Tasks ({})", tasks.len());
     let p = Paragraph::new(lines)
         .block(bordered_focused(&title, focused))
-        .scroll((*scroll, 0));
+        .scroll((scroll, 0));
     f.render_widget(p, area);
+}
+
+/// Vertical scroll offset that keeps row `selected` within a window of
+/// `height` rows out of `total`.
+fn scroll_to_reveal(selected: usize, total: usize, height: usize) -> u16 {
+    if height == 0 || total <= height {
+        return 0;
+    }
+    let max = (total - height) as u16;
+    let off = if selected < height {
+        0
+    } else {
+        (selected + 1 - height) as u16
+    };
+    off.min(max)
 }
 
 fn render_agents(f: &mut Frame, area: Rect, agents: &[AgentRow], frame: u64, g: Glyphs) {
@@ -751,6 +824,7 @@ fn render_footer(f: &mut Frame, area: Rect, finished: bool, show_runs: bool) {
     let mut spans = vec![Span::raw(" ")];
     spans.extend(key("Tab", "focus"));
     spans.extend(key("↑/↓", "scroll"));
+    spans.extend(key("↵", "detail"));
     if show_runs {
         spans.extend(key("1-9", "run"));
     }
@@ -770,6 +844,123 @@ fn render_footer(f: &mut Frame, area: Rect, finished: bool, show_runs: bool) {
         Line::from(spans)
     };
     f.render_widget(Paragraph::new(hint), area);
+}
+
+/// Floating overlay with the full detail for one task and the worker running
+/// it — the fields the one-line row has to truncate, plus that task's recent
+/// log lines.
+fn render_detail(f: &mut Frame, area: Rect, model: &DashboardModel, id: &str, g: Glyphs) {
+    let rect = centered_rect(72, 74, area);
+    f.render_widget(Clear, rect);
+
+    let Some(t) = model.tasks.iter().find(|t| t.id == id) else {
+        let p = Paragraph::new(format!("task {id} is no longer present"))
+            .block(bordered_focused("Detail", true));
+        f.render_widget(p, rect);
+        return;
+    };
+    // The worker assigned to this task, matched by its friendly name.
+    let agent = t
+        .agent
+        .as_ref()
+        .and_then(|nm| model.agents.iter().find(|a| &a.name == nm));
+
+    let label = |k: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!("{k:<9}"), dim()),
+            Span::raw(v),
+        ])
+    };
+    let mut lines: Vec<Line> = Vec::new();
+
+    let (glyph, color) = task_status_style(t.status, g);
+    lines.push(Line::from(vec![
+        Span::styled(format!("{glyph} "), Style::default().fg(color)),
+        Span::styled(
+            format!("{} ", t.id),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("[{}] ", t.role), dim()),
+        Span::styled(format!("{:?}", t.status), Style::default().fg(color)),
+    ]));
+    lines.push(Line::raw(t.title.clone()));
+    lines.push(Line::raw(""));
+
+    if !t.deps.is_empty() {
+        lines.push(label("deps", t.deps.join(", ")));
+    }
+    lines.push(label("writes", format!("{}", t.writes)));
+    lines.push(label("attempts", format!("{}", t.attempts)));
+    if t.usd > 0.0 {
+        lines.push(label("spend", format!("${:.4}", t.usd)));
+    }
+    if let Some(secs) = t.elapsed_secs {
+        lines.push(label("elapsed", fmt_dur(secs)));
+    }
+
+    // Assigned worker.
+    lines.push(Line::raw(""));
+    if let Some(a) = agent {
+        let name_color = agent_color(&a.name);
+        lines.push(Line::from(vec![
+            Span::styled("worker   ", dim()),
+            Span::styled(
+                a.name.clone(),
+                Style::default().fg(name_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  [{}] {:?}", a.role, a.status), dim()),
+        ]));
+        if let Some(tool) = &a.tool {
+            lines.push(label("tool", format!("{}{tool}", g.tool())));
+        }
+        if let Some(pid) = a.pid {
+            lines.push(label("pid", format!("{pid}")));
+        }
+        if let Some(secs) = a.uptime_secs {
+            lines.push(label("uptime", fmt_dur(secs)));
+        }
+    } else {
+        lines.push(label("worker", "unassigned".into()));
+    }
+
+    // This task's recent log lines (by id or worker name).
+    let hits: Vec<&LogRow> = model
+        .log
+        .iter()
+        .filter(|r| {
+            r.text.contains(&t.id)
+                || t.agent.as_ref().is_some_and(|nm| r.text.contains(nm))
+        })
+        .collect();
+    if !hits.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("recent", dim()));
+        for r in hits.iter().rev().take(8).rev() {
+            lines.push(log_line(r));
+        }
+    }
+
+    let title = format!("Task {} — Esc to close", t.id);
+    let p = Paragraph::new(lines)
+        .block(bordered_focused(&title, true))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, rect);
+}
+
+/// A rectangle centred in `area`, sized to the given width/height percentages.
+fn centered_rect(pct_w: u16, pct_h: u16, area: Rect) -> Rect {
+    let v = Layout::vertical([
+        Constraint::Percentage((100 - pct_h) / 2),
+        Constraint::Percentage(pct_h),
+        Constraint::Percentage((100 - pct_h) / 2),
+    ])
+    .split(area);
+    Layout::horizontal([
+        Constraint::Percentage((100 - pct_w) / 2),
+        Constraint::Percentage(pct_w),
+        Constraint::Percentage((100 - pct_w) / 2),
+    ])
+    .split(v[1])[1]
 }
 
 // ---------------------------------------------------------------------------
@@ -1277,6 +1468,75 @@ mod tests {
         assert_eq!(ui.focus, Focus::Runs);
         ui.cycle_focus();
         assert_eq!(ui.focus, Focus::Tasks);
+    }
+
+    #[test]
+    fn scroll_to_reveal_keeps_selection_in_window() {
+        // Fits entirely → never scrolls.
+        assert_eq!(scroll_to_reveal(4, 5, 10), 0);
+        // Selection above the fold → no scroll.
+        assert_eq!(scroll_to_reveal(2, 100, 10), 0);
+        // Selection past the window → scroll so it's the last visible row.
+        assert_eq!(scroll_to_reveal(12, 100, 10), 3);
+        // Never scrolls past the end.
+        assert_eq!(scroll_to_reveal(99, 100, 10), 90);
+    }
+
+    fn task(id: &str, agent: Option<&str>) -> TaskRow {
+        TaskRow {
+            id: id.into(),
+            role: "developer".into(),
+            title: "Wire up the editor".into(),
+            status: TaskStatus::InProgress,
+            deps: vec!["t1".into()],
+            writes: 3,
+            usd: 0.05,
+            elapsed_secs: Some(80),
+            attempts: 2,
+            agent: agent.map(|s| s.into()),
+        }
+    }
+
+    fn agent_row(name: &str) -> AgentRow {
+        AgentRow {
+            id: "agent-0006".into(),
+            name: name.into(),
+            role: "developer".into(),
+            status: AgentStatus::InProgress,
+            task: Some("t2".into()),
+            pid: Some(19572),
+            tool: Some("edit_file".into()),
+            uptime_secs: Some(140),
+            usd: 0.05,
+        }
+    }
+
+    #[test]
+    fn detail_overlay_shows_task_and_worker() {
+        let mut model = sample_model();
+        model.tasks = vec![task("t2", Some("brave_otter"))];
+        model.agents = vec![agent_row("brave_otter")];
+        model.log = vec![log("task.tool t2 [brave_otter] edit_file", LogSeverity::Info)];
+
+        let mut ui = WatchUi::new(vec![summary("only", RunStatus::Running)], 0, UNI);
+        ui.model = Some(model);
+        ui.detail = Some("t2".into());
+        let s = render_to_string(&mut ui, 120, 30);
+        assert!(s.contains("Task t2"), "overlay title missing:\n{s}");
+        assert!(s.contains("brave_otter"), "worker name missing:\n{s}");
+        assert!(s.contains("Wire up the editor"), "full title missing:\n{s}");
+        assert!(s.contains("edit_file"), "recent log line missing:\n{s}");
+    }
+
+    #[test]
+    fn enter_opens_selected_task_detail() {
+        let mut model = sample_model();
+        model.tasks = vec![task("t1", None), task("t2", Some("brave_otter"))];
+        let mut ui = WatchUi::new(vec![summary("only", RunStatus::Running)], 0, UNI);
+        ui.tasks_len = 2;
+        ui.model = Some(model);
+        ui.tasks_sel = 1;
+        assert_eq!(ui.selected_task_id().as_deref(), Some("t2"));
     }
 
     #[test]
