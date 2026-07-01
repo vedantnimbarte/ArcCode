@@ -47,12 +47,18 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// Live-watch the pilot runs under `project_root` in a full-screen ratatui
 /// UI, starting on `initial` (or the newest run). When more than one run is
-/// active, a Runs sidebar appears and you can switch between them. Blocks
-/// until the user quits (`q` / `Esc` / `Ctrl-C`).
-pub fn run(project_root: &Path, initial: Option<String>, interval_ms: u64) -> Result<ExitCode> {
+/// active, a Runs sidebar appears and you can switch between them. `ascii`
+/// forces the plain-ASCII glyph set for terminals that can't render the
+/// unicode ones. Blocks until the user quits (`q` / `Esc` / `Ctrl-C`).
+pub fn run(
+    project_root: &Path,
+    initial: Option<String>,
+    interval_ms: u64,
+    ascii: bool,
+) -> Result<ExitCode> {
     let mut terminal = setup()?;
     // Whatever happens in the loop, always restore the terminal.
-    let outcome = run_loop(&mut terminal, project_root, initial, interval_ms);
+    let outcome = run_loop(&mut terminal, project_root, initial, interval_ms, Glyphs { ascii });
     teardown(&mut terminal)?;
     outcome
 }
@@ -63,6 +69,53 @@ enum Focus {
     Runs,
     #[default]
     Tasks,
+}
+
+/// The glyph set the UI draws with. Unicode by default; the ASCII variant is
+/// a portable fallback for terminals (legacy Windows console, non-UTF-8
+/// locales) that render the fancier glyphs as tofu boxes.
+#[derive(Debug, Clone, Copy)]
+struct Glyphs {
+    ascii: bool,
+}
+
+impl Glyphs {
+    /// One glyph or the other, chosen by mode. Keeps the call sites readable.
+    fn pick(&self, unicode: char, ascii: char) -> char {
+        if self.ascii {
+            ascii
+        } else {
+            unicode
+        }
+    }
+
+    /// Animated progress spinner frame. Unicode rotates a quarter-filled
+    /// disc; ASCII falls back to the classic `|/-\` spinner.
+    fn spinner(&self, frame: u64) -> char {
+        const UNI: [char; 4] = ['◐', '◓', '◑', '◒'];
+        const ASC: [char; 4] = ['|', '/', '-', '\\'];
+        let set = if self.ascii { &ASC } else { &UNI };
+        set[(frame as usize) % set.len()]
+    }
+
+    fn current(&self) -> char {
+        self.pick('▸', '>')
+    }
+    fn tool(&self) -> char {
+        self.pick('▸', '>')
+    }
+    fn writes(&self) -> char {
+        self.pick('✎', 'w')
+    }
+    fn running(&self) -> char {
+        self.pick('▶', '>')
+    }
+    fn failed(&self) -> char {
+        self.pick('✗', 'x')
+    }
+    fn blocked(&self) -> char {
+        self.pick('‼', '!')
+    }
 }
 
 struct WatchUi {
@@ -79,10 +132,12 @@ struct WatchUi {
     /// Animation frame, advanced off wall-clock time so the in-progress
     /// spinner rotates smoothly regardless of the state-poll cadence.
     frame: u64,
+    /// Glyph set the UI renders with (unicode or ASCII fallback).
+    glyphs: Glyphs,
 }
 
 impl WatchUi {
-    fn new(runs: Vec<RunSummary>, current: usize) -> Self {
+    fn new(runs: Vec<RunSummary>, current: usize, glyphs: Glyphs) -> Self {
         Self {
             runs,
             current,
@@ -92,6 +147,7 @@ impl WatchUi {
             model: None,
             finished: false,
             frame: 0,
+            glyphs,
         }
     }
 
@@ -197,6 +253,7 @@ fn run_loop(
     project_root: &Path,
     initial: Option<String>,
     interval_ms: u64,
+    glyphs: Glyphs,
 ) -> Result<ExitCode> {
     // Cap the wait so we repaint at least every ~120 ms — enough to animate
     // the spinner smoothly even when the user picked a slow --interval-ms.
@@ -207,7 +264,7 @@ fn run_loop(
     if runs.is_empty() {
         return Ok(ExitCode::from(1));
     }
-    let mut ui = WatchUi::new(runs, current);
+    let mut ui = WatchUi::new(runs, current, glyphs);
     ui.reload();
 
     // Throttle the (relatively expensive) full run-list rescan.
@@ -279,6 +336,7 @@ fn run_loop(
 
 fn draw(f: &mut Frame, ui: &mut WatchUi) {
     let area = f.area();
+    let g = ui.glyphs;
     let Some(model) = ui.model.clone() else {
         let p = Paragraph::new("loading run…").block(bordered("Pilot"));
         f.render_widget(p, area);
@@ -293,7 +351,7 @@ fn draw(f: &mut Frame, ui: &mut WatchUi) {
     ])
     .split(area);
 
-    render_header(f, rows[0], &model.header);
+    render_header(f, rows[0], &model.header, g);
 
     // Grid: top row then Live log full width. When >1 run is active, the
     // top row gains a Runs sidebar on the left: Runs | Tasks | Agents.
@@ -303,7 +361,7 @@ fn draw(f: &mut Frame, ui: &mut WatchUi) {
     let work = if ui.show_runs() {
         let cols =
             Layout::horizontal([Constraint::Length(22), Constraint::Min(0)]).split(grid[0]);
-        render_runs(f, cols[0], &ui.runs, ui.current, ui.focus, ui.frame);
+        render_runs(f, cols[0], &ui.runs, ui.current, ui.focus, ui.frame, g);
         cols[1]
     } else {
         grid[0]
@@ -318,8 +376,9 @@ fn draw(f: &mut Frame, ui: &mut WatchUi) {
         &mut ui.tasks_scroll,
         ui.frame,
         tasks_focused,
+        g,
     );
-    render_agents(f, top[1], &model.agents, ui.frame);
+    render_agents(f, top[1], &model.agents, ui.frame, g);
     render_log(f, grid[1], &model.log);
     render_footer(f, rows[2], ui.finished, ui.show_runs());
 }
@@ -333,11 +392,12 @@ fn render_runs(
     current: usize,
     focus: Focus,
     frame: u64,
+    g: Glyphs,
 ) {
     let lines: Vec<Line> = runs
         .iter()
         .enumerate()
-        .map(|(i, r)| run_line(r, i == current, frame))
+        .map(|(i, r)| run_line(r, i == current, frame, g))
         .collect();
     let title = format!("Runs ({})", runs.len());
     f.render_widget(
@@ -346,9 +406,13 @@ fn render_runs(
     );
 }
 
-fn run_line(r: &RunSummary, is_current: bool, frame: u64) -> Line<'static> {
-    let (glyph, color) = run_status_glyph(r.status, frame);
-    let marker = if is_current { "▸" } else { " " };
+fn run_line(r: &RunSummary, is_current: bool, frame: u64, g: Glyphs) -> Line<'static> {
+    let (glyph, color) = run_status_glyph(r.status, frame, g);
+    let marker = if is_current {
+        g.current().to_string()
+    } else {
+        " ".to_string()
+    };
     let label = short_run_label(&r.run_id);
     let mut style = Style::default();
     if is_current {
@@ -367,7 +431,7 @@ fn short_run_label(run_id: &str) -> String {
     run_id.rsplit('-').next().unwrap_or(run_id).to_string()
 }
 
-fn render_header(f: &mut Frame, area: Rect, h: &HeaderInfo) {
+fn render_header(f: &mut Frame, area: Rect, h: &HeaderInfo, g: Glyphs) {
     let (status_label, status_color) = run_status_style(h.status);
     let mut counts = vec![
         Span::styled(format!("{}", h.done), Style::default().fg(Color::Green)),
@@ -376,21 +440,21 @@ fn render_header(f: &mut Frame, area: Rect, h: &HeaderInfo) {
     if h.running > 0 {
         counts.push(Span::raw(" · "));
         counts.push(Span::styled(
-            format!("{}▶ running", h.running),
+            format!("{}{} running", h.running, g.running()),
             Style::default().fg(Color::Cyan),
         ));
     }
     if h.failed > 0 {
         counts.push(Span::raw(" · "));
         counts.push(Span::styled(
-            format!("{}✗ failed", h.failed),
+            format!("{}{} failed", h.failed, g.failed()),
             Style::default().fg(Color::Red),
         ));
     }
     if h.blocked > 0 {
         counts.push(Span::raw(" · "));
         counts.push(Span::styled(
-            format!("{}‼ blocked", h.blocked),
+            format!("{}{} blocked", h.blocked, g.blocked()),
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -435,8 +499,9 @@ fn render_tasks(
     scroll: &mut u16,
     frame: u64,
     focused: bool,
+    g: Glyphs,
 ) {
-    let lines: Vec<Line> = tasks.iter().map(|t| task_line(t, frame)).collect();
+    let lines: Vec<Line> = tasks.iter().map(|t| task_line(t, frame, g)).collect();
     // Clamp scroll so we never page past the end.
     let inner_h = area.height.saturating_sub(2);
     let max = (lines.len() as u16).saturating_sub(inner_h);
@@ -450,11 +515,11 @@ fn render_tasks(
     f.render_widget(p, area);
 }
 
-fn render_agents(f: &mut Frame, area: Rect, agents: &[AgentRow], frame: u64) {
+fn render_agents(f: &mut Frame, area: Rect, agents: &[AgentRow], frame: u64, g: Glyphs) {
     let lines: Vec<Line> = if agents.is_empty() {
         vec![Line::from(Span::styled("(no agents yet)", dim()))]
     } else {
-        agents.iter().map(|a| agent_line(a, frame)).collect()
+        agents.iter().map(|a| agent_line(a, frame, g)).collect()
     };
     let title = format!("Agents ({})", agents.len());
     f.render_widget(Paragraph::new(lines).block(bordered(&title)), area);
@@ -507,12 +572,12 @@ fn render_footer(f: &mut Frame, area: Rect, finished: bool, show_runs: bool) {
 // Row → styled Line
 // ---------------------------------------------------------------------------
 
-fn task_line(t: &TaskRow, frame: u64) -> Line<'static> {
+fn task_line(t: &TaskRow, frame: u64, g: Glyphs) -> Line<'static> {
     // In-progress rows get an animated circular spinner so the currently
     // worked task is obvious at a glance; everything else keeps its glyph.
     let (glyph, color) = match t.status {
-        TaskStatus::InProgress => (spinner(frame), task_status_style(t.status).1),
-        other => task_status_style(other),
+        TaskStatus::InProgress => (g.spinner(frame), task_status_style(t.status, g).1),
+        other => task_status_style(other, g),
     };
     let mut spans = vec![
         Span::styled(format!(" {glyph} "), Style::default().fg(color)),
@@ -532,7 +597,7 @@ fn task_line(t: &TaskRow, frame: u64) -> Line<'static> {
         meta.push(format!("deps: {}", t.deps.join(",")));
     }
     if t.writes > 0 {
-        meta.push(format!("✎{}", t.writes));
+        meta.push(format!("{}{}", g.writes(), t.writes));
     }
     if t.usd > 0.0 {
         meta.push(format!("${:.2}", t.usd));
@@ -549,11 +614,11 @@ fn task_line(t: &TaskRow, frame: u64) -> Line<'static> {
     Line::from(spans)
 }
 
-fn agent_line(a: &AgentRow, frame: u64) -> Line<'static> {
+fn agent_line(a: &AgentRow, frame: u64, g: Glyphs) -> Line<'static> {
     // Working agents animate the same spinner as their in-progress task.
     let (glyph, color) = match a.status {
-        AgentStatus::InProgress => (spinner(frame), agent_status_style(a.status).1),
-        other => agent_status_style(other),
+        AgentStatus::InProgress => (g.spinner(frame), agent_status_style(a.status, g).1),
+        other => agent_status_style(other, g),
     };
     // The friendly name gets a stable per-agent colour (hashed from the
     // name) so the same worker is easy to track at a glance.
@@ -575,7 +640,7 @@ fn agent_line(a: &AgentRow, frame: u64) -> Line<'static> {
 
     let mut meta: Vec<String> = Vec::new();
     if let Some(tool) = &a.tool {
-        meta.push(format!("▸{tool}"));
+        meta.push(format!("{}{tool}", g.tool()));
     }
     if let Some(p) = a.pid {
         meta.push(format!("pid={p}"));
@@ -611,13 +676,6 @@ fn log_line(r: &LogSeverityLine) -> Line<'static> {
 
 fn dim() -> Style {
     Style::default().add_modifier(Modifier::DIM)
-}
-
-/// Circular progress spinner frame for the given animation tick. Rotates
-/// through the four quarter-filled circles to read as a spinning disc.
-fn spinner(frame: u64) -> char {
-    const FRAMES: [char; 4] = ['◐', '◓', '◑', '◒'];
-    FRAMES[(frame as usize) % FRAMES.len()]
 }
 
 /// Stable colour for an agent, hashed from its name. Red/yellow/green are
@@ -659,37 +717,37 @@ fn bordered_focused(title: &str, focused: bool) -> Block<'static> {
 
 /// Status glyph + colour for a run in the sidebar. Non-terminal runs animate
 /// the spinner; terminal runs get a static mark.
-fn run_status_glyph(s: RunStatus, frame: u64) -> (char, Color) {
+fn run_status_glyph(s: RunStatus, frame: u64, g: Glyphs) -> (char, Color) {
     match s {
-        RunStatus::Planning => (spinner(frame), Color::Blue),
-        RunStatus::AwaitingApproval => (spinner(frame), Color::Yellow),
-        RunStatus::Running => (spinner(frame), Color::Cyan),
-        RunStatus::Merging => (spinner(frame), Color::Magenta),
-        RunStatus::Done => ('✓', Color::Green),
-        RunStatus::Failed => ('✗', Color::Red),
-        RunStatus::Aborted => ('⊘', Color::Yellow),
+        RunStatus::Planning => (g.spinner(frame), Color::Blue),
+        RunStatus::AwaitingApproval => (g.spinner(frame), Color::Yellow),
+        RunStatus::Running => (g.spinner(frame), Color::Cyan),
+        RunStatus::Merging => (g.spinner(frame), Color::Magenta),
+        RunStatus::Done => (g.pick('✓', 'v'), Color::Green),
+        RunStatus::Failed => (g.pick('✗', 'x'), Color::Red),
+        RunStatus::Aborted => (g.pick('⊘', '#'), Color::Yellow),
     }
 }
 
-fn task_status_style(s: TaskStatus) -> (char, Color) {
+fn task_status_style(s: TaskStatus, g: Glyphs) -> (char, Color) {
     match s {
-        TaskStatus::Pending => ('·', Color::DarkGray),
-        TaskStatus::Todo => ('○', Color::Blue),
-        TaskStatus::InProgress => ('↻', Color::Cyan),
-        TaskStatus::Review => ('◇', Color::Magenta),
-        TaskStatus::Done => ('✓', Color::Green),
-        TaskStatus::Failed => ('✗', Color::Red),
-        TaskStatus::Blocked => ('‼', Color::Yellow),
+        TaskStatus::Pending => (g.pick('·', '.'), Color::DarkGray),
+        TaskStatus::Todo => (g.pick('○', 'o'), Color::Blue),
+        TaskStatus::InProgress => (g.pick('↻', '~'), Color::Cyan),
+        TaskStatus::Review => (g.pick('◇', '?'), Color::Magenta),
+        TaskStatus::Done => (g.pick('✓', 'v'), Color::Green),
+        TaskStatus::Failed => (g.pick('✗', 'x'), Color::Red),
+        TaskStatus::Blocked => (g.pick('‼', '!'), Color::Yellow),
     }
 }
 
-fn agent_status_style(s: AgentStatus) -> (char, Color) {
+fn agent_status_style(s: AgentStatus, g: Glyphs) -> (char, Color) {
     match s {
-        AgentStatus::Idle => ('·', Color::DarkGray),
-        AgentStatus::InProgress => ('↻', Color::Cyan),
-        AgentStatus::Done => ('✓', Color::Green),
-        AgentStatus::Failed => ('✗', Color::Red),
-        AgentStatus::Aborted => ('⊘', Color::Yellow),
+        AgentStatus::Idle => (g.pick('·', '.'), Color::DarkGray),
+        AgentStatus::InProgress => (g.pick('↻', '~'), Color::Cyan),
+        AgentStatus::Done => (g.pick('✓', 'v'), Color::Green),
+        AgentStatus::Failed => (g.pick('✗', 'x'), Color::Red),
+        AgentStatus::Aborted => (g.pick('⊘', '#'), Color::Yellow),
     }
 }
 
@@ -741,13 +799,75 @@ fn teardown(terminal: &mut Term) -> Result<()> {
 mod tests {
     use super::*;
 
+    const UNI: Glyphs = Glyphs { ascii: false };
+    const ASC: Glyphs = Glyphs { ascii: true };
+
     #[test]
     fn spinner_cycles_through_four_circular_frames() {
-        let frames: Vec<char> = (0..4).map(spinner).collect();
+        let frames: Vec<char> = (0..4).map(|f| UNI.spinner(f)).collect();
         assert_eq!(frames, vec!['◐', '◓', '◑', '◒']);
         // Wraps around and stays in-bounds for large ticks.
-        assert_eq!(spinner(4), spinner(0));
-        assert_eq!(spinner(4_000_001), spinner(1));
+        assert_eq!(UNI.spinner(4), UNI.spinner(0));
+        assert_eq!(UNI.spinner(4_000_001), UNI.spinner(1));
+    }
+
+    #[test]
+    fn ascii_glyphs_avoid_non_ascii_codepoints() {
+        // Every glyph the ASCII theme can emit must be plain 7-bit ASCII, so
+        // a legacy console never renders a tofu box.
+        for f in 0..4 {
+            assert!(ASC.spinner(f).is_ascii(), "spinner frame {f} not ascii");
+        }
+        let mut glyphs = vec![
+            ASC.current(),
+            ASC.tool(),
+            ASC.writes(),
+            ASC.running(),
+            ASC.failed(),
+            ASC.blocked(),
+        ];
+        for s in [
+            TaskStatus::Pending,
+            TaskStatus::Todo,
+            TaskStatus::InProgress,
+            TaskStatus::Review,
+            TaskStatus::Done,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+        ] {
+            glyphs.push(task_status_style(s, ASC).0);
+        }
+        for s in [
+            AgentStatus::Idle,
+            AgentStatus::InProgress,
+            AgentStatus::Done,
+            AgentStatus::Failed,
+            AgentStatus::Aborted,
+        ] {
+            glyphs.push(agent_status_style(s, ASC).0);
+        }
+        for s in [RunStatus::Running, RunStatus::Done, RunStatus::Failed, RunStatus::Aborted] {
+            glyphs.push(run_status_glyph(s, 0, ASC).0);
+        }
+        for c in glyphs {
+            assert!(c.is_ascii(), "ASCII theme emitted non-ascii glyph: {c:?}");
+        }
+    }
+
+    #[test]
+    fn ascii_theme_reaches_the_rendered_grid() {
+        let runs = vec![
+            summary("2026-07-01-0707-hq27zr", RunStatus::Running),
+            summary("2026-07-01-0709-a1b2c3", RunStatus::Running),
+        ];
+        let mut ui = WatchUi::new(runs, 0, ASC);
+        ui.model = Some(sample_model());
+        let s = render_to_string(&mut ui, 120, 30);
+        // The unicode current-run marker / spinner must not appear anywhere.
+        for bad in ['▸', '◐', '◓', '◑', '◒', '✓', '✗', '↻'] {
+            assert!(!s.contains(bad), "ascii render leaked {bad:?}:\n{s}");
+        }
+        assert!(s.contains('>'), "ascii current-run marker missing:\n{s}");
     }
 
     fn summary(id: &str, status: RunStatus) -> RunSummary {
@@ -803,7 +923,7 @@ mod tests {
             summary("2026-07-01-0707-hq27zr", RunStatus::Running),
             summary("2026-07-01-0709-a1b2c3", RunStatus::Running),
         ];
-        let mut ui = WatchUi::new(runs, 0);
+        let mut ui = WatchUi::new(runs, 0, UNI);
         ui.model = Some(sample_model());
         let s = render_to_string(&mut ui, 120, 30);
         assert!(s.contains("Runs (2)"), "sidebar title missing:\n{s}");
@@ -813,7 +933,7 @@ mod tests {
 
     #[test]
     fn sidebar_hidden_for_a_single_run() {
-        let mut ui = WatchUi::new(vec![summary("only", RunStatus::Running)], 0);
+        let mut ui = WatchUi::new(vec![summary("only", RunStatus::Running)], 0, UNI);
         ui.model = Some(sample_model());
         let s = render_to_string(&mut ui, 120, 30);
         assert!(!s.contains("Runs ("), "sidebar should be hidden:\n{s}");
@@ -862,9 +982,9 @@ mod tests {
 
     #[test]
     fn run_status_glyph_spins_only_for_active_runs() {
-        assert_eq!(run_status_glyph(RunStatus::Running, 0).0, spinner(0));
-        assert_eq!(run_status_glyph(RunStatus::Done, 0).0, '✓');
-        assert_eq!(run_status_glyph(RunStatus::Failed, 0).0, '✗');
+        assert_eq!(run_status_glyph(RunStatus::Running, 0, UNI).0, UNI.spinner(0));
+        assert_eq!(run_status_glyph(RunStatus::Done, 0, UNI).0, '✓');
+        assert_eq!(run_status_glyph(RunStatus::Failed, 0, UNI).0, '✗');
     }
 
     #[test]

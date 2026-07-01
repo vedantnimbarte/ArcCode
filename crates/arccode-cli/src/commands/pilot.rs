@@ -18,6 +18,49 @@ use arccode_config::{Config, ProjectPaths};
 
 use crate::runtime;
 
+/// Resolve whether the dashboard should render plain-ASCII glyphs instead of
+/// the unicode status/spinner glyphs.
+///
+/// Precedence: an explicit `--ascii` flag wins; then the `ARCCODE_ASCII`
+/// escape hatch (`0`/`false`/`no` forces unicode, anything else forces
+/// ASCII); otherwise we auto-detect. The auto path is conservative — it only
+/// downgrades to ASCII on terminals that historically can't render the
+/// glyphs (legacy Windows console; a clearly non-UTF-8 unix locale).
+pub fn resolve_ascii(flag: bool) -> bool {
+    if flag {
+        return true;
+    }
+    if let Some(v) = std::env::var_os("ARCCODE_ASCII") {
+        let v = v.to_string_lossy();
+        let off = matches!(v.trim(), "0" | "false" | "no" | "off" | "");
+        return !off;
+    }
+    auto_ascii()
+}
+
+/// Best-effort guess at whether the current terminal can't render the unicode
+/// glyphs. Kept dependency-free: we key off well-known environment markers
+/// rather than probing the console API.
+fn auto_ascii() -> bool {
+    if cfg!(windows) {
+        // Modern terminals (Windows Terminal, VS Code, ConEmu) render the
+        // glyphs fine and advertise themselves; the legacy conhost/cmd host
+        // does not, so default it to ASCII.
+        let modern = std::env::var_os("WT_SESSION").is_some()
+            || std::env::var_os("TERM_PROGRAM").is_some()
+            || std::env::var_os("ConEmuANSI").is_some();
+        !modern
+    } else {
+        // On unix, only downgrade when the locale is explicitly non-UTF-8.
+        // An unset locale is treated as capable (the modern default).
+        let loc = std::env::var("LC_ALL")
+            .or_else(|_| std::env::var("LC_CTYPE"))
+            .or_else(|_| std::env::var("LANG"))
+            .unwrap_or_default();
+        !loc.is_empty() && !loc.to_ascii_uppercase().contains("UTF")
+    }
+}
+
 /// E6 adaptive-routing thresholds: a role's cheap-model blended success
 /// rate must clear this (after `ROUTE_MIN_SAMPLES` attempts) to keep being
 /// routed to the cheap model; otherwise it escalates to the capable model.
@@ -1012,7 +1055,7 @@ pub async fn status(run_id: Option<String>) -> Result<ExitCode> {
 /// initialization) so it composes with normal scrollback the way `tail
 /// -f` does. The dashboard re-renders by reprinting the box on each
 /// tick.
-pub async fn watch(run_id: Option<String>, interval_ms: u64) -> Result<ExitCode> {
+pub async fn watch(run_id: Option<String>, interval_ms: u64, ascii: bool) -> Result<ExitCode> {
     use std::time::Duration;
     let project = ProjectPaths::discover(&std::env::current_dir()?);
     let runs = arccode_autonomous::dashboard::list_runs(&project.root)?;
@@ -1039,7 +1082,7 @@ pub async fn watch(run_id: Option<String>, interval_ms: u64) -> Result<ExitCode>
     if std::io::stdout().is_terminal() {
         let root = project.root.clone();
         return tokio::task::spawn_blocking(move || {
-            crate::commands::pilot_watch_tui::run(&root, run_id, interval_ms)
+            crate::commands::pilot_watch_tui::run(&root, run_id, interval_ms, ascii)
         })
         .await
         .context("pilot watch UI task panicked")?;
