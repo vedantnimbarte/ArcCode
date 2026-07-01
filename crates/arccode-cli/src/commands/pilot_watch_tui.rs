@@ -26,7 +26,10 @@ use std::time::SystemTime;
 
 use anyhow::Result;
 use chrono::Utc;
-use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event as CtEvent, KeyCode, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -58,7 +61,13 @@ pub fn run(
 ) -> Result<ExitCode> {
     let mut terminal = setup()?;
     // Whatever happens in the loop, always restore the terminal.
-    let outcome = run_loop(&mut terminal, project_root, initial, interval_ms, Glyphs { ascii });
+    let outcome = run_loop(
+        &mut terminal,
+        project_root,
+        initial,
+        interval_ms,
+        Glyphs { ascii },
+    );
     teardown(&mut terminal)?;
     outcome
 }
@@ -135,8 +144,7 @@ impl LogView {
     /// Whether a log row passes the active severity + text filters.
     fn accepts(&self, r: &LogRow) -> bool {
         self.severity.accepts(r.severity)
-            && (self.query.is_empty()
-                || r.text.to_lowercase().contains(&self.query.to_lowercase()))
+            && (self.query.is_empty() || r.text.to_lowercase().contains(&self.query.to_lowercase()))
     }
 
     /// Pane title reflecting the follow state and any active filters.
@@ -230,8 +238,52 @@ struct WatchUi {
     /// Cumulative spend samples (USD cents) captured on each reload, for the
     /// header sparkline. Bounded so it never grows without limit.
     spend_samples: Vec<u64>,
+    /// Last-drawn pane rectangles + task scroll offset, so mouse clicks and
+    /// wheel events can be hit-tested against what's on screen.
+    hit: HitAreas,
     /// Glyph set the UI renders with (unicode or ASCII fallback).
     glyphs: Glyphs,
+}
+
+/// Screen geometry captured each frame for mouse hit-testing.
+#[derive(Debug, Clone, Copy, Default)]
+struct HitAreas {
+    runs: Option<Rect>,
+    tasks: Option<Rect>,
+    log: Option<Rect>,
+    /// The task pane's scroll offset at draw time, so a click maps to the
+    /// right row.
+    tasks_scroll: u16,
+}
+
+impl HitAreas {
+    /// Which pane, if any, contains the point — for wheel + click routing.
+    fn pane_at(&self, x: u16, y: u16) -> Option<Focus> {
+        let inside = |r: &Option<Rect>| r.map(|r| contains(r, x, y)).unwrap_or(false);
+        if inside(&self.runs) {
+            Some(Focus::Runs)
+        } else if inside(&self.tasks) {
+            Some(Focus::Tasks)
+        } else if inside(&self.log) {
+            Some(Focus::Log)
+        } else {
+            None
+        }
+    }
+}
+
+/// Whether `(x, y)` falls inside a rectangle.
+fn contains(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+/// The 0-based content row a click landed on inside a bordered pane, or
+/// `None` when it hit the border. Assumes a 1-cell border.
+fn row_in(r: Rect, y: u16) -> Option<usize> {
+    if y <= r.y || y + 1 >= r.y + r.height {
+        return None;
+    }
+    Some((y - r.y - 1) as usize)
 }
 
 /// Cap on the spend sparkline history — a couple of terminal-widths of points.
@@ -252,6 +304,7 @@ impl WatchUi {
             finished: false,
             frame: 0,
             spend_samples: Vec::new(),
+            hit: HitAreas::default(),
             glyphs,
         }
     }
@@ -291,7 +344,8 @@ impl WatchUi {
     /// Record the current cumulative spend for the header sparkline, keeping
     /// the history bounded.
     fn push_spend_sample(&mut self, usd: f64) {
-        self.spend_samples.push((usd * 100.0).round().max(0.0) as u64);
+        self.spend_samples
+            .push((usd * 100.0).round().max(0.0) as u64);
         let overflow = self.spend_samples.len().saturating_sub(SPEND_SAMPLES_MAX);
         if overflow > 0 {
             self.spend_samples.drain(..overflow);
@@ -415,6 +469,66 @@ impl WatchUi {
             .map(|t| t.id.clone())
     }
 
+    /// Mouse-wheel over a pane scrolls it (falling back to the focused pane
+    /// when the pointer is off any pane).
+    fn on_scroll(&mut self, down: bool, x: u16, y: u16) {
+        let pane = self.hit.pane_at(x, y).unwrap_or(self.focus);
+        match pane {
+            Focus::Runs => {
+                if down {
+                    self.select_next()
+                } else {
+                    self.select_prev()
+                }
+            }
+            Focus::Tasks => {
+                self.tasks_sel = if down {
+                    (self.tasks_sel + 1).min(self.tasks_max())
+                } else {
+                    self.tasks_sel.saturating_sub(1)
+                };
+            }
+            Focus::Log => {
+                self.log.follow = false;
+                self.log.scroll = if down {
+                    self.log.scroll.saturating_add(3)
+                } else {
+                    self.log.scroll.saturating_sub(3)
+                };
+            }
+        }
+    }
+
+    /// Left-click focuses the clicked pane and, in the Runs/Tasks lists,
+    /// selects the clicked row.
+    fn on_click(&mut self, x: u16, y: u16) {
+        match self.hit.pane_at(x, y) {
+            Some(Focus::Runs) => {
+                self.focus = Focus::Runs;
+                if let Some(rect) = self.hit.runs {
+                    if let Some(row) = row_in(rect, y) {
+                        if row < self.runs.len() {
+                            self.switch_to(row);
+                        }
+                    }
+                }
+            }
+            Some(Focus::Tasks) => {
+                self.focus = Focus::Tasks;
+                if let Some(rect) = self.hit.tasks {
+                    if let Some(row) = row_in(rect, y) {
+                        let idx = self.hit.tasks_scroll as usize + row;
+                        if idx < self.tasks_len {
+                            self.tasks_sel = idx;
+                        }
+                    }
+                }
+            }
+            Some(Focus::Log) => self.focus = Focus::Log,
+            None => {}
+        }
+    }
+
     /// Re-list runs (active + the watched one), preserving the current
     /// selection by id and refreshing each run's progress/status.
     fn refresh_runs(&mut self, project_root: &Path) {
@@ -494,70 +608,80 @@ fn run_loop(
 
         // Drain input first so keys feel responsive.
         if event::poll(poll)? {
-            if let CtEvent::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Release {
-                    continue;
-                }
-                // Ctrl-C always quits, even mid-search.
-                if let (KeyCode::Char('c'), KeyModifiers::CONTROL) = (k.code, k.modifiers) {
-                    return Ok(ExitCode::SUCCESS);
-                }
-                // A detail overlay is modal: Esc/Enter/q dismiss it, everything
-                // else is swallowed so it doesn't drive the panes underneath.
-                if ui.detail.is_some() {
-                    if matches!(
-                        k.code,
-                        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')
-                    ) {
-                        ui.detail = None;
+            match event::read()? {
+                CtEvent::Key(k) => {
+                    if k.kind == KeyEventKind::Release {
+                        continue;
                     }
-                    continue;
-                }
-                // While typing a `/` search, keys edit the query instead of
-                // driving the panes.
-                if ui.log.editing {
-                    match k.code {
-                        KeyCode::Esc => {
-                            ui.log.editing = false;
-                            ui.log.query.clear();
+                    // Ctrl-C always quits, even mid-search.
+                    if let (KeyCode::Char('c'), KeyModifiers::CONTROL) = (k.code, k.modifiers) {
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    // A detail overlay is modal: Esc/Enter/q dismiss it, everything
+                    // else is swallowed so it doesn't drive the panes underneath.
+                    if ui.detail.is_some() {
+                        if matches!(k.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                            ui.detail = None;
                         }
-                        KeyCode::Enter => ui.log.editing = false,
-                        KeyCode::Backspace => {
-                            ui.log.query.pop();
+                        continue;
+                    }
+                    // While typing a `/` search, keys edit the query instead of
+                    // driving the panes.
+                    if ui.log.editing {
+                        match k.code {
+                            KeyCode::Esc => {
+                                ui.log.editing = false;
+                                ui.log.query.clear();
+                            }
+                            KeyCode::Enter => ui.log.editing = false,
+                            KeyCode::Backspace => {
+                                ui.log.query.pop();
+                            }
+                            KeyCode::Char(c) => ui.log.query.push(c),
+                            _ => {}
                         }
-                        KeyCode::Char(c) => ui.log.query.push(c),
+                        continue;
+                    }
+                    match (k.code, k.modifiers) {
+                        (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => {
+                            return Ok(ExitCode::SUCCESS)
+                        }
+                        (KeyCode::Tab, _) => ui.cycle_focus(),
+                        (KeyCode::Up | KeyCode::Char('k'), _) => ui.nav_up(),
+                        (KeyCode::Down | KeyCode::Char('j'), _) => ui.nav_down(),
+                        (KeyCode::PageUp, _) => ui.nav_page(false),
+                        (KeyCode::PageDown, _) => ui.nav_page(true),
+                        (KeyCode::Home | KeyCode::Char('g'), _) => ui.nav_home(),
+                        (KeyCode::End | KeyCode::Char('G'), _) => ui.nav_end(),
+                        // Enter opens the detail overlay for the highlighted task.
+                        (KeyCode::Enter, _) => ui.detail = ui.selected_task_id(),
+                        // Log filtering: `/` opens the search box, `f` cycles the
+                        // severity filter. Both focus the log so the effect is
+                        // visible immediately.
+                        (KeyCode::Char('/'), _) => {
+                            ui.focus = Focus::Log;
+                            ui.log.editing = true;
+                        }
+                        (KeyCode::Char('f'), _) => {
+                            ui.focus = Focus::Log;
+                            ui.log.severity = ui.log.severity.next();
+                        }
+                        // Number keys jump straight to a run, regardless of focus.
+                        (KeyCode::Char(c), _) if c.is_ascii_digit() && c != '0' => {
+                            ui.switch_to(c as usize - '1' as usize);
+                        }
                         _ => {}
                     }
-                    continue;
                 }
-                match (k.code, k.modifiers) {
-                    (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => return Ok(ExitCode::SUCCESS),
-                    (KeyCode::Tab, _) => ui.cycle_focus(),
-                    (KeyCode::Up | KeyCode::Char('k'), _) => ui.nav_up(),
-                    (KeyCode::Down | KeyCode::Char('j'), _) => ui.nav_down(),
-                    (KeyCode::PageUp, _) => ui.nav_page(false),
-                    (KeyCode::PageDown, _) => ui.nav_page(true),
-                    (KeyCode::Home | KeyCode::Char('g'), _) => ui.nav_home(),
-                    (KeyCode::End | KeyCode::Char('G'), _) => ui.nav_end(),
-                    // Enter opens the detail overlay for the highlighted task.
-                    (KeyCode::Enter, _) => ui.detail = ui.selected_task_id(),
-                    // Log filtering: `/` opens the search box, `f` cycles the
-                    // severity filter. Both focus the log so the effect is
-                    // visible immediately.
-                    (KeyCode::Char('/'), _) => {
-                        ui.focus = Focus::Log;
-                        ui.log.editing = true;
-                    }
-                    (KeyCode::Char('f'), _) => {
-                        ui.focus = Focus::Log;
-                        ui.log.severity = ui.log.severity.next();
-                    }
-                    // Number keys jump straight to a run, regardless of focus.
-                    (KeyCode::Char(c), _) if c.is_ascii_digit() && c != '0' => {
-                        ui.switch_to(c as usize - '1' as usize);
-                    }
+                // Mouse: wheel scrolls the pane under the pointer, left-click
+                // focuses/selects. Ignored while the detail overlay is modal.
+                CtEvent::Mouse(m) if ui.detail.is_none() => match m.kind {
+                    MouseEventKind::ScrollDown => ui.on_scroll(true, m.column, m.row),
+                    MouseEventKind::ScrollUp => ui.on_scroll(false, m.column, m.row),
+                    MouseEventKind::Down(MouseButton::Left) => ui.on_click(m.column, m.row),
                     _ => {}
-                }
+                },
+                _ => {}
             }
         }
 
@@ -603,21 +727,21 @@ fn draw(f: &mut Frame, ui: &mut WatchUi) {
 
     // Grid: top row then Live log full width. When >1 run is active, the
     // top row gains a Runs sidebar on the left: Runs | Tasks | Agents.
-    let grid = Layout::vertical([Constraint::Percentage(62), Constraint::Percentage(38)])
-        .split(rows[2]);
+    let grid =
+        Layout::vertical([Constraint::Percentage(62), Constraint::Percentage(38)]).split(rows[2]);
 
-    let work = if ui.show_runs() {
-        let cols =
-            Layout::horizontal([Constraint::Length(22), Constraint::Min(0)]).split(grid[0]);
+    let (work, runs_rect) = if ui.show_runs() {
+        let cols = Layout::horizontal([Constraint::Length(22), Constraint::Min(0)]).split(grid[0]);
         render_runs(f, cols[0], &ui.runs, ui.current, ui.focus, ui.frame, g);
-        cols[1]
+        (cols[1], Some(cols[0]))
     } else {
-        grid[0]
+        (grid[0], None)
     };
-    let top = Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)]).split(work);
+    let top =
+        Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)]).split(work);
 
     let tasks_focused = ui.focus == Focus::Tasks;
-    render_tasks(
+    let tasks_scroll = render_tasks(
         f,
         top[0],
         &model.tasks,
@@ -630,6 +754,14 @@ fn draw(f: &mut Frame, ui: &mut WatchUi) {
     let log_focused = ui.focus == Focus::Log;
     render_log(f, grid[1], &model.log, &mut ui.log, log_focused);
     render_footer(f, rows[3], ui.finished, ui.show_runs());
+
+    // Capture geometry for mouse hit-testing on the next input tick.
+    ui.hit = HitAreas {
+        runs: runs_rect,
+        tasks: Some(top[0]),
+        log: Some(grid[1]),
+        tasks_scroll,
+    };
 
     // The detail overlay floats above the grid when open.
     if let Some(id) = &ui.detail {
@@ -779,7 +911,12 @@ fn render_meters(f: &mut Frame, area: Rect, h: &HeaderInfo, spend: &[u64]) {
 /// The gauge's inline label: `3/16 · 19% · ETA 12m · $0.08/min`. ETA and rate
 /// are only shown once there's enough signal to estimate them.
 fn progress_label(h: &HeaderInfo, ratio: f64) -> String {
-    let mut s = format!("{}/{} · {}%", h.done, h.total, (ratio * 100.0).round() as u32);
+    let mut s = format!(
+        "{}/{} · {}%",
+        h.done,
+        h.total,
+        (ratio * 100.0).round() as u32
+    );
     if let Some(eta) = eta_secs(h) {
         s.push_str(&format!(" · ETA {}", fmt_dur(eta)));
     }
@@ -817,7 +954,7 @@ fn render_tasks(
     frame: u64,
     focused: bool,
     g: Glyphs,
-) {
+) -> u16 {
     let lines: Vec<Line> = tasks
         .iter()
         .enumerate()
@@ -846,6 +983,7 @@ fn render_tasks(
         .block(bordered_focused(&title, focused))
         .scroll((scroll, 0));
     f.render_widget(p, area);
+    scroll
 }
 
 /// Vertical scroll offset that keeps row `selected` within a window of
@@ -950,12 +1088,8 @@ fn render_detail(f: &mut Frame, area: Rect, model: &DashboardModel, id: &str, g:
         .as_ref()
         .and_then(|nm| model.agents.iter().find(|a| &a.name == nm));
 
-    let label = |k: &str, v: String| {
-        Line::from(vec![
-            Span::styled(format!("{k:<9}"), dim()),
-            Span::raw(v),
-        ])
-    };
+    let label =
+        |k: &str, v: String| Line::from(vec![Span::styled(format!("{k:<9}"), dim()), Span::raw(v)]);
     let mut lines: Vec<Line> = Vec::new();
 
     let (glyph, color) = task_status_style(t.status, g);
@@ -1013,8 +1147,7 @@ fn render_detail(f: &mut Frame, area: Rect, model: &DashboardModel, id: &str, g:
         .log
         .iter()
         .filter(|r| {
-            r.text.contains(&t.id)
-                || t.agent.as_ref().is_some_and(|nm| r.text.contains(nm))
+            r.text.contains(&t.id) || t.agent.as_ref().is_some_and(|nm| r.text.contains(nm))
         })
         .collect();
     if !hits.is_empty() {
@@ -1263,14 +1396,18 @@ fn fmt_dur(secs: i64) -> String {
 fn setup() -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     Ok(terminal)
 }
 
 fn teardown(terminal: &mut Term) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -1326,7 +1463,12 @@ mod tests {
         ] {
             glyphs.push(agent_status_style(s, ASC).0);
         }
-        for s in [RunStatus::Running, RunStatus::Done, RunStatus::Failed, RunStatus::Aborted] {
+        for s in [
+            RunStatus::Running,
+            RunStatus::Done,
+            RunStatus::Failed,
+            RunStatus::Aborted,
+        ] {
             glyphs.push(run_status_glyph(s, 0, ASC).0);
         }
         for c in glyphs {
@@ -1462,7 +1604,10 @@ mod tests {
 
     #[test]
     fn run_status_glyph_spins_only_for_active_runs() {
-        assert_eq!(run_status_glyph(RunStatus::Running, 0, UNI).0, UNI.spinner(0));
+        assert_eq!(
+            run_status_glyph(RunStatus::Running, 0, UNI).0,
+            UNI.spinner(0)
+        );
         assert_eq!(run_status_glyph(RunStatus::Done, 0, UNI).0, '✓');
         assert_eq!(run_status_glyph(RunStatus::Failed, 0, UNI).0, '✗');
     }
@@ -1572,6 +1717,65 @@ mod tests {
     }
 
     #[test]
+    fn hit_testing_maps_points_and_rows() {
+        let r = Rect::new(0, 5, 20, 6); // border at y=5 and y=10, content 6..10
+        assert!(contains(r, 0, 5));
+        assert!(!contains(r, 20, 5)); // just past the right edge
+        assert!(!contains(r, 0, 11));
+        // Border rows have no content row; first content row is index 0.
+        assert_eq!(row_in(r, 5), None);
+        assert_eq!(row_in(r, 6), Some(0));
+        assert_eq!(row_in(r, 9), Some(3));
+        assert_eq!(row_in(r, 10), None); // bottom border
+    }
+
+    #[test]
+    fn pane_at_prefers_runs_then_tasks_then_log() {
+        let hit = HitAreas {
+            runs: Some(Rect::new(0, 0, 10, 10)),
+            tasks: Some(Rect::new(10, 0, 30, 10)),
+            log: Some(Rect::new(0, 10, 40, 5)),
+            tasks_scroll: 0,
+        };
+        assert_eq!(hit.pane_at(3, 3), Some(Focus::Runs));
+        assert_eq!(hit.pane_at(20, 3), Some(Focus::Tasks));
+        assert_eq!(hit.pane_at(5, 12), Some(Focus::Log));
+        assert_eq!(hit.pane_at(100, 100), None);
+    }
+
+    #[test]
+    fn click_on_task_row_selects_it_with_scroll_offset() {
+        let mut ui = WatchUi::new(vec![summary("only", RunStatus::Running)], 0, UNI);
+        ui.tasks_len = 50;
+        // Tasks pane spans rows 5..15 (border at 5); the list is scrolled by 8.
+        ui.hit = HitAreas {
+            runs: None,
+            tasks: Some(Rect::new(0, 5, 40, 10)),
+            log: None,
+            tasks_scroll: 8,
+        };
+        // Click content row 2 → index 8 + 2 = 10.
+        ui.on_click(3, 8);
+        assert_eq!(ui.focus, Focus::Tasks);
+        assert_eq!(ui.tasks_sel, 10);
+    }
+
+    #[test]
+    fn wheel_over_log_scrolls_it_without_focus_change() {
+        let mut ui = WatchUi::new(vec![summary("only", RunStatus::Running)], 0, UNI);
+        ui.hit = HitAreas {
+            runs: None,
+            tasks: Some(Rect::new(0, 0, 40, 10)),
+            log: Some(Rect::new(0, 10, 40, 6)),
+            tasks_scroll: 0,
+        };
+        assert!(ui.log.follow);
+        ui.on_scroll(false, 5, 12); // wheel up over the log
+        assert!(!ui.log.follow, "wheel over log detaches follow");
+        assert_eq!(ui.focus, Focus::Tasks, "scrolling doesn't steal focus");
+    }
+
+    #[test]
     fn eta_is_linear_and_guards_edges() {
         // 2 of 16 done in 120s → 14 remaining × 60s each = 840s.
         assert_eq!(eta_secs(&header(2, 16, Some(120), 0.0)), Some(840));
@@ -1658,7 +1862,10 @@ mod tests {
         let mut model = sample_model();
         model.tasks = vec![task("t2", Some("brave_otter"))];
         model.agents = vec![agent_row("brave_otter")];
-        model.log = vec![log("task.tool t2 [brave_otter] edit_file", LogSeverity::Info)];
+        model.log = vec![log(
+            "task.tool t2 [brave_otter] edit_file",
+            LogSeverity::Info,
+        )];
 
         let mut ui = WatchUi::new(vec![summary("only", RunStatus::Running)], 0, UNI);
         ui.model = Some(model);
