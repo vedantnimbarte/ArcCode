@@ -294,27 +294,61 @@ the git anchors). Each row surfaces the details worth watching — per-task cost
 elapsed time, write-set size, dependency list, and retry count; per-agent
 current tool, uptime, pid, and cost.
 
+Workers are shown by a Docker-style **friendly name** (`brave_otter`,
+`lucid_lynx`) rather than the raw `agent-000N` id. The name is derived
+deterministically from `(run_id, agent id)` — so replaying a run yields the
+same names — and in the interactive UI each worker's name gets a stable colour
+so it's easy to track across the live log. The stable `agent-000N` id is kept
+internally (session files, `session fork`, event log) and still appears in
+`state.json` alongside the name.
+
 ```
 ┌ Pilot: 2026-07-01-0707-hq27zr · 3/16 · Running · $0.42 · 2▶ · 1✗ · 4m12s ──────┐
 ┌─ Tasks (16) ────────────────────────┐┌─ Agents (4) ─────────────────────────┐
-│ ✓ t1  [designer]  Tiptap editor …   ││ ↻ agent-0001 [designer] task=t1 ·    │
+│ ✓ t1  [designer]  Tiptap editor …   ││ ↻ brave_otter [designer] task=t1 ·   │
 │ ↻ t2  [developer] Editor.tsx  ·      ││     ▸edit_file · pid=10628 · 3m · $.08│
-│       agent-0006 · deps: t1 · ✎3 ·   ││ ↻ agent-0006 [developer] task=t2 ·   │
+│       lucid_lynx · deps: t1 · ✎3 ·   ││ ↻ lucid_lynx  [developer] task=t2 ·  │
 │       $0.05 · 1m20s · try2           ││     ▸run_shell · pid=19572 · 2m · $.05│
 │ ○ t3  [developer] Slash menu …       │└──────────────────────────────────────┘
 └──────────────────────────────────────┘
 ┌─ Live log ─────────────────────────────────────────────────────────────────────┐
-│ 07:24:44  task.tool    t2 [agent-0006] edit_file                               │
+│ 07:24:44  task.tool    t2 [lucid_lynx] edit_file                               │
 │ 07:25:07  task.status  t1e → Failed                                            │
 │ 07:25:53  task.create  t1f: Create editor package …                            │
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Keys: `↑`/`↓` (or `k`/`j`) and `PgUp`/`PgDn` scroll the Tasks pane, `Home`/`g`
-jumps to the top, `q`/`Esc`/`Ctrl-C` exits. The Live log auto-sticks to the
-newest events. When stdout is not a terminal (CI, `| tee`, redirected logs),
-`pilot watch` falls back to a plain reprint of the same grid; `pilot status`
-prints that grid once and exits.
+In-progress tasks and the workers running them show an animated circular
+spinner (`◐◓◑◒`) in place of the static status glyph, so the work happening
+*right now* is obvious at a glance. The spinner is driven off wall-clock time,
+so it rotates smoothly regardless of the `--interval-ms` state-poll cadence.
+
+**Multiple runs.** When more than one run is active, a **Runs sidebar** appears
+on the left of the top row (Runs | Tasks | Agents) listing each active run with
+its status glyph and progress; the watched run is marked `▸`. `Tab` moves focus
+between the Runs and Tasks panes (the focused pane gets a cyan border), `↑`/`↓`
+then select a run or scroll tasks, and number keys `1`–`9` jump straight to a
+run. The sidebar refreshes ~once a second as runs start and finish; the run
+you're watching stays listed even if it completes. With a single active run the
+sidebar is hidden and the layout is the plain Tasks | Agents grid.
+
+```
+┌ Pilot: 2026-07-01-0707-hq27zr · 3/16 · Running ────────────────────────────────┐
+┌ Runs (2) ──┐┌ Tasks (16) ───────────┐┌ Agents (2) ──────────────────────────┐
+│▸◐ hq27zr 3/16││ ↻ t2 [dev] Editor…    ││ ↻ brave_otter [dev] task=t2 · ▸edit… │
+│ ◐ 9f4d2  1/5 ││ ○ t3 [dev] Slash…     ││ ↻ lucid_lynx  [dev] task=t3 · ▸run…  │
+└────────────┘└───────────────────────┘└──────────────────────────────────────┘
+┌ Live log ──────────────────────────────────────────────────────────────────────┐
+│ 07:24:44  task.tool    t2 [brave_otter] edit_file                              │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Keys: `↑`/`↓` (or `k`/`j`) and `PgUp`/`PgDn` scroll the Tasks pane (or select a
+run when the Runs pane is focused), `Tab` switches focus, `1`–`9` jump to a run,
+`Home`/`g` jumps to the top, `q`/`Esc`/`Ctrl-C` exits. The Live log auto-sticks
+to the newest events. When stdout is not a terminal (CI, `| tee`, redirected
+logs), `pilot watch` falls back to a plain reprint of the current run's grid (no
+sidebar, no animation); `pilot status` prints that grid once and exits.
 
 ### Slash Commands
 

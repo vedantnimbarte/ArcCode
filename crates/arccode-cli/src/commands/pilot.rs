@@ -1020,21 +1020,26 @@ pub async fn watch(run_id: Option<String>, interval_ms: u64) -> Result<ExitCode>
         eprintln!("[pilot] no runs found under {}", project.root.display());
         return Ok(ExitCode::from(1));
     }
-    let pick = match run_id {
-        Some(id) => runs
-            .iter()
-            .find(|r| r.run_id == id)
-            .cloned()
-            .ok_or_else(|| anyhow!("no run with id {id} found"))?,
+    // Validate an explicit --run-id up front so a typo fails fast rather
+    // than silently watching the newest run.
+    if let Some(id) = &run_id {
+        if !runs.iter().any(|r| &r.run_id == id) {
+            return Err(anyhow!("no run with id {id} found"));
+        }
+    }
+    let pick = match &run_id {
+        Some(id) => runs.iter().find(|r| &r.run_id == id).cloned().unwrap(),
         None => runs.into_iter().next().unwrap(),
     };
 
     // Interactive full-screen grid UI when attached to a terminal; fall
     // back to the pipe-friendly reprint loop otherwise (CI, `| tee`, logs).
+    // The TUI manages the run list itself so it can offer a Runs sidebar
+    // when several runs are active.
     if std::io::stdout().is_terminal() {
-        let dir = pick.dir.clone();
+        let root = project.root.clone();
         return tokio::task::spawn_blocking(move || {
-            crate::commands::pilot_watch_tui::run(&dir, interval_ms)
+            crate::commands::pilot_watch_tui::run(&root, run_id, interval_ms)
         })
         .await
         .context("pilot watch UI task panicked")?;

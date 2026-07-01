@@ -106,6 +106,8 @@ pub struct TaskRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentRow {
     pub id: String,
+    /// Friendly display name (`brave_otter`); falls back to `id` on older runs.
+    pub name: String,
     pub role: String,
     pub status: AgentStatus,
     pub task: Option<String>,
@@ -286,6 +288,15 @@ pub fn build_model(state: &RunState, recent: &[Event], now: Option<DateTime<Utc>
         base_short: short_sha(&state.base_commit),
     };
 
+    // id → friendly display name, so every place an agent id would appear
+    // (task rows, agent rows, the live log) shows the name instead.
+    let names: std::collections::BTreeMap<String, String> = state
+        .agents
+        .iter()
+        .map(|a| (a.id.clone(), agent_display(a).to_string()))
+        .collect();
+    let name_of = |id: &str| names.get(id).cloned().unwrap_or_else(|| id.to_string());
+
     let tasks = state
         .tasks
         .iter()
@@ -299,7 +310,7 @@ pub fn build_model(state: &RunState, recent: &[Event], now: Option<DateTime<Utc>
             usd: t.usd,
             elapsed_secs: span_secs(t.started_at.as_deref(), t.ended_at.as_deref(), now),
             attempts: t.attempts,
-            agent: t.agent.clone(),
+            agent: t.agent.as_deref().map(&name_of),
         })
         .collect();
 
@@ -308,6 +319,7 @@ pub fn build_model(state: &RunState, recent: &[Event], now: Option<DateTime<Utc>
         .iter()
         .map(|a| AgentRow {
             id: a.id.clone(),
+            name: agent_display(a).to_string(),
             role: a.role.as_str().to_string(),
             status: a.status,
             task: a.current_task.clone(),
@@ -321,7 +333,7 @@ pub fn build_model(state: &RunState, recent: &[Event], now: Option<DateTime<Utc>
         .collect();
 
     // `recent` is already the caller-chosen tail, in chronological order.
-    let log = recent.iter().map(render_log_line).collect();
+    let log = recent.iter().map(|ev| render_log_line(ev, &names)).collect();
 
     DashboardModel {
         header,
@@ -428,8 +440,8 @@ fn agent_row_line(a: &AgentRow) -> String {
         meta.push(format!("${:.2}", a.usd));
     }
     format!(
-        "{badge} {id} [{role}] {meta}",
-        id = a.id,
+        "{badge} {name} [{role}] {meta}",
+        name = a.name,
         role = a.role,
         meta = meta.join(" · "),
     )
@@ -446,20 +458,28 @@ fn join_or(lines: impl Iterator<Item = String>, empty: &str) -> String {
     }
 }
 
-fn render_log_line(ev: &Event) -> LogRow {
+fn render_log_line(ev: &Event, names: &std::collections::BTreeMap<String, String>) -> LogRow {
     use LogSeverity::*;
     let ts = ev.timestamp();
     let short_ts = ts.split(['T', '+', '.']).nth(1).unwrap_or(ts);
     let short_ts = &short_ts[..short_ts.len().min(8)];
+    // Resolve an agent id to its friendly name for display.
+    let nm = |agent: &str| {
+        names
+            .get(agent)
+            .cloned()
+            .unwrap_or_else(|| agent.to_string())
+    };
     let (severity, text) = match ev {
         Event::RunStart { run_id, .. } => (Info, format!("{short_ts}  run.start  {run_id}")),
         Event::TaskCreate { id, title, .. } => (
             Info,
             format!("{short_ts}  task.create  {id}: {}", truncate(title, 40)),
         ),
-        Event::TaskAssign { id, agent, .. } => {
-            (Info, format!("{short_ts}  task.assign  {id} → {agent}"))
-        }
+        Event::TaskAssign { id, agent, .. } => (
+            Info,
+            format!("{short_ts}  task.assign  {id} → {}", nm(agent)),
+        ),
         Event::TaskStatus { id, status, .. } => {
             let sev = match status {
                 TaskStatus::Done => Ok,
@@ -476,7 +496,7 @@ fn render_log_line(ev: &Event) -> LogRow {
             let sev = if *ok { Info } else { Error };
             (
                 sev,
-                format!("{short_ts}  task.tool    {id} [{agent}] {tool}{mark}"),
+                format!("{short_ts}  task.tool    {id} [{}] {tool}{mark}", nm(agent)),
             )
         }
         Event::TaskCommit { id, sha, .. } => (
@@ -485,7 +505,7 @@ fn render_log_line(ev: &Event) -> LogRow {
         ),
         Event::AgentSpawn { agent, role, .. } => (
             Info,
-            format!("{short_ts}  agent.spawn  {agent} [{}]", role.as_str()),
+            format!("{short_ts}  agent.spawn  {} [{}]", nm(agent), role.as_str()),
         ),
         Event::AgentStatus { agent, status, .. } => {
             let sev = match status {
@@ -494,11 +514,15 @@ fn render_log_line(ev: &Event) -> LogRow {
                 AgentStatus::Aborted => Warn,
                 _ => Info,
             };
-            (sev, format!("{short_ts}  agent.status {agent} → {status:?}"))
+            (
+                sev,
+                format!("{short_ts}  agent.status {} → {status:?}", nm(agent)),
+            )
         }
-        Event::AgentUsd { agent, usd, .. } => {
-            (Info, format!("{short_ts}  agent.usd    {agent} +${usd:.4}"))
-        }
+        Event::AgentUsd { agent, usd, .. } => (
+            Info,
+            format!("{short_ts}  agent.usd    {} +${usd:.4}", nm(agent)),
+        ),
         Event::RunStatusEv { status, .. } => {
             let sev = match status {
                 RunStatus::Failed | RunStatus::Aborted => Error,
@@ -529,6 +553,16 @@ fn render_log_line(ev: &Event) -> LogRow {
 /// First 8 chars of a git sha (or the whole thing if shorter).
 fn short_sha(sha: &str) -> String {
     sha.chars().take(8).collect()
+}
+
+/// Display label for an agent: its friendly name, or the stable id when the
+/// name is absent (runs created before agent naming existed).
+fn agent_display(a: &crate::model::Agent) -> &str {
+    if a.name.is_empty() {
+        &a.id
+    } else {
+        &a.name
+    }
 }
 
 /// Parse an RFC-3339 timestamp into UTC; `None` on any parse failure.
@@ -745,6 +779,7 @@ mod tests {
         s.tasks.push(t2);
         s.agents.push(crate::model::Agent {
             id: "agent-0002".into(),
+            name: "brave_otter".into(),
             role: Role::Designer,
             current_task: Some("t2".into()),
             pid: Some(12345),
@@ -777,17 +812,49 @@ mod tests {
         assert!(p.contains("t2"));
         assert!(p.contains("↻"), "in-progress task should have ↻ glyph: {p}");
         assert!(p.contains("deps: t1"));
-        assert!(p.contains("agent-0002"));
+        // The assigned worker shows by its friendly name, not the raw id.
+        assert!(p.contains("brave_otter"));
+        assert!(!p.contains("agent-0002"));
     }
 
     #[test]
     fn agents_pane_lists_active_workers() {
         let view = render_dashboard(&sample_state(), &[]);
         let p = &view.agents_pane;
-        assert!(p.contains("agent-0002"));
+        // Friendly name replaces the raw id in the display.
+        assert!(p.contains("brave_otter"));
+        assert!(!p.contains("agent-0002"));
         assert!(p.contains("designer"));
         assert!(p.contains("task=t2"));
         assert!(p.contains("pid=12345"));
+    }
+
+    #[test]
+    fn agent_display_falls_back_to_id_when_name_absent() {
+        let mut state = sample_state();
+        state.agent_mut("agent-0002").unwrap().name.clear();
+        let view = render_dashboard(&state, &[]);
+        // Older runs (no name) still render, keyed by id.
+        assert!(view.agents_pane.contains("agent-0002"));
+    }
+
+    #[test]
+    fn apply_assigns_deterministic_friendly_names() {
+        let mut state = crate::model::RunState::new("2026-07-01-0707-hq27zr", "g", "abc", "b");
+        crate::model::apply(
+            &mut state,
+            &Event::AgentSpawn {
+                t: "2026-07-01T07:07:00Z".into(),
+                agent: "agent-0001".into(),
+                role: crate::model::Role::Developer,
+                pid: Some(42),
+                session_id: None,
+            },
+        );
+        let a = state.agent("agent-0001").unwrap();
+        assert_eq!(a.id, "agent-0001", "stable id preserved");
+        assert_eq!(a.name, crate::names::agent_name("2026-07-01-0707-hq27zr", "agent-0001"));
+        assert!(a.name.contains('_'), "name is adjective_animal: {}", a.name);
     }
 
     #[test]
