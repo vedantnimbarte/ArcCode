@@ -35,7 +35,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Sparkline, Wrap};
 use ratatui::{Frame, Terminal};
 
 use arccode_autonomous::dashboard::{
@@ -227,9 +227,15 @@ struct WatchUi {
     /// Animation frame, advanced off wall-clock time so the in-progress
     /// spinner rotates smoothly regardless of the state-poll cadence.
     frame: u64,
+    /// Cumulative spend samples (USD cents) captured on each reload, for the
+    /// header sparkline. Bounded so it never grows without limit.
+    spend_samples: Vec<u64>,
     /// Glyph set the UI renders with (unicode or ASCII fallback).
     glyphs: Glyphs,
 }
+
+/// Cap on the spend sparkline history — a couple of terminal-widths of points.
+const SPEND_SAMPLES_MAX: usize = 240;
 
 impl WatchUi {
     fn new(runs: Vec<RunSummary>, current: usize, glyphs: Glyphs) -> Self {
@@ -245,6 +251,7 @@ impl WatchUi {
             model: None,
             finished: false,
             frame: 0,
+            spend_samples: Vec::new(),
             glyphs,
         }
     }
@@ -276,7 +283,18 @@ impl WatchUi {
             self.tasks_len = model.tasks.len();
             // Keep the selection in-bounds as tasks come and go.
             self.tasks_sel = self.tasks_sel.min(self.tasks_len.saturating_sub(1));
+            self.push_spend_sample(model.header.usd);
             self.model = Some(model);
+        }
+    }
+
+    /// Record the current cumulative spend for the header sparkline, keeping
+    /// the history bounded.
+    fn push_spend_sample(&mut self, usd: f64) {
+        self.spend_samples.push((usd * 100.0).round().max(0.0) as u64);
+        let overflow = self.spend_samples.len().saturating_sub(SPEND_SAMPLES_MAX);
+        if overflow > 0 {
+            self.spend_samples.drain(..overflow);
         }
     }
 
@@ -286,6 +304,8 @@ impl WatchUi {
             self.current = idx;
             self.tasks_sel = 0;
             self.detail = None;
+            // The sparkline is per-run; start fresh on a switch.
+            self.spend_samples.clear();
             self.reload();
         }
     }
@@ -569,20 +589,22 @@ fn draw(f: &mut Frame, ui: &mut WatchUi) {
         return;
     };
 
-    // Rows: header (4) · grid (rest) · footer (1).
+    // Rows: header (4) · meters (3) · grid (rest) · footer (1).
     let rows = Layout::vertical([
         Constraint::Length(4),
+        Constraint::Length(3),
         Constraint::Min(0),
         Constraint::Length(1),
     ])
     .split(area);
 
     render_header(f, rows[0], &model.header, g);
+    render_meters(f, rows[1], &model.header, &ui.spend_samples);
 
     // Grid: top row then Live log full width. When >1 run is active, the
     // top row gains a Runs sidebar on the left: Runs | Tasks | Agents.
     let grid = Layout::vertical([Constraint::Percentage(62), Constraint::Percentage(38)])
-        .split(rows[1]);
+        .split(rows[2]);
 
     let work = if ui.show_runs() {
         let cols =
@@ -607,7 +629,7 @@ fn draw(f: &mut Frame, ui: &mut WatchUi) {
     render_agents(f, top[1], &model.agents, ui.frame, g);
     let log_focused = ui.focus == Focus::Log;
     render_log(f, grid[1], &model.log, &mut ui.log, log_focused);
-    render_footer(f, rows[2], ui.finished, ui.show_runs());
+    render_footer(f, rows[3], ui.finished, ui.show_runs());
 
     // The detail overlay floats above the grid when open.
     if let Some(id) = &ui.detail {
@@ -707,11 +729,11 @@ fn render_header(f: &mut Frame, area: Rect, h: &HeaderInfo, g: Glyphs) {
         .concat(),
     );
 
+    // Spend now lives in the meters row (sparkline title), so the header
+    // meta line carries the git anchors and elapsed clock.
     let mut meta = vec![
         Span::styled("elapsed ", dim()),
         Span::raw(h.elapsed_secs.map(fmt_dur).unwrap_or_else(|| "—".into())),
-        Span::styled("  ·  spend ", dim()),
-        Span::styled(format!("${:.2}", h.usd), Style::default().fg(Color::Green)),
         Span::styled("  ·  branch ", dim()),
         Span::raw(h.branch.clone()),
     ];
@@ -722,6 +744,69 @@ fn render_header(f: &mut Frame, area: Rect, h: &HeaderInfo, g: Glyphs) {
 
     let p = Paragraph::new(vec![line1, Line::from(meta)]).block(bordered("Pilot"));
     f.render_widget(p, area);
+}
+
+/// The meters row: a progress gauge (with ETA + spend-rate in its label) on
+/// the left, a cumulative-spend sparkline on the right.
+fn render_meters(f: &mut Frame, area: Rect, h: &HeaderInfo, spend: &[u64]) {
+    let cols =
+        Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)]).split(area);
+
+    let ratio = if h.total > 0 {
+        (h.done as f64 / h.total as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let gauge = Gauge::default()
+        .block(bordered("Progress"))
+        .gauge_style(Style::default().fg(Color::Green))
+        .ratio(ratio)
+        .label(progress_label(h, ratio));
+    f.render_widget(gauge, cols[0]);
+
+    // Sparkline of cumulative spend. `max` pins the top so the curve doesn't
+    // rescale every tick; an empty history just draws a flat baseline.
+    let max = spend.iter().copied().max().unwrap_or(1).max(1);
+    let title = format!("spend ${:.2}", h.usd);
+    let spark = Sparkline::default()
+        .block(bordered(&title))
+        .max(max)
+        .style(Style::default().fg(Color::Cyan))
+        .data(spend);
+    f.render_widget(spark, cols[1]);
+}
+
+/// The gauge's inline label: `3/16 · 19% · ETA 12m · $0.08/min`. ETA and rate
+/// are only shown once there's enough signal to estimate them.
+fn progress_label(h: &HeaderInfo, ratio: f64) -> String {
+    let mut s = format!("{}/{} · {}%", h.done, h.total, (ratio * 100.0).round() as u32);
+    if let Some(eta) = eta_secs(h) {
+        s.push_str(&format!(" · ETA {}", fmt_dur(eta)));
+    }
+    if let Some(rate) = spend_per_min(h) {
+        s.push_str(&format!(" · ${rate:.2}/min"));
+    }
+    s
+}
+
+/// Linear ETA from average time-per-completed-task, or `None` when it can't
+/// be estimated yet (nothing done, already finished, or no elapsed clock).
+fn eta_secs(h: &HeaderInfo) -> Option<i64> {
+    let elapsed = h.elapsed_secs?;
+    if h.done == 0 || h.done >= h.total || elapsed <= 0 {
+        return None;
+    }
+    let remaining = (h.total - h.done) as i64;
+    Some((elapsed * remaining) / h.done as i64)
+}
+
+/// Spend rate in USD per minute, or `None` before any elapsed time / spend.
+fn spend_per_min(h: &HeaderInfo) -> Option<f64> {
+    let elapsed = h.elapsed_secs?;
+    if elapsed <= 0 || h.usd <= 0.0 {
+        return None;
+    }
+    Some(h.usd * 60.0 / elapsed as f64)
 }
 
 fn render_tasks(
@@ -1468,6 +1553,63 @@ mod tests {
         assert_eq!(ui.focus, Focus::Runs);
         ui.cycle_focus();
         assert_eq!(ui.focus, Focus::Tasks);
+    }
+
+    fn header(done: usize, total: usize, elapsed: Option<i64>, usd: f64) -> HeaderInfo {
+        HeaderInfo {
+            run_id: "r".into(),
+            status: RunStatus::Running,
+            done,
+            running: 1,
+            failed: 0,
+            blocked: 0,
+            total,
+            usd,
+            elapsed_secs: elapsed,
+            branch: "b".into(),
+            base_short: "abc".into(),
+        }
+    }
+
+    #[test]
+    fn eta_is_linear_and_guards_edges() {
+        // 2 of 16 done in 120s → 14 remaining × 60s each = 840s.
+        assert_eq!(eta_secs(&header(2, 16, Some(120), 0.0)), Some(840));
+        // Nothing done yet → no estimate.
+        assert_eq!(eta_secs(&header(0, 16, Some(120), 0.0)), None);
+        // Already complete → no estimate.
+        assert_eq!(eta_secs(&header(16, 16, Some(120), 0.0)), None);
+        // No clock → no estimate.
+        assert_eq!(eta_secs(&header(2, 16, None, 0.0)), None);
+    }
+
+    #[test]
+    fn spend_rate_is_per_minute() {
+        // $0.42 over 120s → $0.21/min.
+        let r = spend_per_min(&header(2, 16, Some(120), 0.42)).unwrap();
+        assert!((r - 0.21).abs() < 1e-9, "got {r}");
+        assert_eq!(spend_per_min(&header(2, 16, Some(0), 0.42)), None);
+        assert_eq!(spend_per_min(&header(2, 16, Some(120), 0.0)), None);
+    }
+
+    #[test]
+    fn progress_label_summarises_the_run() {
+        let l = progress_label(&header(2, 16, Some(120), 0.42), 2.0 / 16.0);
+        assert!(l.contains("2/16"), "{l}");
+        assert!(l.contains("13%"), "{l}"); // 0.125 rounds to 13
+        assert!(l.contains("ETA 14m"), "{l}");
+        assert!(l.contains("$0.21/min"), "{l}");
+    }
+
+    #[test]
+    fn spend_samples_stay_bounded_and_scale_to_cents() {
+        let mut ui = WatchUi::new(vec![summary("only", RunStatus::Running)], 0, UNI);
+        ui.push_spend_sample(0.42);
+        assert_eq!(ui.spend_samples.last(), Some(&42));
+        for _ in 0..SPEND_SAMPLES_MAX + 50 {
+            ui.push_spend_sample(1.0);
+        }
+        assert_eq!(ui.spend_samples.len(), SPEND_SAMPLES_MAX);
     }
 
     #[test]
