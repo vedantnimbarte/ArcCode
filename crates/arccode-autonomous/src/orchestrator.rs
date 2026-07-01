@@ -50,7 +50,9 @@ pub enum OrchestratorError {
     ConcurrencyCap(u32),
     #[error("cost cap reached: spent ${spent:.2} of ${cap:.2}")]
     CostCap { spent: f64, cap: f64 },
-    #[error("task {0} write-set overlaps in-progress task {1}; serialising to avoid a conflict (E4)")]
+    #[error(
+        "task {0} write-set overlaps in-progress task {1}; serialising to avoid a conflict (E4)"
+    )]
     WriteConflict(String, String),
     #[error("orchestrator stopped before this command completed")]
     Shutdown,
@@ -754,7 +756,10 @@ async fn handle_assign(
             })
             .map(|t| t.id.clone())
         {
-            return Err(OrchestratorError::WriteConflict(task_id.to_string(), conflict));
+            return Err(OrchestratorError::WriteConflict(
+                task_id.to_string(),
+                conflict,
+            ));
         }
 
         let n = *next_agent_seq;
@@ -1509,8 +1514,14 @@ mod tests {
             reversibility: Default::default(),
             reversibility_reason: None,
         };
-        handle.add_task(spec("t1", vec!["shared.rs"])).await.unwrap();
-        handle.add_task(spec("t2", vec!["shared.rs"])).await.unwrap();
+        handle
+            .add_task(spec("t1", vec!["shared.rs"]))
+            .await
+            .unwrap();
+        handle
+            .add_task(spec("t2", vec!["shared.rs"]))
+            .await
+            .unwrap();
         handle.add_task(spec("t3", vec!["other.rs"])).await.unwrap();
 
         // Assign t1 and wait for it to be in-progress.
@@ -1613,7 +1624,11 @@ mod tests {
         assert!(
             state.tasks.iter().all(|t| t.status.is_terminal()),
             "every task terminal after abort: {:?}",
-            state.tasks.iter().map(|t| (&t.id, t.status)).collect::<Vec<_>>()
+            state
+                .tasks
+                .iter()
+                .map(|t| (&t.id, t.status))
+                .collect::<Vec<_>>()
         );
         // No new work is accepted once aborting.
         assert!(matches!(
@@ -1660,7 +1675,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(aborted, "control-file abort_run never reached the orchestrator");
+        assert!(
+            aborted,
+            "control-file abort_run never reached the orchestrator"
+        );
 
         handle.shutdown().await;
         let _ = join.await;

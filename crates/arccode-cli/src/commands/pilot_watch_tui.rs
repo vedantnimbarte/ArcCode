@@ -796,9 +796,7 @@ fn run_loop(
                 }
                 // Mouse: wheel scrolls the pane under the pointer, left-click
                 // focuses/selects. Ignored while an overlay is modal.
-                CtEvent::Mouse(m)
-                    if ui.detail.is_none() && !ui.help && ui.confirm.is_none() =>
-                {
+                CtEvent::Mouse(m) if ui.detail.is_none() && !ui.help && ui.confirm.is_none() => {
                     match m.kind {
                         MouseEventKind::ScrollDown => ui.on_scroll(true, m.column, m.row),
                         MouseEventKind::ScrollUp => ui.on_scroll(false, m.column, m.row),
@@ -1230,7 +1228,10 @@ fn render_footer(
     // While a run is parked at the approval gate, foreground the a/v hint.
     if awaiting {
         let spans = vec![
-            Span::styled(" plan awaiting approval — ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                " plan awaiting approval — ",
+                Style::default().fg(Color::Yellow),
+            ),
             Span::styled("a", Style::default().fg(Color::Green)),
             Span::styled(" approve · ", dim()),
             Span::styled("v", Style::default().fg(Color::Red)),
@@ -1400,7 +1401,10 @@ fn render_help(f: &mut Frame, area: Rect, g: Glyphs) {
         Line::raw(""),
         row("x".into(), "abort the run (confirm)"),
         row("r".into(), "retry the selected task (confirm)"),
-        row("a / v".into(), "approve / veto (while awaiting the plan gate)"),
+        row(
+            "a / v".into(),
+            "approve / veto (while awaiting the plan gate)",
+        ),
         Line::raw(""),
         row("?".into(), "toggle this help"),
         row("q · Esc · Ctrl-C".into(), "quit"),

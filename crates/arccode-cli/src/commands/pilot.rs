@@ -67,10 +67,7 @@ fn pick_run(run_id: Option<String>) -> Result<arccode_autonomous::dashboard::Run
     let project = ProjectPaths::discover(&std::env::current_dir()?);
     let runs = arccode_autonomous::dashboard::list_runs(&project.root).context("listing runs")?;
     if runs.is_empty() {
-        return Err(anyhow!(
-            "no runs found under {}",
-            project.root.display()
-        ));
+        return Err(anyhow!("no runs found under {}", project.root.display()));
     }
     match run_id {
         Some(id) => runs
