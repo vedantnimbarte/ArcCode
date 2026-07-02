@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use arccode_core::{AgentConfig, AgentEvent, AgentLoop, AgentStop, Provider};
+use arccode_core::{AgentConfig, AgentEvent, AgentLoop, AgentStop, Provider, Usage};
 use arccode_tools::{builtin, ToolCtx, ToolRegistry};
 use futures::StreamExt;
 use thiserror::Error;
@@ -134,11 +134,18 @@ pub fn render_state_block(state: &RunState) -> String {
 /// The manager's job in one tick is to make as many scheduling decisions
 /// as it can. With `max_turns = 32` and the orchestrator processing
 /// commands serially, a 3-task plan typically resolves in ~3 ticks.
-pub async fn run_tick(agent: &mut AgentLoop, prompt: String) -> Result<AgentStop, ManagerError> {
+pub async fn run_tick(
+    agent: &mut AgentLoop,
+    prompt: String,
+    usage: &mut Usage,
+) -> Result<AgentStop, ManagerError> {
     let mut stream = agent.run(prompt);
     let mut last_stop = AgentStop::EndTurn;
     while let Some(event) = stream.next().await {
         match event {
+            // Accumulate the manager's token usage — otherwise it's dropped
+            // and the run totals under-count the scheduling loop entirely.
+            AgentEvent::Usage { usage: u } => usage.add(&u),
             AgentEvent::Stop { reason } => {
                 last_stop = reason;
                 break;
@@ -159,16 +166,19 @@ pub async fn run_tick(agent: &mut AgentLoop, prompt: String) -> Result<AgentStop
 /// `max_ticks` is a safety belt — if the manager is looping fruitlessly
 /// we bail out rather than burn budget forever. Real cost limits come
 /// from [`crate::orchestrator::OrchestratorConfig`].
+/// Returns the manager loop's accumulated token [`Usage`] so the caller can
+/// attribute it in the run's per-phase token accounting.
 pub async fn drive_to_completion(
     agent: &mut AgentLoop,
     handle: &OrchestratorHandle,
     max_ticks: usize,
-) -> Result<(), ManagerError> {
+) -> Result<Usage, ManagerError> {
+    let mut usage = Usage::default();
     for tick in 0..max_ticks {
         let state = handle.snapshot().await?;
         if state.tasks.iter().all(|t| t.status.is_terminal()) {
             tracing::info!(target: "pilot::manager", tick, "all tasks terminal — exiting drive loop");
-            return Ok(());
+            return Ok(usage);
         }
         let prompt = format!(
             "{state_block}\n\n\
@@ -180,7 +190,7 @@ pub async fn drive_to_completion(
              reply with one line ('waiting') and end your turn.",
             state_block = render_state_block(&state),
         );
-        run_tick(agent, prompt).await?;
+        run_tick(agent, prompt, &mut usage).await?;
     }
     Err(ManagerError::Agent(format!(
         "drive_to_completion exceeded max_ticks={max_ticks} without converging"
