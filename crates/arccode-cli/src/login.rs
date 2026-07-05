@@ -32,29 +32,26 @@ async fn probe_payload(p: &LoginPayload) -> Result<(), String> {
 }
 
 async fn commit_payload(p: &LoginPayload) -> Result<(), String> {
-    // 1. Persist the API key to the OS keyring, if the provider has one.
-    if let Some(key) = p.api_key.as_deref() {
-        secrets::store(&p.provider_id, key).map_err(|e| format!("keyring: {e}"))?;
-    }
-
-    // 2. Determine whether a keyring marker should be written to the config.
-    //    For chatgpt the tokens are written directly by the OAuth runner, so
-    //    `api_key` is None in the payload — but the keychain entry exists.
-    let with_keyring =
-        p.api_key.is_some() || secrets::load(&p.provider_id).ok().flatten().is_some();
-
-    // 3. Update the global config file to point at this provider+model and
-    //    record either the keyring marker (for providers with a key) or the
-    //    custom base URL (for local providers).
     let path = global_config_path().map_err(|e| format!("config path: {e}"))?;
-    Config::set_default_provider_and_save(
+    Config::set_default_provider_and_save_with_key(
         &path,
         &p.provider_id,
         &p.model,
         p.base_url.as_deref(),
-        with_keyring,
+        p.api_key.as_deref(),
     )
     .map_err(|e| format!("save config: {e}"))?;
+
+    // Also try to store in the keyring in the background — non-blocking.
+    if let Some(key) = p.api_key.as_deref() {
+        let provider_id = p.provider_id.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = secrets::store(&provider_id, &key) {
+                eprintln!("[arccode] background keyring store failed: {e}");
+            }
+        });
+    }
 
     Ok(())
 }

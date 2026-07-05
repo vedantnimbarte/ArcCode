@@ -34,6 +34,7 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     pub fn new(api_key: impl Into<String>) -> Result<Self> {
         let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(600))
             .build()
             .map_err(|e| ArccodeError::Provider(format!("http client: {e}")))?;
@@ -63,6 +64,43 @@ impl Provider for AnthropicProvider {
             vision: true,
             cache_kind: CacheKind::Explicit,
         }
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>> {
+        // GET /v1/models -> { "data": [ { "id": "claude-…" }, … ] }.
+        let url = format!("{}/v1/models?limit=1000", self.base_url.trim_end_matches('/'));
+        let response = self
+            .http
+            .get(&url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| ArccodeError::Provider(format!("anthropic list models request: {e}")))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(ArccodeError::Provider(format!(
+                "anthropic /v1/models returned {status}: {text}"
+            )));
+        }
+
+        let json: Value = response
+            .json()
+            .await
+            .map_err(|e| ArccodeError::Provider(format!("anthropic list models parse: {e}")))?;
+        let ids: Vec<String> = json
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m.get("id").and_then(|s| s.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(ids)
     }
 
     async fn complete(&self, req: CompletionRequest) -> Result<ProviderEventStream> {

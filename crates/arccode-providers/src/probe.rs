@@ -16,7 +16,10 @@ use tokio::time::timeout;
 /// provider produces at least one stream event without erroring; otherwise
 /// returns a human-readable error.
 ///
-/// Bounded by a 20s timeout so a hung connection can't freeze the wizard.
+/// Uses separate timeouts for the initial HTTP request/response phase (30s)
+/// and the first stream event read (30s). The combined worst-case is 60s
+/// but each phase is individually bounded so a hung connection is detected
+/// quickly.
 pub async fn probe(provider: &dyn Provider, model: &str) -> Result<(), String> {
     let req = CompletionRequest {
         max_tokens: 8,
@@ -24,17 +27,16 @@ pub async fn probe(provider: &dyn Provider, model: &str) -> Result<(), String> {
         ..CompletionRequest::new(model)
     };
 
-    let fut = async move {
-        let mut stream = provider.complete(req).await.map_err(|e| format!("{e}"))?;
-        match stream.next().await {
-            Some(Ok(_)) => Ok(()),
-            Some(Err(e)) => Err(format!("{e}")),
-            None => Err("provider returned an empty stream".to_string()),
-        }
+    let mut stream = match timeout(Duration::from_secs(30), provider.complete(req)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(format!("{e}")),
+        Err(_) => return Err("connection timed out — check network / firewall".to_string()),
     };
 
-    match timeout(Duration::from_secs(20), fut).await {
-        Ok(res) => res,
-        Err(_) => Err("probe timed out after 20s".to_string()),
+    match timeout(Duration::from_secs(30), stream.next()).await {
+        Ok(Some(Ok(_))) => Ok(()),
+        Ok(Some(Err(e))) => Err(format!("{e}")),
+        Ok(None) => Err("provider returned an empty response stream".to_string()),
+        Err(_) => Err("provider connected but produced no output within 30s".to_string()),
     }
 }
