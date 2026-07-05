@@ -6,6 +6,7 @@
 //! into and out of this shape in `wingman-providers`.
 
 pub mod agent;
+pub mod checkpoint;
 pub mod error;
 pub mod message;
 pub mod pricing;
