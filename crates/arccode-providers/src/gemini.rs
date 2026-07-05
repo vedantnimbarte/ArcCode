@@ -35,6 +35,7 @@ pub struct GeminiProvider {
 impl GeminiProvider {
     pub fn new(api_key: impl Into<String>) -> Result<Self> {
         let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(600))
             .build()
             .map_err(|e| ArccodeError::Provider(format!("http client: {e}")))?;
@@ -64,6 +65,59 @@ impl Provider for GeminiProvider {
             vision: true,
             cache_kind: CacheKind::Cached,
         }
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>> {
+        // GET /v1beta/models -> { "models": [ { "name": "models/gemini-…",
+        // "supportedGenerationMethods": [...] }, … ] }. Key goes in the
+        // header (not `?key=`) so it can't leak into error/log URLs.
+        let url = format!(
+            "{}/{}/models?pageSize=1000",
+            self.base_url.trim_end_matches('/'),
+            API_VERSION,
+        );
+        let response = self
+            .http
+            .get(&url)
+            .header("accept", "application/json")
+            .header("x-goog-api-key", &self.api_key)
+            .send()
+            .await
+            .map_err(|e| ArccodeError::Provider(format!("gemini list models request: {e}")))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(ArccodeError::Provider(format!(
+                "gemini /models returned {status}: {text}"
+            )));
+        }
+
+        let json: Value = response
+            .json()
+            .await
+            .map_err(|e| ArccodeError::Provider(format!("gemini list models parse: {e}")))?;
+        let ids: Vec<String> = json
+            .get("models")
+            .and_then(|d| d.as_array())
+            .map(|a| {
+                a.iter()
+                    // Skip embedding / non-chat models.
+                    .filter(|m| {
+                        m.get("supportedGenerationMethods")
+                            .and_then(|v| v.as_array())
+                            .map(|methods| {
+                                methods.iter().any(|x| x.as_str() == Some("generateContent"))
+                            })
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|m| m.get("name").and_then(|s| s.as_str()))
+                    // `complete` builds `/models/{model}:…`, so store the bare id.
+                    .map(|name| name.strip_prefix("models/").unwrap_or(name).to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(ids)
     }
 
     async fn complete(&self, req: CompletionRequest) -> Result<ProviderEventStream> {

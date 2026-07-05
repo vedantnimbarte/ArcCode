@@ -73,4 +73,17 @@ pub trait Provider: Send + Sync {
     /// Issue a request and return a stream of `StreamEvent`s. The stream
     /// ends after a single `Stop` event.
     async fn complete(&self, req: CompletionRequest) -> Result<ProviderEventStream>;
+
+    /// List the model ids the provider currently advertises (e.g. via an
+    /// OpenAI-compatible `GET /models` endpoint). Used by the `/model`
+    /// picker to show a live catalog instead of a hardcoded one.
+    ///
+    /// The default returns an error so providers without a listing endpoint
+    /// fall back to the static catalog; providers that can enumerate models
+    /// override this.
+    async fn list_models(&self) -> Result<Vec<String>> {
+        Err(crate::ArccodeError::Provider(
+            "this provider does not support listing models".into(),
+        ))
+    }
 }

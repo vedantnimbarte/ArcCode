@@ -360,6 +360,7 @@ pub struct OpenAiCompatProvider {
 impl OpenAiCompatProvider {
     pub fn new(variant: Variant, api_key: Option<String>) -> Result<Self> {
         let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(600))
             .build()
             .map_err(|e| ArccodeError::Provider(format!("http client: {e}")))?;
@@ -419,6 +420,61 @@ impl Provider for OpenAiCompatProvider {
         }
     }
 
+    async fn list_models(&self) -> Result<Vec<String>> {
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let mut builder = self.http.get(&url).header("accept", "application/json");
+
+        // Same auth scheme as `complete`.
+        if let Some(key) = &self.api_key {
+            if !key.is_empty() {
+                if self.variant.uses_api_key_header() {
+                    builder = builder.header("api-key", key.as_str());
+                } else {
+                    builder = builder.header("authorization", format!("Bearer {key}"));
+                }
+            }
+        } else if self.variant.requires_api_key() {
+            return Err(ArccodeError::Provider(format!(
+                "provider {} requires an api_key",
+                self.variant.id()
+            )));
+        }
+        if matches!(self.variant, Variant::OpenRouter) {
+            builder = builder
+                .header("HTTP-Referer", "https://github.com/your-org/arccode")
+                .header("X-Title", "arccode");
+        }
+
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| ArccodeError::Provider(format!("list models request: {e}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(ArccodeError::Provider(format!(
+                "{} /models returned {status}: {text}",
+                self.variant.id()
+            )));
+        }
+
+        let json: Value = response
+            .json()
+            .await
+            .map_err(|e| ArccodeError::Provider(format!("list models parse: {e}")))?;
+        // Standard OpenAI shape: `{ "data": [ { "id": "…" }, … ] }`.
+        let ids: Vec<String> = json
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m.get("id").and_then(|s| s.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(ids)
+    }
+
     async fn complete(&self, req: CompletionRequest) -> Result<ProviderEventStream> {
         let body = build_request_body(&req);
         tracing::debug!(target: "arccode::openai_compat", "request: {body}");
@@ -459,6 +515,7 @@ impl Provider for OpenAiCompatProvider {
             .map_err(|e| ArccodeError::Provider(format!("request: {e}")))?;
 
         let status = response.status();
+
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
             return Err(ArccodeError::Provider(format!(
