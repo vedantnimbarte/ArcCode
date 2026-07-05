@@ -110,8 +110,8 @@ impl HelpModal {
                 Span::raw("Adjust temperature / max_tokens"),
             ]),
             Line::from(vec![
-                Span::styled("  /mode <m>      ", Style::default().fg(Color::Cyan)),
-                Span::raw("Change permission mode"),
+                Span::styled("  /mode [m]      ", Style::default().fg(Color::Cyan)),
+                Span::raw("Switch permission mode, or open a picker with no arg"),
             ]),
             Line::from(vec![
                 Span::styled("  /add <path>    ", Style::default().fg(Color::Cyan)),

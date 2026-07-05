@@ -29,8 +29,8 @@ use ratatui::{
 
 use crate::modal::{
     ActiveModal, FilePicker, HelpModal, LoginTask, LoginWizard, McpServerSummary, McpTask, McpView,
-    ModalOutcome, ModalTask, ModelPicker, ParamsModal, SessionEntry, SessionPicker, SkillsView,
-    UsageView,
+    ModalOutcome, ModalTask, ModePicker, ModelPicker, ParamsModal, SessionEntry, SessionPicker,
+    SkillsView, UsageView,
 };
 use crate::usage_store::LifetimeUsage;
 use crate::widgets::{
@@ -131,7 +131,7 @@ enum Cmd {
     Quit,
     Clear,
     Help,
-    Mode(String),
+    Mode(Option<String>),
     Model(Option<String>),
     Login,
     Logout(Option<String>),
@@ -169,7 +169,11 @@ fn parse_slash(line: &str) -> Cmd {
         "/quit" | "/exit" | "/q" => Cmd::Quit,
         "/clear" => Cmd::Clear,
         "/help" | "/?" => Cmd::Help,
-        "/mode" if !arg.is_empty() => Cmd::Mode(arg.to_string()),
+        "/mode" => Cmd::Mode(if arg.is_empty() {
+            None
+        } else {
+            Some(arg.to_string())
+        }),
         "/model" => Cmd::Model(if arg.is_empty() {
             None
         } else {
@@ -254,6 +258,25 @@ fn connected_provider_ids(active: &str) -> Vec<String> {
         ids.push(active.to_string());
     }
     ids
+}
+
+/// Apply a permission-mode selection to the status line. Validates and
+/// normalises `raw` via [`wingman_config::PermissionMode`]; on an unknown
+/// value it surfaces an error and leaves the current mode unchanged. Shared
+/// by the `/mode <name>` direct path and the `/mode` picker.
+fn apply_mode(ui: &mut UiState, raw: &str) {
+    match raw.parse::<wingman_config::PermissionMode>() {
+        Ok(mode) => {
+            let normalized = mode.to_string();
+            ui.status.mode = normalized.clone();
+            ui.transcript.push(TranscriptItem::System(format!(
+                "mode set to {normalized} (display only for now)"
+            )));
+        }
+        Err(e) => {
+            ui.transcript.push(TranscriptItem::Error(format!("/mode: {e}")));
+        }
+    }
 }
 
 fn load_user_command(name: &str) -> Option<String> {
@@ -616,6 +639,11 @@ async fn idle_step(
                                             );
                                         }
                                     }
+                                    ActiveModal::ModePicker(p) => {
+                                        if let Some(mode) = p.take_selected() {
+                                            apply_mode(ui, &mode);
+                                        }
+                                    }
                                     ActiveModal::Skills(v) => {
                                         if let Some(s) = v.take_selected() {
                                             ui.transcript.push(TranscriptItem::System(format!(
@@ -675,11 +703,12 @@ async fn idle_step(
                             Cmd::Clear => {
                                 ui.transcript.clear();
                             }
-                            Cmd::Mode(m) => {
-                                ui.status.mode = m.clone();
-                                ui.transcript.push(TranscriptItem::System(format!(
-                                    "(mode display set to {m}; live permission swap lands in M2)"
-                                )));
+                            Cmd::Mode(None) => {
+                                ui.modal =
+                                    ActiveModal::ModePicker(ModePicker::new(&ui.status.mode));
+                            }
+                            Cmd::Mode(Some(arg)) => {
+                                apply_mode(ui, &arg);
                             }
                             Cmd::Model(None) => {
                                 let connected = connected_provider_ids(&ui.status.provider);
@@ -1398,7 +1427,7 @@ fn help_text() -> String {
          /login, /connect            set up a provider in a guided wizard\n  \
          /logout [provider]          remove a stored API key\n  \
          /model [provider/model]     switch model, or open a picker with no arg\n  \
-         /mode <m>                   change display mode (read-only/auto-edit/yolo)\n  \
+         /mode [m]                   switch permission mode, or open a picker with no arg\n  \
          /add <path>                 attach a file to the next prompt\n  \
          /usage                      show per-model token + cost breakdown\n  \
          /skills                     browse and apply skills\n  \
