@@ -147,6 +147,13 @@ impl ToolDispatcher for ToolRegistry {
             }
         }
 
+        // Snapshot any files this tool is about to mutate, so /undo can
+        // restore them. Captured before the edit; persisted only on success.
+        let pres: Vec<_> = wingman_core::checkpoint::mutating_paths(name, &args)
+            .iter()
+            .map(|p| wingman_core::checkpoint::capture(&self.ctx.project_root, p))
+            .collect();
+
         // Clone the Arc out of the lock before awaiting so we don't hold
         // a guard across an `.await` (std::sync guards aren't Send).
         let tool = self
@@ -159,6 +166,10 @@ impl ToolDispatcher for ToolRegistry {
             Some(tool) => tool.run(args.clone(), &self.ctx).await,
             None => ToolOutcome::err(format!("unknown tool: {name}")),
         };
+
+        if !outcome.is_error && !pres.is_empty() {
+            wingman_core::checkpoint::commit(&self.ctx.project_root, pres);
+        }
 
         // Post-tool-use hooks: fire-and-forget; failures only logged.
         for hook in &self.hooks.post_tool_use {

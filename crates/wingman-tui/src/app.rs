@@ -130,6 +130,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 enum Cmd {
     Quit,
     Clear,
+    Undo(usize),
     Compact,
     Help,
     Mode(Option<String>),
@@ -172,6 +173,7 @@ fn parse_slash(line: &str) -> Cmd {
     match head {
         "/quit" | "/exit" | "/q" => Cmd::Quit,
         "/clear" => Cmd::Clear,
+        "/undo" => Cmd::Undo(arg.trim().parse().unwrap_or(1)),
         "/compact" => Cmd::Compact,
         "/help" | "/?" => Cmd::Help,
         "/mode" => Cmd::Mode(if arg.is_empty() {
@@ -734,6 +736,23 @@ async fn idle_step(
                             }
                             Cmd::Clear => {
                                 ui.transcript.clear();
+                            }
+                            Cmd::Undo(n) => {
+                                let mut done = 0;
+                                for _ in 0..n.max(1) {
+                                    match wingman_core::checkpoint::undo_last(project_root) {
+                                        Some(msg) => {
+                                            done += 1;
+                                            ui.transcript.push(TranscriptItem::System(msg));
+                                        }
+                                        None => break,
+                                    }
+                                }
+                                if done == 0 {
+                                    ui.transcript.push(TranscriptItem::System(
+                                        "nothing to undo".into(),
+                                    ));
+                                }
                             }
                             Cmd::Compact => match agent.as_mut() {
                                 Some(a) => {
