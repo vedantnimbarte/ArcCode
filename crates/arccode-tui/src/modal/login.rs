@@ -647,6 +647,7 @@ enum Stage {
     OAuthPending,
     /// OAuth: browser is open, waiting for the callback to complete.
     OAuthRunning,
+    #[allow(dead_code)]
     Testing,
     Committing,
     Done,
@@ -733,6 +734,11 @@ impl LoginWizard {
     /// Drain the pending async task.
     pub fn take_pending_task(&mut self) -> Option<LoginTask> {
         self.pending.take()
+    }
+
+    /// Non-draining peek: is an async task queued for the host to run?
+    pub fn has_pending_task(&self) -> bool {
+        self.pending.is_some()
     }
 
     /// Host reports completion of the most recently dispatched task.
@@ -858,15 +864,8 @@ impl LoginWizard {
                             self.error = Some("model required".into());
                             return ModalOutcome::Continue;
                         }
-                        // OAuth providers skip the probe — they already have a
-                        // valid token; go straight to Commit.
-                        if spec.needs_oauth {
-                            self.stage = Stage::Committing;
-                            self.pending = Some(LoginTask::Commit(self.payload()));
-                        } else {
-                            self.stage = Stage::Testing;
-                            self.pending = Some(LoginTask::Probe(self.payload()));
-                        }
+                        self.stage = Stage::Committing;
+                        self.pending = Some(LoginTask::Commit(self.payload()));
                     }
                 }
             }
@@ -906,14 +905,14 @@ impl LoginWizard {
 
     fn render_step(&self, area: Rect, buf: &mut Buffer) {
         let label = match self.stage {
-            Stage::PickProvider => "Step 1/4 · pick a provider",
-            Stage::EnterKey => "Step 2/4 · enter API key",
-            Stage::EnterBaseUrl => "Step 2/4 · base URL",
-            Stage::OAuthPending => "Step 2/4 · authenticate via browser",
-            Stage::OAuthRunning => "Step 2/4 · browser authentication in progress",
-            Stage::EnterModel => "Step 3/4 · pick model",
-            Stage::Testing => "Step 4/4 · testing connection",
-            Stage::Committing => "Step 4/4 · saving",
+            Stage::PickProvider => "Step 1/3 · pick a provider",
+            Stage::EnterKey => "Step 2/3 · enter API key",
+            Stage::EnterBaseUrl => "Step 2/3 · base URL",
+            Stage::OAuthPending => "Step 2/3 · authenticate via browser",
+            Stage::OAuthRunning => "Step 2/3 · browser authentication in progress",
+            Stage::EnterModel => "Step 3/3 · pick model",
+            Stage::Testing => "testing connection",
+            Stage::Committing => "saving",
             Stage::Done => "Done",
         };
         Paragraph::new(Line::from(Span::styled(
@@ -1011,14 +1010,14 @@ impl LoginWizard {
             }
             Stage::Committing => {
                 Paragraph::new(Line::from(Span::styled(
-                    "Saving credentials and building agent…",
+                    "Saving credentials…",
                     Style::default().fg(Color::Yellow),
                 )))
                 .render(area, buf);
             }
             Stage::Done => {
                 Paragraph::new(Line::from(Span::styled(
-                    "Connected.",
+                    "Saved.",
                     Style::default().fg(Color::Green),
                 )))
                 .render(area, buf);

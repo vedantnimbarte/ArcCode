@@ -570,7 +570,20 @@ impl Config {
         base_url: Option<&str>,
         with_keyring: bool,
     ) -> Result<(), ConfigError> {
-        Self::write_provider_layer(path, provider_id, model, base_url, with_keyring, true)
+        Self::write_provider_layer(path, provider_id, model, base_url, None, with_keyring, true)
+    }
+
+    /// Like above but also stores a plaintext api_key in the config layer
+    /// (used when the keyring is unavailable or when the caller wants to
+    /// skip the keyring for speed).
+    pub fn set_default_provider_and_save_with_key(
+        path: &Path,
+        provider_id: &str,
+        model: &str,
+        base_url: Option<&str>,
+        api_key: Option<&str>,
+    ) -> Result<(), ConfigError> {
+        Self::write_provider_layer(path, provider_id, model, base_url, api_key, false, true)
     }
 
     /// Persist a single provider's model / base URL / keyring marker to the
@@ -584,7 +597,7 @@ impl Config {
         base_url: Option<&str>,
         with_keyring: bool,
     ) -> Result<(), ConfigError> {
-        Self::write_provider_layer(path, provider_id, model, base_url, with_keyring, false)
+        Self::write_provider_layer(path, provider_id, model, base_url, None, with_keyring, false)
     }
 
     /// Shared implementation for the two `*_provider_and_save` entry points.
@@ -595,6 +608,7 @@ impl Config {
         provider_id: &str,
         model: &str,
         base_url: Option<&str>,
+        api_key: Option<&str>,
         with_keyring: bool,
         set_default: bool,
     ) -> Result<(), ConfigError> {
@@ -622,7 +636,9 @@ impl Config {
         if let Some(url) = base_url {
             entry.base_url = Some(url.to_string());
         }
-        if with_keyring {
+        if let Some(key) = api_key {
+            entry.api_key = Some(key.to_string());
+        } else if with_keyring {
             entry.api_key = Some(format!("keyring:{provider_id}"));
         }
 
