@@ -17,6 +17,7 @@ pub mod file_picker;
 pub mod help;
 pub mod login;
 pub mod mcp;
+pub mod mode_picker;
 pub mod model_picker;
 pub mod params;
 pub mod session_picker;
@@ -29,6 +30,7 @@ pub use file_picker::FilePicker;
 pub use help::HelpModal;
 pub use login::{LoginPayload, LoginTask, LoginWizard};
 pub use mcp::{McpAddPayload, McpServerSummary, McpTask, McpView};
+pub use mode_picker::ModePicker;
 pub use model_picker::{ModelChoice, ModelPicker};
 pub use params::ParamsModal;
 pub use session_picker::{SessionEntry, SessionPicker};
@@ -66,6 +68,7 @@ pub enum ActiveModal {
     Login(LoginWizard),
     FilePicker(FilePicker),
     ModelPicker(ModelPicker),
+    ModePicker(ModePicker),
     Usage(UsageView),
     Skills(SkillsView),
     Mcp(McpView),
@@ -87,6 +90,7 @@ impl ActiveModal {
             Self::Login(w) => w.handle_key(key),
             Self::FilePicker(p) => p.handle_key(key),
             Self::ModelPicker(p) => p.handle_key(key),
+            Self::ModePicker(p) => p.handle_key(key),
             Self::Usage(v) => v.handle_key(key),
             Self::Skills(v) => v.handle_key(key),
             Self::Mcp(v) => v.handle_key(key),
@@ -105,6 +109,7 @@ impl ActiveModal {
             Self::Login(w) => w.take_pending_task().map(ModalTask::Login),
             Self::FilePicker(_) => None,
             Self::ModelPicker(p) => p.take_pending_task().map(ModalTask::Models),
+            Self::ModePicker(_) => None,
             Self::Usage(_) => None,
             Self::Skills(_) => None,
             Self::Mcp(v) => v.take_pending_task().map(ModalTask::Mcp),
@@ -135,6 +140,7 @@ impl ActiveModal {
             Self::Login(w) => w.task_completed(result),
             Self::FilePicker(_) => {}
             Self::ModelPicker(_) => {}
+            Self::ModePicker(_) => {}
             Self::Usage(_) => {}
             Self::Skills(_) => {}
             Self::Mcp(v) => v.task_completed(result),
@@ -152,6 +158,7 @@ impl ActiveModal {
             Self::Login(w) => w.render(area, buf),
             Self::FilePicker(p) => p.render(area, buf),
             Self::ModelPicker(p) => p.render(area, buf),
+            Self::ModePicker(p) => p.render(area, buf),
             Self::Usage(v) => v.render(area, buf),
             Self::Skills(v) => v.render(area, buf),
             Self::Mcp(v) => v.render(area, buf),

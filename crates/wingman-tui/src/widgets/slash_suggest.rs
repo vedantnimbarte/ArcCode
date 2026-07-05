@@ -41,7 +41,7 @@ pub const CATALOG: &[Command] = &[
     },
     Command {
         name: "/mode",
-        description: "permission mode (read-only / auto-edit / yolo)",
+        description: "switch permission mode · empty arg opens the picker",
     },
     Command {
         name: "/add",
