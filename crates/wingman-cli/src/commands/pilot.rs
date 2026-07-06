@@ -393,6 +393,7 @@ pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
         use_real_worktrees: true,
         max_usd: pilot.max_usd,
         max_retries_per_task: 1,
+        enforce_checkpoint_hygiene: capability_on(&pilot, "checkpoint_hygiene"),
     };
     let stats_path = wingman_config::global_dir()
         .ok()
@@ -600,6 +601,8 @@ fn capability_on(pilot: &wingman_config::PilotConfig, key: &str) -> bool {
     match key {
         // Per-task reviewer (E7): on for copilot and autopilot.
         "per_task_reviewer" => matches!(pilot.tier, Copilot | Autopilot),
+        // Mandatory checkpoint hygiene (E11): on for copilot and autopilot.
+        "checkpoint_hygiene" => matches!(pilot.tier, Copilot | Autopilot),
         // Critic (J10): autopilot-only by default.
         "critic" => matches!(pilot.tier, Autopilot),
         // Goal refinement / negotiation (J1): autopilot-only by default.
@@ -1046,6 +1049,7 @@ pub async fn resume(
         use_real_worktrees: true,
         max_usd: cfg.pilot.max_usd,
         max_retries_per_task: 1,
+        enforce_checkpoint_hygiene: capability_on(&cfg.pilot, "checkpoint_hygiene"),
     };
     let stats_path = wingman_config::global_dir()
         .ok()

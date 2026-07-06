@@ -1433,6 +1433,7 @@ mod tests {
                 use_real_worktrees: true,
                 max_usd: 0.0,
                 max_retries_per_task: 0,
+                enforce_checkpoint_hygiene: false,
             },
             max_ticks: 32,
             tier: wingman_config::PilotTier::Copilot,
