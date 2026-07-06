@@ -564,7 +564,21 @@ fn report_run_outcome(
     };
     match route(severity, cfg) {
         RoutingDecision::Immediate(channels) => {
-            eprintln!("[pilot] 🔔 ({}) {body}", channels.join(","));
+            // Only the terminal is actually delivered today; Slack/email
+            // transports need live accounts (a deferred leaf). Print the
+            // notice to the terminal and, if the routing targeted channels we
+            // can't yet deliver to, say so plainly rather than implying we
+            // sent it there.
+            eprintln!("[pilot] 🔔 {body}");
+            let undelivered: Vec<&String> = channels
+                .iter()
+                .filter(|c| !matches!(c.as_str(), "desktop" | "terminal"))
+                .collect();
+            if !undelivered.is_empty() {
+                eprintln!(
+                    "[pilot]    (routed to {undelivered:?}, but those transports aren't wired yet — shown here instead)"
+                );
+            }
         }
         RoutingDecision::Digest => {
             let path = project_root.join(".wingman").join("pilot-digest.jsonl");
@@ -1329,6 +1343,19 @@ pub async fn daemon(cfg: Config, cycles: usize) -> Result<ExitCode> {
              or pass `--cycles N` for a one-shot discovery pass."
         );
         return Ok(ExitCode::from(1));
+    }
+
+    // Honesty check: only `github_issues` has a live discovery path. Warn
+    // (don't fail) for any configured source we can't actually poll, so the
+    // daemon doesn't look broken when it silently finds nothing.
+    const IMPLEMENTED_SOURCES: &[&str] = &["github_issues"];
+    for s in &pilot.daemon.sources {
+        if !IMPLEMENTED_SOURCES.contains(&s.as_str()) {
+            eprintln!(
+                "[pilot] daemon: source '{s}' is configured but not yet implemented — ignoring it \
+                 (implemented: {IMPLEMENTED_SOURCES:?})."
+            );
+        }
     }
 
     let project = ProjectPaths::discover(&std::env::current_dir()?);

@@ -180,9 +180,22 @@ assist     You approve every decision. Agent plans, you confirm, agent executes
 copilot    Default. Agent flies; you monitor and intervene at decision points.
            Trust-tiered approval, self-healing retries, per-task reviewer,
            real verification, PR automation, cross-run learning.
-autopilot  Agent flies and navigates. Daemon mode, multi-channel intake,
-           critic agent, knowledge graph, tool synthesis, sandboxed execution.
+autopilot  (experimental) Agent flies and navigates. Daemon mode, critic
+           agent, knowledge graph, tool synthesis, sandboxed execution.
+           Several autopilot capabilities are partial — see Maturity below.
 ```
+
+> **Maturity.** `assist` and `copilot` are the supported tiers. Pilot mode
+> has been validated by unit tests but **not yet run end-to-end against a
+> live provider** — do a smoke run on a throwaway goal before relying on it.
+> `autopilot` is experimental and ships with known gaps: the discovery
+> daemon polls **GitHub issues only** (`ci_failures` / `dependabot` /
+> `todos` / `coverage_gaps` are planned, not implemented); Slack/email
+> intake and notification transports are not wired (notices print to the
+> terminal); voice intake needs audio hardware. Auto-dispatch
+> (`[pilot.daemon].auto_dispatch`) opens real PRs autonomously and is
+> off by default — tune your trust config and dry-run with `daemon
+> --cycles 1` before enabling it.
 
 Pick a tier in `~/.wingman/config.toml`:
 
@@ -237,9 +250,12 @@ squash-merge, gh PR creation, dashboard, cost-cap enforcement, and the
 provider-support gate). On top of that, the crate now ships the
 `copilot`/`autopilot` machinery: a live control channel (`approve` /
 `veto` / `abort` / `retry`), run `resume`, a per-run plan-approval gate,
-sandbox tiers (`host` / `container` / `vm`), and the always-on discovery
-`daemon`. End-to-end runs against the providers below need real API keys
-and are user-validated rather than CI-validated for now.
+sandbox tiers (`host` / `container` / `vm`, degrading to `host` when no
+Docker daemon is present), and the always-on discovery `daemon` (GitHub
+issues). End-to-end runs against the providers below need real API keys
+and are **user-validated, not CI-validated** — see Maturity above before
+launching. `autopilot`-only extras (multi-source discovery, Slack/email
+transports, voice) are partial or unimplemented.
 
 ### Provider support for pilot mode
 
@@ -411,28 +427,51 @@ mapper functions in `runtime.rs` + `login.rs`.
 
 ## Installation
 
-### Prerequisites
+### Quick install (prebuilt binary — no Rust needed)
 
-- Rust 1.80 or later (uses 2021 edition; pinned in `Cargo.toml`).
-- A working C toolchain for some transitive crates.
-- (Optional) An API key for the provider(s) you intend to use.
+**macOS / Linux:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vedantnimbarte/Wingman/main/scripts/install.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/vedantnimbarte/Wingman/main/scripts/install.ps1 | iex
+```
+
+This downloads the `wingman` binary for your platform from the latest
+[GitHub Release](https://github.com/vedantnimbarte/Wingman/releases) and puts
+it on your `PATH` (default `~/.local/bin`; override with
+`WINGMAN_INSTALL_DIR`, pin a tag with `VERSION=v0.1.0`). Then run
+`wingman --help`.
+
+Supported prebuilt targets: Linux x86_64/aarch64 (musl), macOS
+x86_64/Apple-silicon, Windows x86_64.
+
+### With Rust already installed
+
+```bash
+cargo install --git https://github.com/vedantnimbarte/Wingman wingman-cli
+```
 
 ### Build from source
 
 ```bash
 git clone git@github.com:vedantnimbarte/Wingman.git
 cd Wingman
-cargo build --release
+cargo build --release        # binary at target/release/wingman
+cargo install --path crates/wingman-cli   # or install onto PATH
 ```
 
-The resulting binary is at `target/release/wingman` (or `wingman.exe` on
-Windows).
+Prerequisites for building: Rust 1.80+ and a C toolchain for some transitive
+crates. (Optional) an API key for the provider(s) you use.
 
-To install onto your `PATH`:
-
-```bash
-cargo install --path crates/wingman-cli
-```
+> **Maintainers:** the prebuilt binaries are produced by
+> `.github/workflows/release.yml` on every `v*` tag — `git tag v0.1.0 && git
+> push origin v0.1.0` builds and publishes the assets the install scripts
+> download.
 
 ---
 

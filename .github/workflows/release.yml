@@ -1,0 +1,55 @@
+name: release
+
+# Build prebuilt `wingman` binaries for every supported platform and attach
+# them to the GitHub Release whenever a `v*` tag is pushed. The install
+# script (`scripts/install.sh`) downloads these assets, so users never have
+# to clone or run cargo themselves.
+#
+#   git tag v0.0.1 && git push origin v0.0.1
+#
+# produces assets named  wingman-<target>.tar.gz  (and .zip on Windows).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # required to upload assets to the release
+
+jobs:
+  upload-assets:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # taiki-e's action builds the binary (using `cross` for the musl
+      # cross-compile targets), archives it, generates a SHA256 checksum, and
+      # uploads everything to the release for this tag. `archive` fixes the
+      # asset name so install.sh can predict the download URL.
+      - name: Build and upload
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: wingman
+          target: ${{ matrix.target }}
+          archive: wingman-$target
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}
