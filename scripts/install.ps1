@@ -5,7 +5,7 @@
 #
 # Environment overrides:
 #   $env:WINGMAN_INSTALL_DIR   install location  (default: %LOCALAPPDATA%\Programs\wingman)
-#   $env:VERSION               pin a release tag (default: latest, e.g. v0.0.1)
+#   $env:VERSION               pin a release tag (default: latest, e.g. v0.1.0)
 
 $ErrorActionPreference = "Stop"
 

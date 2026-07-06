@@ -6,7 +6,7 @@
 #
 # Environment overrides:
 #   WINGMAN_INSTALL_DIR   where to put the binary   (default: $HOME/.local/bin)
-#   VERSION               pin a release tag         (default: latest, e.g. v0.0.1)
+#   VERSION               pin a release tag         (default: latest, e.g. v0.1.0)
 #   DRY_RUN=1             print the resolved target + URL and exit (no download)
 set -eu
 

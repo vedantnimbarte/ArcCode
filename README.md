@@ -444,7 +444,7 @@ irm https://raw.githubusercontent.com/vedantnimbarte/Wingman/main/scripts/instal
 This downloads the `wingman` binary for your platform from the latest
 [GitHub Release](https://github.com/vedantnimbarte/Wingman/releases) and puts
 it on your `PATH` (default `~/.local/bin`; override with
-`WINGMAN_INSTALL_DIR`, pin a tag with `VERSION=v0.0.1`). Then run
+`WINGMAN_INSTALL_DIR`, pin a tag with `VERSION=v0.1.0`). Then run
 `wingman --help`.
 
 Supported prebuilt targets: Linux x86_64/aarch64 (musl), macOS
@@ -469,8 +469,8 @@ Prerequisites for building: Rust 1.80+ and a C toolchain for some transitive
 crates. (Optional) an API key for the provider(s) you use.
 
 > **Maintainers:** the prebuilt binaries are produced by
-> `.github/workflows/release.yml` on every `v*` tag — `git tag v0.0.1 && git
-> push origin v0.0.1` builds and publishes the assets the install scripts
+> `.github/workflows/release.yml` on every `v*` tag — `git tag v0.1.0 && git
+> push origin v0.1.0` builds and publishes the assets the install scripts
 > download.
 
 ---
