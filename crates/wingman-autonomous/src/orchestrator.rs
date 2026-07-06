@@ -62,6 +62,8 @@ pub enum OrchestratorError {
     Spawn(String),
     #[error("task {0} failed checkpoint hygiene: {1}")]
     CheckpointViolation(String, String),
+    #[error("task {0} sent back for rework by the inline reviewer (E7)")]
+    ReviewRework(String),
     #[error("invalid task graph: {0}")]
     InvalidDag(String),
 }
@@ -122,6 +124,16 @@ pub type TaskSplitter = Arc<
             -> Pin<Box<dyn Future<Output = Result<Vec<NewTaskSpec>, OrchestratorError>> + Send>>
         + Send
         + Sync,
+>;
+
+/// E7 — per-task inline reviewer (E7). Given a task that just reached
+/// `Review`, returns `None` to approve it (finalize proceeds to `Done`) or
+/// `Some(notes)` to send it back for rework. The block-gate severity logic
+/// lives inside the closure (built in the pipeline from `pr` config), so the
+/// orchestrator stays config-agnostic. Runs at the finalize choke point so it
+/// can't race the manager. `None` reviewer disables inline review.
+pub type Reviewer = Arc<
+    dyn Fn(Task) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync,
 >;
 
 /// Per-spawn context handed to a [`WorkerSpawner`].
@@ -396,6 +408,18 @@ pub fn spawn_with_splitter(
     spawner: WorkerSpawner,
     splitter: Option<TaskSplitter>,
 ) -> (OrchestratorHandle, tokio::task::JoinHandle<()>) {
+    spawn_full(store, cfg, spawner, splitter, None)
+}
+
+/// Fullest [`spawn`] variant: register both a [`TaskSplitter`] (E5 rung 3)
+/// and an inline [`Reviewer`] (E7). Either `None` disables that feature.
+pub fn spawn_full(
+    store: RunStore,
+    cfg: OrchestratorConfig,
+    spawner: WorkerSpawner,
+    splitter: Option<TaskSplitter>,
+    reviewer: Option<Reviewer>,
+) -> (OrchestratorHandle, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(64);
     let handle = OrchestratorHandle { tx: tx.clone() };
     let budget_rx = store.subscribe();
@@ -440,7 +464,7 @@ pub fn spawn_with_splitter(
         drop(retry_rx);
     }
 
-    let join = tokio::spawn(run_actor(store, cfg, spawner, splitter, rx));
+    let join = tokio::spawn(run_actor(store, cfg, spawner, splitter, reviewer, rx));
     (handle, join)
 }
 
@@ -561,6 +585,7 @@ async fn run_actor(
     cfg: OrchestratorConfig,
     spawner: WorkerSpawner,
     splitter: Option<TaskSplitter>,
+    reviewer: Option<Reviewer>,
     mut rx: mpsc::Receiver<OrchestratorCommand>,
 ) {
     // Track active worker tasks so we can enforce the concurrency cap and
@@ -631,6 +656,7 @@ async fn run_actor(
                     &task_id,
                     merge_commit,
                     cfg.enforce_checkpoint_hygiene,
+                    reviewer.as_ref(),
                 )
                 .await;
                 let _ = reply.send(result);
@@ -1216,36 +1242,69 @@ async fn handle_finalize(
     task_id: &str,
     merge_commit: Option<String>,
     enforce_checkpoint_hygiene: bool,
+    reviewer: Option<&Reviewer>,
 ) -> Result<(), OrchestratorError> {
-    let mut store = store.lock().await;
-    let task = store
-        .state()
-        .task(task_id)
-        .ok_or_else(|| OrchestratorError::UnknownTask(task_id.to_string()))?;
-    if task.status != TaskStatus::Review {
-        return Err(OrchestratorError::BadTransition(
-            task_id.to_string(),
-            task.status,
-            "finalize",
-        ));
-    }
-    // E11 hard gate — a Review task may not become Done until its recorded
-    // tool stream satisfies checkpoint hygiene. Rejecting finalize leaves the
-    // task in Review so the manager reworks it instead of merging unchecked
-    // multi-file work. Same `checkpoint::verify` the advisory pipeline pass
-    // uses — one shared verdict, enforced here.
-    if enforce_checkpoint_hygiene {
-        let events = store.read_events().await.unwrap_or_default();
-        let calls = crate::checkpoint::tool_calls_for_task(&events, task_id);
-        if let crate::checkpoint::CheckpointVerdict::Violation { reason } =
-            crate::checkpoint::verify(&calls)
-        {
-            return Err(OrchestratorError::CheckpointViolation(
+    // Phase 1 — validate the transition + E11 gate under the lock, and clone
+    // the task for the (async, lock-free) reviewer call.
+    let task = {
+        let store = store.lock().await;
+        let task = store
+            .state()
+            .task(task_id)
+            .ok_or_else(|| OrchestratorError::UnknownTask(task_id.to_string()))?
+            .clone();
+        if task.status != TaskStatus::Review {
+            return Err(OrchestratorError::BadTransition(
                 task_id.to_string(),
-                reason,
+                task.status,
+                "finalize",
             ));
         }
+        // E11 hard gate — a Review task may not become Done until its recorded
+        // tool stream satisfies checkpoint hygiene. Rejecting finalize leaves
+        // the task in Review so the manager reworks it instead of merging
+        // unchecked multi-file work. Same `checkpoint::verify` the advisory
+        // pipeline pass uses — one shared verdict, enforced here.
+        if enforce_checkpoint_hygiene {
+            let events = store.read_events().await.unwrap_or_default();
+            let calls = crate::checkpoint::tool_calls_for_task(&events, task_id);
+            if let crate::checkpoint::CheckpointVerdict::Violation { reason } =
+                crate::checkpoint::verify(&calls)
+            {
+                return Err(OrchestratorError::CheckpointViolation(
+                    task_id.to_string(),
+                    reason,
+                ));
+            }
+        }
+        task
+    };
+
+    // Phase 2 — E7 inline reviewer at the finalize choke point (race-free vs
+    // the manager). A rework verdict marks the task Failed with the reviewer's
+    // notes as the outcome summary, which the retry watchdog picks up and
+    // threads into the next attempt's failure history (bounded by
+    // max_retries). No new rework channel — it reuses the E5 ladder.
+    if let Some(reviewer) = reviewer {
+        if let Some(notes) = reviewer(task.clone()).await {
+            let mut store = store.lock().await;
+            store
+                .append(Event::TaskStatus {
+                    t: RunStore::now(),
+                    id: task_id.to_string(),
+                    status: TaskStatus::Failed,
+                    outcome: Some(crate::model::TaskOutcome {
+                        summary: format!("reviewer requested rework: {notes}"),
+                        files_changed: Vec::new(),
+                    }),
+                })
+                .await?;
+            return Err(OrchestratorError::ReviewRework(task_id.to_string()));
+        }
     }
+
+    // Phase 3 — approved: commit the Done/merge transition under the lock.
+    let mut store = store.lock().await;
     if let Some(sha) = merge_commit {
         store
             .append(Event::RunMergeTask {
@@ -2436,6 +2495,84 @@ mod tests {
             }
             other => panic!("expected BadTransition, got {other:?}"),
         }
+        handle.shutdown().await;
+        let _ = join.await;
+    }
+
+    /// E7 — an inline reviewer that requests rework makes finalize fail and
+    /// bounces the task to Failed (which the retry ladder then re-runs). An
+    /// approving reviewer lets it reach Done.
+    #[tokio::test]
+    async fn e7_inline_reviewer_reworks_on_finalize() {
+        async fn seed_review(dir: &std::path::Path) -> RunStore {
+            let mut store = RunStore::create(
+                dir.join(".wingman/autonomous/e7-run"),
+                "e7-run",
+                "g",
+                "abc",
+                "wingman/auto/e7-run",
+            )
+            .await
+            .unwrap();
+            for ev in [
+                Event::TaskCreate {
+                    t: RunStore::now(),
+                    id: "t1".into(),
+                    role: Role::Developer,
+                    title: "t1".into(),
+                    goal: String::new(),
+                    deps: vec![],
+                    writes: vec![],
+                    acceptance: vec![],
+                    reversibility: Default::default(),
+                    reversibility_reason: None,
+                },
+                Event::TaskStatus {
+                    t: RunStore::now(),
+                    id: "t1".into(),
+                    status: TaskStatus::InProgress,
+                    outcome: None,
+                },
+                Event::TaskStatus {
+                    t: RunStore::now(),
+                    id: "t1".into(),
+                    status: TaskStatus::Review,
+                    outcome: None,
+                },
+            ] {
+                store.append(ev).await.unwrap();
+            }
+            store
+        }
+
+        // Reviewer that always requests rework.
+        let rework: Reviewer = std::sync::Arc::new(|_task| {
+            Box::pin(async { Some("add tests".to_string()) })
+        });
+        let dir = tempdir().unwrap();
+        let store = seed_review(dir.path()).await;
+        let (handle, join) =
+            spawn_full(store, cfg(dir.path().to_path_buf()), fake_happy_spawner(), None, Some(rework));
+        let err = handle.finalize_task("t1", None).await.unwrap_err();
+        assert!(matches!(err, OrchestratorError::ReviewRework(ref id) if id == "t1"), "got {err:?}");
+        // The rework bounced it to Failed with the reviewer notes as summary.
+        let t = handle.snapshot().await.unwrap().task("t1").unwrap().clone();
+        assert_eq!(t.status, TaskStatus::Failed);
+        assert!(t.outcome.unwrap().summary.contains("add tests"));
+        handle.shutdown().await;
+        let _ = join.await;
+
+        // Approving reviewer lets the same task finalize to Done.
+        let approve: Reviewer = std::sync::Arc::new(|_task| Box::pin(async { None }));
+        let dir = tempdir().unwrap();
+        let store = seed_review(dir.path()).await;
+        let (handle, join) =
+            spawn_full(store, cfg(dir.path().to_path_buf()), fake_happy_spawner(), None, Some(approve));
+        handle.finalize_task("t1", None).await.unwrap();
+        assert_eq!(
+            handle.snapshot().await.unwrap().task("t1").unwrap().status,
+            TaskStatus::Done
+        );
         handle.shutdown().await;
         let _ = join.await;
     }

@@ -139,11 +139,39 @@ pub async fn run_to_completion(
     // cost trigger needs the cap at run end.
     let max_usd = inputs.orchestrator_cfg.max_usd;
 
-    let (handle, join) = orchestrator::spawn(store, inputs.orchestrator_cfg, inputs.worker_spawner);
-
-    // Keep a handle to the provider for the post-run reviewer (E7) and
-    // critic (J10) passes — `build_manager` consumes the original Arc.
+    // Keep a handle to the provider for the post-run critic (J10) pass and
+    // the E7 inline reviewer — `build_manager` consumes the original Arc.
     let aux_provider = inputs.provider.clone();
+
+    // E7 — build the inline reviewer that gates each task's finalize. When
+    // set, `run_reviewer` runs the reviewer at the Review→Done choke point
+    // (race-free vs the manager) and sends rework verdicts back through the
+    // retry ladder, instead of a batched post-run pass.
+    let reviewer: Option<orchestrator::Reviewer> = if inputs.run_reviewer {
+        let provider = aux_provider.clone();
+        let model = inputs.reviewer_model.clone();
+        let gate = inputs
+            .pr_config
+            .auto_merge_max_severity
+            .parse::<crate::severity::Severity>()
+            .unwrap_or(crate::severity::Severity::Medium);
+        Some(std::sync::Arc::new(move |task: crate::model::Task| {
+            let provider = provider.clone();
+            let model = model.clone();
+            Box::pin(async move { review_task_inline(provider.as_ref(), &model, &task, gate).await })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
+        }))
+    } else {
+        None
+    };
+
+    let (handle, join) = orchestrator::spawn_full(
+        store,
+        inputs.orchestrator_cfg,
+        inputs.worker_spawner,
+        None,
+        reviewer,
+    );
 
     // Drive the manager loop. Manager system prompt is loaded inside
     // build_manager; the per-tick state block is injected by
@@ -424,29 +452,18 @@ pub async fn run_to_completion(
         );
     }
 
-    // E7 — per-task reviewer pass (opt-in). Runs a reviewer agent per
-    // task and records its verdict; the worst finding severity feeds the
-    // auto-merge gate.
-    let mut reviewer_usage = wingman_core::Usage::default();
-    let reviews = if inputs.run_reviewer {
-        run_reviewer_pass(
-            aux_provider.as_ref(),
-            &inputs.reviewer_model,
-            &snapshot_for_pr,
-            &mut reviewer_usage,
-        )
-        .await
-    } else {
-        Vec::new()
-    };
-    record_phase_usage(&mut store, "reviewer", &reviewer_usage).await;
-    let review_max_severity = reviews
-        .iter()
-        .filter_map(|(_, v)| match v {
-            crate::review::Verdict::Rework => Some(crate::severity::Severity::High),
-            crate::review::Verdict::Approve => None,
-        })
-        .max();
+    // E7 — the per-task reviewer now runs INLINE at each task's finalize
+    // choke point (see the `reviewer` closure + `spawn_full` above), so a
+    // rework verdict bounces the task back through the retry ladder during
+    // the run instead of only annotating the gate afterward. By the time a
+    // task is Done here it has already passed inline review, so there's no
+    // separate post-run pass and the gate's review severity is None.
+    // ponytail: a task that was batch-finalized by the pipeline (rather than
+    // the manager calling finalize_task) skips the inline gate — that path is
+    // only hit when the manager never finalized incrementally, which the
+    // common flow avoids.
+    let reviews: Vec<(String, crate::review::Verdict)> = Vec::new();
+    let review_max_severity: Option<crate::severity::Severity> = None;
 
     // J10 — critic pass (opt-in). A high+ risk vetoes auto-merge.
     let mut critic_usage = wingman_core::Usage::default();
@@ -828,53 +845,44 @@ fn extract_json(s: &str) -> &str {
 /// E7 — run a reviewer agent per task and collect verdicts. Parse
 /// failures default to Approve (a broken reviewer must not wedge the run);
 /// the orchestrator still has the security + critic gates.
-async fn run_reviewer_pass(
+/// E7 — review one task inline at its finalize choke point. Returns
+/// `Some(rework_notes)` when the task should go back for rework (verdict
+/// Rework, or a finding at/above `block_gate`), or `None` to approve. A
+/// call/parse failure defaults to approve (fail-open, same as the post-run
+/// pass) so a flaky reviewer can't wedge the run.
+async fn review_task_inline(
     provider: &dyn Provider,
     model: &str,
-    state: &crate::model::RunState,
-    usage: &mut wingman_core::Usage,
-) -> Vec<(String, crate::review::Verdict)> {
+    task: &crate::model::Task,
+    block_gate: crate::severity::Severity,
+) -> Option<String> {
     const SYSTEM: &str = "You are a meticulous code reviewer. Review the described task's \
         diff and reply with ONLY a JSON object: {\"verdict\":\"approve\"|\"rework\", \
         \"summary\":\"...\", \"findings\":[{\"severity\":\"low|medium|high|critical\", \
         \"message\":\"...\"}]}.";
-    let mut out = Vec::new();
-    for task in &state.tasks {
-        if !matches!(task.status, TaskStatus::Done | TaskStatus::Review) {
-            continue;
-        }
-        let summary = task
-            .outcome
+    let summary = task
+        .outcome
+        .as_ref()
+        .map(|o| o.summary.as_str())
+        .unwrap_or("(no summary)");
+    let user = format!(
+        "Task #{}: {}\nRole: {}\nOutcome: {}\nFiles: {}",
+        task.id,
+        task.title,
+        task.role.as_str(),
+        summary,
+        task.outcome
             .as_ref()
-            .map(|o| o.summary.as_str())
-            .unwrap_or("(no summary)");
-        let user = format!(
-            "Task #{}: {}\nRole: {}\nOutcome: {}\nFiles: {}",
-            task.id,
-            task.title,
-            task.role.as_str(),
-            summary,
-            task.outcome
-                .as_ref()
-                .map(|o| o.files_changed.join(", "))
-                .unwrap_or_default()
-        );
-        let verdict = match complete_text(provider, model, SYSTEM, &user).await {
-            Ok((text, u)) => {
-                usage.add(&u);
-                match crate::review::parse_review(extract_json(&text)) {
-                    Ok(report) => report.verdict,
-                    Err(_) => crate::review::Verdict::Approve,
-                }
-            }
-            Err(e) => {
-                tracing::warn!(target: "pilot::pipeline", task = %task.id, error = %e, "reviewer call failed");
-                crate::review::Verdict::Approve
-            }
-        };
-        out.push((task.id.clone(), verdict));
+            .map(|o| o.files_changed.join(", "))
+            .unwrap_or_default()
+    );
+    let (text, _usage) = complete_text(provider, model, SYSTEM, &user).await.ok()?;
+    let report = crate::review::parse_review(extract_json(&text)).ok()?;
+    if report.next_status(block_gate) == TaskStatus::Todo {
+        Some(report.rework_notes(block_gate))
+    } else {
+        None
     }
-    out
 }
 
 /// J10 — run a critic on the whole run; returns true if it vetoes
@@ -2178,28 +2186,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn e7_reviewer_pass_parses_verdict() {
+    async fn e7_inline_reviewer_rework_returns_notes() {
         let provider = CannedTextProvider {
             text: r#"{"verdict":"rework","summary":"needs tests","findings":[{"severity":"high","message":"no error handling"}]}"#.into(),
         };
-        let mut state = crate::model::RunState::new("r1", "g", "abc", "b");
-        state.tasks = vec![done_task("t1")];
-        let reviews =
-            run_reviewer_pass(&provider, "m", &state, &mut wingman_core::Usage::default()).await;
-        assert_eq!(reviews.len(), 1);
-        assert_eq!(reviews[0].1, crate::review::Verdict::Rework);
+        let task = done_task("t1");
+        // High finding at the Medium gate → rework, with notes.
+        let notes =
+            review_task_inline(&provider, "m", &task, crate::severity::Severity::Medium).await;
+        assert!(notes.is_some(), "rework verdict must return notes");
+        assert!(notes.unwrap().contains("no error handling"));
     }
 
     #[tokio::test]
-    async fn e7_reviewer_pass_defaults_to_approve_on_garbage() {
+    async fn e7_inline_reviewer_defaults_to_approve_on_garbage() {
         let provider = CannedTextProvider {
             text: "not json at all".into(),
         };
-        let mut state = crate::model::RunState::new("r1", "g", "abc", "b");
-        state.tasks = vec![done_task("t1")];
-        let reviews =
-            run_reviewer_pass(&provider, "m", &state, &mut wingman_core::Usage::default()).await;
-        assert_eq!(reviews[0].1, crate::review::Verdict::Approve);
+        let task = done_task("t1");
+        // Unparseable → fail-open approve → None (finalize proceeds).
+        let notes =
+            review_task_inline(&provider, "m", &task, crate::severity::Severity::Medium).await;
+        assert!(notes.is_none(), "garbage must fail open to approve");
     }
 
     #[tokio::test]
