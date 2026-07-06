@@ -307,6 +307,9 @@ pub enum PilotAction {
         #[arg(long, default_value_t = 0)]
         cycles: usize,
     },
+    /// J12 — install the skill packs listed in `[pilot.skills].packs` into
+    /// `~/.wingman/packs/` and link their roles into `~/.wingman/agents/`.
+    Skills,
     /// R4 — eval / regression gate. Summarize eval results, compare to the
     /// committed baseline, and exit non-zero on regression (the CI gate).
     Eval {
@@ -598,6 +601,10 @@ pub async fn run() -> Result<ExitCode> {
             } => {
                 let cfg = load_config()?;
                 commands::pilot::eval(cfg, goals, threshold, update_baseline).await
+            }
+            PilotAction::Skills => {
+                let cfg = load_config()?;
+                commands::pilot::skills_install(cfg).await
             }
             PilotAction::Daemon { cycles } => {
                 let cfg = load_config()?;

@@ -1517,6 +1517,57 @@ async fn feedback_pending_runs(
     out
 }
 
+/// J12 — install the skill packs listed in `[pilot.skills].packs`. Each
+/// `owner/name@version` spec is fetched from `https://github.com/owner/name`
+/// (tag `v<version>`) into `~/.wingman/packs/<slug>/` and its role/lessons
+/// files are copied into `~/.wingman/agents/` so the role loader picks them
+/// up. Already-installed packs (exact version present) only re-install files.
+pub async fn skills_install(cfg: Config) -> Result<ExitCode> {
+    use wingman_autonomous::skillpack;
+    let (refs, errs) = skillpack::parse_pack_list(&cfg.pilot.skills.packs);
+    for e in &errs {
+        eprintln!("[pilot] skills: bad spec — {e}");
+    }
+    if refs.is_empty() {
+        eprintln!("[pilot] skills: no valid packs in [pilot.skills].packs");
+        return Ok(if errs.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        });
+    }
+    let home = wingman_config::global_dir()
+        .ok()
+        .and_then(|d| d.parent().map(|p| p.to_path_buf()))
+        .or_else(dirs_home)
+        .ok_or_else(|| anyhow!("cannot resolve home directory for pack install"))?;
+    let runner = wingman_autonomous::pr::SystemCommandRunner;
+    let mut failures = 0;
+    for r in &refs {
+        let url = format!("https://github.com/{}/{}", r.owner, r.name);
+        match skillpack::fetch_pack(&runner, r, &url, &home) {
+            Ok(dest) => eprintln!("[pilot] skills: installed {} → {}", r.slug(), dest.display()),
+            Err(e) => {
+                eprintln!("[pilot] skills: {} failed — {e}", r.slug());
+                failures += 1;
+            }
+        }
+    }
+    Ok(if failures == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
+/// Best-effort home dir from `$HOME` / `%USERPROFILE%` without pulling in the
+/// `dirs` crate.
+fn dirs_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+}
+
 /// R4 — eval / regression harness + CI gate.
 ///
 /// Two modes:
