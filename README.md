@@ -180,9 +180,22 @@ assist     You approve every decision. Agent plans, you confirm, agent executes
 copilot    Default. Agent flies; you monitor and intervene at decision points.
            Trust-tiered approval, self-healing retries, per-task reviewer,
            real verification, PR automation, cross-run learning.
-autopilot  Agent flies and navigates. Daemon mode, multi-channel intake,
-           critic agent, knowledge graph, tool synthesis, sandboxed execution.
+autopilot  (experimental) Agent flies and navigates. Daemon mode, critic
+           agent, knowledge graph, tool synthesis, sandboxed execution.
+           Several autopilot capabilities are partial — see Maturity below.
 ```
+
+> **Maturity.** `assist` and `copilot` are the supported tiers. Pilot mode
+> has been validated by unit tests but **not yet run end-to-end against a
+> live provider** — do a smoke run on a throwaway goal before relying on it.
+> `autopilot` is experimental and ships with known gaps: the discovery
+> daemon polls **GitHub issues only** (`ci_failures` / `dependabot` /
+> `todos` / `coverage_gaps` are planned, not implemented); Slack/email
+> intake and notification transports are not wired (notices print to the
+> terminal); voice intake needs audio hardware. Auto-dispatch
+> (`[pilot.daemon].auto_dispatch`) opens real PRs autonomously and is
+> off by default — tune your trust config and dry-run with `daemon
+> --cycles 1` before enabling it.
 
 Pick a tier in `~/.wingman/config.toml`:
 
@@ -237,9 +250,12 @@ squash-merge, gh PR creation, dashboard, cost-cap enforcement, and the
 provider-support gate). On top of that, the crate now ships the
 `copilot`/`autopilot` machinery: a live control channel (`approve` /
 `veto` / `abort` / `retry`), run `resume`, a per-run plan-approval gate,
-sandbox tiers (`host` / `container` / `vm`), and the always-on discovery
-`daemon`. End-to-end runs against the providers below need real API keys
-and are user-validated rather than CI-validated for now.
+sandbox tiers (`host` / `container` / `vm`, degrading to `host` when no
+Docker daemon is present), and the always-on discovery `daemon` (GitHub
+issues). End-to-end runs against the providers below need real API keys
+and are **user-validated, not CI-validated** — see Maturity above before
+launching. `autopilot`-only extras (multi-source discovery, Slack/email
+transports, voice) are partial or unimplemented.
 
 ### Provider support for pilot mode
 
