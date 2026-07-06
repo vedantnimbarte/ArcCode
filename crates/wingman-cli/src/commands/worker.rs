@@ -89,6 +89,27 @@ pub async fn run(cfg: Config, opts: WorkerOptions) -> Result<ExitCode> {
     let system = compose_worker_system_prompt(&role, &task);
     let user_prompt = compose_worker_user_prompt(&task);
 
+    // E5.5 — per-turn sanity gate. When `[pilot].turn_gate_cmd` is set, the
+    // worker's agent loop runs it after any turn that mutated files and feeds
+    // failures back to the model (bounded by gate_max_retries) so it
+    // self-corrects before reporting the task complete. Fail-open: a gate
+    // that can't spawn passes. Empty cmd disables it.
+    // ponytail: this is the "gate progress" half. True per-turn rollback of a
+    // failed turn needs a checkpoint snapshot/restore primitive that doesn't
+    // exist yet (E11 verifies checkpoints but never captures a restorable
+    // one); until then the loop re-prompts rather than reverts.
+    let gate: Option<Arc<dyn wingman_core::TurnGate>> = {
+        let cmd = cfg.pilot.turn_gate_cmd.trim();
+        if cmd.is_empty() {
+            None
+        } else {
+            Some(Arc::new(runtime::ShellTurnGate::new(
+                cmd.to_string(),
+                paths.root.clone(),
+            )))
+        }
+    };
+
     let agent_cfg = AgentConfig {
         model: selection.model.clone(),
         system: Some(system),
@@ -97,6 +118,7 @@ pub async fn run(cfg: Config, opts: WorkerOptions) -> Result<ExitCode> {
             trigger_tokens: cfg.tokens.compact_at_tokens,
             ..Default::default()
         },
+        gate,
         ..Default::default()
     };
     let mut agent = AgentLoop::new(provider, registry, agent_cfg);
