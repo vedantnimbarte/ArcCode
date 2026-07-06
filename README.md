@@ -427,28 +427,51 @@ mapper functions in `runtime.rs` + `login.rs`.
 
 ## Installation
 
-### Prerequisites
+### Quick install (prebuilt binary — no Rust needed)
 
-- Rust 1.80 or later (uses 2021 edition; pinned in `Cargo.toml`).
-- A working C toolchain for some transitive crates.
-- (Optional) An API key for the provider(s) you intend to use.
+**macOS / Linux:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vedantnimbarte/Wingman/main/scripts/install.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/vedantnimbarte/Wingman/main/scripts/install.ps1 | iex
+```
+
+This downloads the `wingman` binary for your platform from the latest
+[GitHub Release](https://github.com/vedantnimbarte/Wingman/releases) and puts
+it on your `PATH` (default `~/.local/bin`; override with
+`WINGMAN_INSTALL_DIR`, pin a tag with `VERSION=v0.0.1`). Then run
+`wingman --help`.
+
+Supported prebuilt targets: Linux x86_64/aarch64 (musl), macOS
+x86_64/Apple-silicon, Windows x86_64.
+
+### With Rust already installed
+
+```bash
+cargo install --git https://github.com/vedantnimbarte/Wingman wingman-cli
+```
 
 ### Build from source
 
 ```bash
 git clone git@github.com:vedantnimbarte/Wingman.git
 cd Wingman
-cargo build --release
+cargo build --release        # binary at target/release/wingman
+cargo install --path crates/wingman-cli   # or install onto PATH
 ```
 
-The resulting binary is at `target/release/wingman` (or `wingman.exe` on
-Windows).
+Prerequisites for building: Rust 1.80+ and a C toolchain for some transitive
+crates. (Optional) an API key for the provider(s) you use.
 
-To install onto your `PATH`:
-
-```bash
-cargo install --path crates/wingman-cli
-```
+> **Maintainers:** the prebuilt binaries are produced by
+> `.github/workflows/release.yml` on every `v*` tag — `git tag v0.0.1 && git
+> push origin v0.0.1` builds and publishes the assets the install scripts
+> download.
 
 ---
 
