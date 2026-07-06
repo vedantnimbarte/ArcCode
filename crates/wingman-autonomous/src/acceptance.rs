@@ -439,15 +439,19 @@ mod tests {
     }
 
     #[test]
-    fn http_check_surfaces_as_unsupported() {
+    fn http_check_fails_gracefully_on_unreachable_host() {
+        // Offline + deterministic: a closed local port. curl exits non-zero,
+        // and the runner surfaces a labeled failure rather than panicking.
+        // (The status/body assertion logic is covered by
+        // `j6_http_assert_covers_status_string_and_null`.)
         let dir = tempdir().unwrap();
         let checks = vec![Acceptance::Http {
-            url: "http://example.com".into(),
+            url: "http://127.0.0.1:1/nope".into(),
             must_match: serde_json::Value::Null,
         }];
         let results = run_acceptance_checks(&checks, dir.path());
         assert!(!results[0].ok);
-        assert!(results[0].output.contains("HTTP"));
+        assert!(results[0].label.starts_with("http:"));
     }
 
     #[test]
