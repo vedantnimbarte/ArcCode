@@ -497,6 +497,7 @@ pub async fn run_to_completion(
         inputs.tier,
         // J15 blocking triggers veto the merge alongside the R6 security gate.
         security_blocks || escalation_blocks,
+        inputs.run_reviewer,
         review_max_severity,
         critic_vetoed,
         dangerous_paths_touched,
@@ -561,6 +562,7 @@ fn decide_and_maybe_merge(
     auto_approved: bool,
     tier: wingman_config::PilotTier,
     security_blocks: bool,
+    reviewed: bool,
     review_max_severity: Option<crate::severity::Severity>,
     critic_vetoes: bool,
     dangerous_paths_touched: bool,
@@ -588,6 +590,7 @@ fn decide_and_maybe_merge(
         tier_was_auto,
         ci_green,
         require_ci_green: pr_config.require_ci_green,
+        reviewed,                // whether a per-task review actually ran
         review_max_severity,     // E7 per-task reviewer (wired below)
         security_blocks,         // R6 security pass + J15 blocking triggers
         critic_vetoes,           // J10 critic (wired below)
@@ -1732,6 +1735,7 @@ mod tests {
             false, // not auto-approved
             wingman_config::PilotTier::Copilot,
             false, // security clean
+            true,  // reviewed
             None,  // no review findings
             false, // no critic veto
             false, // no dangerous paths (J15)
@@ -1760,6 +1764,7 @@ mod tests {
             true, // auto-approved
             wingman_config::PilotTier::Copilot,
             false, // security clean
+            true,  // reviewed
             None,  // no review findings
             false, // no critic veto
             false, // no dangerous paths (J15)
@@ -1865,6 +1870,7 @@ mod tests {
             true,
             wingman_config::PilotTier::Copilot,
             false,
+            true, // reviewed
             None,
             false,
             false, // no dangerous paths (J15)
@@ -1898,6 +1904,7 @@ mod tests {
             true,
             wingman_config::PilotTier::Copilot,
             false,
+            true, // reviewed
             None,
             false,
             false, // no dangerous paths (J15)
@@ -1930,6 +1937,7 @@ mod tests {
             true, // auto-approved
             wingman_config::PilotTier::Copilot,
             true, // security pass blocks
+            true, // reviewed
             None,
             false,
             false, // no dangerous paths (J15)

@@ -934,7 +934,16 @@ async fn handle_assign(
     // rides in the SpawnContext so the spawner can drain it into the child's
     // stdin. A small bounded buffer is plenty — commands are rare.
     let (cmd_tx, cmd_rx) = mpsc::channel::<crate::ipc::ManagerCommand>(8);
-    senders.lock().await.insert(agent_id.clone(), cmd_tx);
+    {
+        // Opportunistically drop entries for workers that have already
+        // finished (their receiver was dropped → sender is_closed) before
+        // inserting the new one. Without this, `senders` grows unbounded over
+        // a long run since completion never removed its entry. Race-free: we
+        // only prune closed channels, never the live one we're about to add.
+        let mut s = senders.lock().await;
+        s.retain(|_, tx| !tx.is_closed());
+        s.insert(agent_id.clone(), cmd_tx);
+    }
 
     let retry = retries.get(task_id).cloned().unwrap_or_default();
     let ctx = SpawnContext {
@@ -974,7 +983,15 @@ async fn handle_assign(
         }
     });
 
-    active.lock().await.insert(agent_id.clone(), handle);
+    {
+        // Same opportunistic prune for the JoinHandle map: reap handles for
+        // workers that already finished so `active` doesn't grow for the whole
+        // run. `is_finished` is race-free — a handle only reports finished once
+        // its task has completed.
+        let mut a = active.lock().await;
+        a.retain(|_, h| !h.is_finished());
+        a.insert(agent_id.clone(), handle);
+    }
     Ok(agent_id)
 }
 
