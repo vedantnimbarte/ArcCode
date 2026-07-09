@@ -1,7 +1,8 @@
 //! wingman — multi-provider terminal coding agent.
 //!
-//! M0 surface: `--version`, `config init`, `config show`. Default subcommand
-//! (TUI) prints a placeholder until M1 lands.
+//! Binary entry point: builds the tokio runtime and dispatches to
+//! [`cli::run`]. The default subcommand opens the interactive TUI; see
+//! `cli.rs` for the full command surface.
 
 mod cli;
 mod commands;

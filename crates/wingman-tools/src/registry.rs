@@ -49,7 +49,7 @@ impl ToolRegistry {
         let spec = tool.spec();
         self.tools
             .write()
-            .expect("tools rwlock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(spec.name, tool)
     }
 
@@ -57,7 +57,7 @@ impl ToolRegistry {
     pub fn unregister(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools
             .write()
-            .expect("tools rwlock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(name)
     }
 
@@ -66,7 +66,7 @@ impl ToolRegistry {
         let mut names: Vec<String> = self
             .tools
             .read()
-            .expect("tools rwlock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .keys()
             .cloned()
             .collect();
@@ -126,7 +126,7 @@ impl ToolRegistry {
 #[async_trait]
 impl ToolDispatcher for ToolRegistry {
     fn specs(&self) -> Vec<ToolSpec> {
-        let guard = self.tools.read().expect("tools rwlock poisoned");
+        let guard = self.tools.read().unwrap_or_else(|e| e.into_inner());
         let mut out: Vec<ToolSpec> = guard.values().map(|t| t.spec()).collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
@@ -166,7 +166,7 @@ impl ToolDispatcher for ToolRegistry {
         let tool = self
             .tools
             .read()
-            .expect("tools rwlock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(name)
             .cloned();
         let outcome = match tool {

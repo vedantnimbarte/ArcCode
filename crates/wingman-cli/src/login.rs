@@ -33,27 +33,49 @@ async fn probe_payload(p: &LoginPayload) -> Result<(), String> {
 
 async fn commit_payload(p: &LoginPayload) -> Result<(), String> {
     let path = global_config_path().map_err(|e| format!("config path: {e}"))?;
-    Config::set_default_provider_and_save_with_key(
-        &path,
-        &p.provider_id,
-        &p.model,
-        p.base_url.as_deref(),
-        p.api_key.as_deref(),
-    )
-    .map_err(|e| format!("save config: {e}"))?;
 
-    // Also try to store in the keyring in the background — non-blocking.
-    if let Some(key) = p.api_key.as_deref() {
-        let provider_id = p.provider_id.clone();
-        let key = key.to_string();
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = secrets::store(&provider_id, &key) {
-                eprintln!("[wingman] background keyring store failed: {e}");
+    // Prefer the OS keyring: store the secret there and write only a
+    // `keyring:<provider>` marker to the config. Fall back to a plaintext key
+    // in the config (locked to 0600 by save_atomic) only when the keyring is
+    // unavailable, so a headless / no-keyring box still works.
+    let stored_in_keyring = match p.api_key.as_deref() {
+        Some(key) => {
+            let provider_id = p.provider_id.clone();
+            let key = key.to_string();
+            match tokio::task::spawn_blocking(move || secrets::store(&provider_id, &key)).await {
+                Ok(Ok(())) => true,
+                Ok(Err(e)) => {
+                    eprintln!("[wingman] keyring store failed, keeping key in config: {e}");
+                    false
+                }
+                Err(e) => {
+                    eprintln!("[wingman] keyring store task failed, keeping key in config: {e}");
+                    false
+                }
             }
-        });
-    }
+        }
+        None => false,
+    };
 
-    Ok(())
+    if stored_in_keyring {
+        Config::set_default_provider_and_save(
+            &path,
+            &p.provider_id,
+            &p.model,
+            p.base_url.as_deref(),
+            true,
+        )
+        .map_err(|e| format!("save config: {e}"))
+    } else {
+        Config::set_default_provider_and_save_with_key(
+            &path,
+            &p.provider_id,
+            &p.model,
+            p.base_url.as_deref(),
+            p.api_key.as_deref(),
+        )
+        .map_err(|e| format!("save config: {e}"))
+    }
 }
 
 /// Build a provider directly from a wizard payload, without consulting the

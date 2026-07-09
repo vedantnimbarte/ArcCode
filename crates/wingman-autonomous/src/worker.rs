@@ -96,7 +96,7 @@ pub struct WorkerResult {
 /// has already emitted. The orchestrator chooses the id; the worker just
 /// inherits it.
 pub async fn run_worker(
-    store: &mut RunStore,
+    store: &tokio::sync::Mutex<RunStore>,
     agent_id: &str,
     mut spec: WorkerSpec,
 ) -> Result<WorkerResult, WorkerError> {
@@ -126,7 +126,14 @@ pub async fn run_worker(
     let mut supervisor = sc.spawn()?;
     let pid = supervisor.pid();
 
+    // The run store is shared across all workers, the orchestrator actor, and
+    // the budget watchdog. Lock it only for the duration of each append — the
+    // worker spends almost all its wall-clock awaiting child stdout, and
+    // holding the guard across that would serialize every other worker (and
+    // stall the manager loop) to an effective concurrency of one.
     let _ = store
+        .lock()
+        .await
         .append(Event::AgentSpawn {
             t: RunStore::now(),
             agent: agent_id.to_string(),
@@ -196,6 +203,8 @@ pub async fn run_worker(
             // the same stdout stream carries both.
             if let Ok(Some(msg)) = crate::ipc::parse_message(line) {
                 let _ = store
+                    .lock()
+                    .await
                     .append(Event::TaskTool {
                         t: RunStore::now(),
                         id: spec.task.id.clone(),
@@ -209,10 +218,20 @@ pub async fn run_worker(
             }
             match parse_line(line) {
                 WorkerLine::AgentEvent(ev) => {
-                    forward_agent_event(store, &spec.task.id, agent_id, &ev).await;
+                    let mut guard = store.lock().await;
+                    forward_agent_event(
+                        &mut guard,
+                        &spec.task.id,
+                        agent_id,
+                        spec.model.as_deref().unwrap_or_default(),
+                        &ev,
+                    )
+                    .await;
                 }
                 WorkerLine::WorkerStart { .. } => {
                     let _ = store
+                        .lock()
+                        .await
                         .append(Event::AgentStatus {
                             t: RunStore::now(),
                             agent: agent_id.to_string(),
@@ -220,6 +239,8 @@ pub async fn run_worker(
                         })
                         .await;
                     let _ = store
+                        .lock()
+                        .await
                         .append(Event::TaskStatus {
                             t: RunStore::now(),
                             id: spec.task.id.clone(),
@@ -280,6 +301,8 @@ pub async fn run_worker(
     }
 
     let _ = store
+        .lock()
+        .await
         .append(Event::TaskStatus {
             t: RunStore::now(),
             id: spec.task.id.clone(),
@@ -288,6 +311,8 @@ pub async fn run_worker(
         })
         .await;
     let _ = store
+        .lock()
+        .await
         .append(Event::AgentStatus {
             t: RunStore::now(),
             agent: agent_id.to_string(),
@@ -415,6 +440,7 @@ async fn forward_agent_event(
     store: &mut RunStore,
     task_id: &str,
     agent_id: &str,
+    model: &str,
     event: &wingman_core::AgentEvent,
 ) {
     match event {
@@ -436,17 +462,20 @@ async fn forward_agent_event(
             // this to gate the next turn.
         }
         wingman_core::AgentEvent::Usage { usage } => {
-            // We don't have a USD figure mid-stream; emit a usd=0 event so
-            // token totals stay correct. Pricing reconciliation lands in
-            // Phase 4 once wingman-core::pricing is wired through.
+            // Price the usage so run totals reflect real spend — this is what
+            // the max_usd cap and budget watchdog read. Unknown/local models
+            // (no price table entry) fall back to 0.0.
+            let usd = wingman_core::pricing::price_for(model)
+                .map(|p| p.cost(usage))
+                .unwrap_or(0.0);
             let _ = store
                 .append(Event::AgentUsd {
                     t: RunStore::now(),
                     agent: agent_id.to_string(),
-                    model: String::new(),
+                    model: model.to_string(),
                     input_tokens: usage.input_tokens as u64,
                     output_tokens: usage.output_tokens as u64,
-                    usd: 0.0,
+                    usd,
                 })
                 .await;
         }
@@ -464,6 +493,7 @@ pub async fn drive_stdout_for_test(
     task_id: &str,
     agent_id: &str,
     role: Role,
+    model: &str,
     stdout: impl tokio::io::AsyncRead + Unpin,
     session_id: &str,
 ) -> Result<Option<TaskOutcome>, WorkerError> {
@@ -485,7 +515,7 @@ pub async fn drive_stdout_for_test(
         }
         match parse_line(line) {
             WorkerLine::AgentEvent(ev) => {
-                forward_agent_event(store, task_id, agent_id, &ev).await;
+                forward_agent_event(store, task_id, agent_id, model, &ev).await;
             }
             WorkerLine::WorkerStart { .. } => {
                 let _ = store
@@ -609,6 +639,7 @@ mod tests {
             "t1",
             "agent-1",
             Role::Developer,
+            "claude-haiku-4-5",
             cursor,
             "sess-1",
         )
@@ -637,10 +668,16 @@ mod tests {
         assert_eq!(agent.status, AgentStatus::Done);
         assert_eq!(agent.session_id.as_deref(), Some("sess-1"));
 
-        // Usage was forwarded into the run totals (USD stays 0 until pricing
-        // wiring lands in Phase 4).
+        // Usage was forwarded into the run totals, and priced: haiku-4-5 is
+        // $1/Mtok in + $5/Mtok out → 1200*1e-6 + 300*5e-6 = $0.0027. This is
+        // what the max_usd cap reads.
         assert_eq!(store.state().totals.tokens_in, 1200);
         assert_eq!(store.state().totals.tokens_out, 300);
+        assert!(
+            (store.state().totals.usd - 0.0027).abs() < 1e-9,
+            "expected priced usd ~0.0027, got {}",
+            store.state().totals.usd
+        );
 
         // Tool invocation was recorded for the live log. We can't read
         // tasks.jsonl back through the snapshot (task.tool intentionally

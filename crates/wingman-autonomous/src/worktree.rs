@@ -88,6 +88,12 @@ pub fn create_worktree(
     if let Some(parent) = worktree_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // Make creation idempotent. A crash / Ctrl+C / prior failed attempt can
+    // leave this worktree directory and branch on disk; `git worktree add -b`
+    // would then fail with "already exists" and the task could never be
+    // reassigned (this is exactly what wedged `pilot resume`). Clear stale
+    // state first — all best-effort no-ops when nothing is left over.
+    prune_stale_worktree(repo_root, worktree_path, &branch);
     // `git worktree add -b <branch> <path> <base>` creates the branch off
     // base_commit and checks it out in the new worktree.
     let out = Command::new("git")
@@ -107,6 +113,35 @@ pub fn create_worktree(
         )));
     }
     Ok(branch)
+}
+
+/// Clear any leftover worktree directory and branch from a prior attempt so
+/// `create_worktree` can recreate them. Every step is best-effort: `prune`
+/// does nothing when there are no stale admin entries, the remove/rm are
+/// skipped when the path is absent, and `branch -D` fails harmlessly when the
+/// branch doesn't exist.
+fn prune_stale_worktree(repo_root: &Path, worktree_path: &Path, branch: &str) {
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["worktree", "prune"])
+        .output();
+    if worktree_path.exists() {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["worktree", "remove", "--force"])
+            .arg(worktree_path)
+            .output();
+        // If git didn't own the path (e.g. it was pruned but the dir stayed),
+        // make sure it's gone so `worktree add` doesn't refuse.
+        let _ = std::fs::remove_dir_all(worktree_path);
+    }
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["branch", "-D", branch])
+        .output();
 }
 
 /// Remove a worktree (and its branch reference under
@@ -480,6 +515,42 @@ pub fn cleanup_worktrees(repo_root: &Path, run_id: &str) -> Vec<PathBuf> {
     removed
 }
 
+/// Delete every per-task branch for a run (`wingman/auto-tasks/<run>/…`).
+/// After a successful integration merge these are squashed into the
+/// integration branch and no longer referenced, so keeping them just leaks
+/// refs that accumulate across every run. Best-effort; returns how many were
+/// deleted and never fails.
+pub fn cleanup_task_branches(repo_root: &Path, run_id: &str) -> usize {
+    let pattern = format!("refs/heads/wingman/auto-tasks/{run_id}/");
+    let Ok(list) = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["for-each-ref", "--format=%(refname:short)"])
+        .arg(&pattern)
+        .output()
+    else {
+        return 0;
+    };
+    let mut deleted = 0;
+    for branch in String::from_utf8_lossy(&list.stdout).lines() {
+        let branch = branch.trim();
+        if branch.is_empty() {
+            continue;
+        }
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["branch", "-D", branch])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            deleted += 1;
+        }
+    }
+    deleted
+}
+
 fn rev_parse(repo_root: &Path, rev: &str) -> Result<String, WorktreeError> {
     let out = Command::new("git")
         .arg("-C")
@@ -648,6 +719,32 @@ mod tests {
         assert_eq!(head, "integration", "HEAD must be restored after aborted rebase");
         // No rebase in progress left dangling.
         assert!(!repo.join(".git").join("rebase-merge").exists());
+    }
+
+    /// Resume-safety: re-creating a worktree for a task whose prior attempt
+    /// left the worktree dir + branch on disk must succeed, not fail with
+    /// "already exists". This is the case `pilot resume` used to wedge on.
+    #[test]
+    fn create_worktree_is_idempotent_over_stale_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some((repo, base)) = init_repo(tmp.path()) else {
+            eprintln!("skipping: git not available");
+            return;
+        };
+        let wt = repo.join(".wingman/worktrees/t1");
+        let run_id = "2026-01-01-0000-abcdef";
+
+        // First attempt creates the worktree + branch and leaves a dirty file.
+        let branch = create_worktree(&repo, &base, run_id, "t1", &wt).expect("first create");
+        std::fs::write(wt.join("scratch.txt"), "partial work").unwrap();
+        assert!(wt.exists());
+
+        // Simulate an interrupted run: the dir and branch are still present.
+        // A naive `git worktree add -b` would now fail; create_worktree must
+        // prune the stale state and recreate cleanly.
+        let branch2 = create_worktree(&repo, &base, run_id, "t1", &wt).expect("recreate over stale");
+        assert_eq!(branch, branch2);
+        assert!(wt.exists());
     }
 
     /// Phase 5 acceptance (plan.md line 675): a clean 3-task run produces

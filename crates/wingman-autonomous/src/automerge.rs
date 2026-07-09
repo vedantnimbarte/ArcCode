@@ -27,6 +27,11 @@ pub struct AutoMergeInputs {
     pub ci_green: Option<bool>,
     /// `[pilot.pr].require_ci_green`.
     pub require_ci_green: bool,
+    /// Whether a per-task review actually ran. Distinguishes "reviewed, no
+    /// findings" (`review_max_severity == None` && `reviewed`) from "never
+    /// reviewed" (`!reviewed`) — the gate must not treat an unreviewed run as
+    /// clean and auto-merge it to the base branch.
+    pub reviewed: bool,
     /// Highest severity among E7 per-task review findings, if any.
     pub review_max_severity: Option<Severity>,
     /// R6 security pass blocked (any finding at/above its gate).
@@ -74,6 +79,11 @@ pub fn decide_auto_merge(inputs: &AutoMergeInputs) -> AutoMergeDecision {
     }
     if inputs.dangerous_paths_touched {
         reasons.push("plan touches dangerous_paths".to_string());
+    }
+    if !inputs.reviewed {
+        reasons.push(
+            "no per-task review ran (enable the reviewer capability or merge manually)".to_string(),
+        );
     }
     if let Some(sev) = inputs.review_max_severity {
         if sev > inputs.merge_max_severity {
@@ -166,6 +176,7 @@ mod tests {
             tier_was_auto: true,
             ci_green: Some(true),
             require_ci_green: true,
+            reviewed: true,
             review_max_severity: Some(Severity::Low),
             security_blocks: false,
             critic_vetoes: false,
@@ -256,6 +267,31 @@ mod tests {
         let i = AutoMergeInputs {
             review_max_severity: Some(Severity::Medium),
             merge_max_severity: Severity::Medium,
+            ..passing_inputs()
+        };
+        assert!(decide_auto_merge(&i).is_merge());
+    }
+
+    #[test]
+    fn unreviewed_run_holds() {
+        // No review ran → must not auto-merge even though severity is None.
+        let i = AutoMergeInputs {
+            reviewed: false,
+            review_max_severity: None,
+            ..passing_inputs()
+        };
+        let d = decide_auto_merge(&i);
+        assert!(!d.is_merge());
+        if let AutoMergeDecision::Hold { reasons } = d {
+            assert!(reasons.iter().any(|r| r.contains("no per-task review")));
+        }
+    }
+
+    #[test]
+    fn reviewed_with_no_findings_merges() {
+        let i = AutoMergeInputs {
+            reviewed: true,
+            review_max_severity: None,
             ..passing_inputs()
         };
         assert!(decide_auto_merge(&i).is_merge());

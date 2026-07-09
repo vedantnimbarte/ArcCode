@@ -147,6 +147,9 @@ pub async fn run_to_completion(
     // set, `run_reviewer` runs the reviewer at the Review→Done choke point
     // (race-free vs the manager) and sends rework verdicts back through the
     // retry ladder, instead of a batched post-run pass.
+    // Captured before `inputs.manager_model` is moved into build_manager, so
+    // the manager phase's tokens can be priced below.
+    let manager_model = inputs.manager_model.clone();
     let reviewer: Option<orchestrator::Reviewer> = if inputs.run_reviewer {
         let provider = aux_provider.clone();
         let model = inputs.reviewer_model.clone();
@@ -193,7 +196,7 @@ pub async fn run_to_completion(
     // already emit `agent.usd`; recording the manager here keeps run totals
     // honest and feeds the per-phase breakdown. Best-effort.
     if let Ok(mut s) = RunStore::load(&run_dir).await {
-        record_phase_usage(&mut s, "manager", &manager_usage).await;
+        record_phase_usage(&mut s, "manager", &manager_model, &manager_usage).await;
     }
 
     // E11 — advisory checkpoint-hygiene check over the recorded tool
@@ -349,8 +352,11 @@ pub async fn run_to_completion(
     };
 
     // Cleanup worker worktrees before opening the PR — keeps the repo
-    // tidy if the PR step errors out.
+    // tidy if the PR step errors out. Also delete the per-task branches: by
+    // here they've been squashed into the integration branch, so leaving them
+    // only leaks refs that pile up across runs.
     let _removed = worktree::cleanup_worktrees(&project_root, &run_id);
+    let _branches = worktree::cleanup_task_branches(&project_root, &run_id);
 
     if inputs.no_pr {
         store
@@ -478,7 +484,7 @@ pub async fn run_to_completion(
     } else {
         false
     };
-    record_phase_usage(&mut store, "critic", &critic_usage).await;
+    record_phase_usage(&mut store, "critic", &inputs.reviewer_model, &critic_usage).await;
 
     // E8 — auto-merge gate. Combine the available signals and decide
     // whether to merge automatically. When it decides Merge and the PR was
@@ -491,6 +497,7 @@ pub async fn run_to_completion(
         inputs.tier,
         // J15 blocking triggers veto the merge alongside the R6 security gate.
         security_blocks || escalation_blocks,
+        inputs.run_reviewer,
         review_max_severity,
         critic_vetoed,
         dangerous_paths_touched,
@@ -555,6 +562,7 @@ fn decide_and_maybe_merge(
     auto_approved: bool,
     tier: wingman_config::PilotTier,
     security_blocks: bool,
+    reviewed: bool,
     review_max_severity: Option<crate::severity::Severity>,
     critic_vetoes: bool,
     dangerous_paths_touched: bool,
@@ -582,6 +590,7 @@ fn decide_and_maybe_merge(
         tier_was_auto,
         ci_green,
         require_ci_green: pr_config.require_ci_green,
+        reviewed,                // whether a per-task review actually ran
         review_max_severity,     // E7 per-task reviewer (wired below)
         security_blocks,         // R6 security pass + J15 blocking triggers
         critic_vetoes,           // J10 critic (wired below)
@@ -768,18 +777,26 @@ fn detect_escalation_triggers(
 /// is logged and swallowed so instrumentation never breaks a run. (Cache
 /// read/write tokens aren't in the event schema yet, so only fresh
 /// input/output are recorded.)
-async fn record_phase_usage(store: &mut RunStore, phase: &str, usage: &wingman_core::Usage) {
+async fn record_phase_usage(
+    store: &mut RunStore,
+    phase: &str,
+    model: &str,
+    usage: &wingman_core::Usage,
+) {
     if usage.input_tokens == 0 && usage.output_tokens == 0 {
         return;
     }
+    let usd = wingman_core::pricing::price_for(model)
+        .map(|p| p.cost(usage))
+        .unwrap_or(0.0);
     if let Err(e) = store
         .append(crate::Event::AgentUsd {
             t: RunStore::now(),
             agent: format!("phase:{phase}"),
-            model: String::new(),
+            model: model.to_string(),
             input_tokens: usage.input_tokens as u64,
             output_tokens: usage.output_tokens as u64,
-            usd: 0.0,
+            usd,
         })
         .await
     {
@@ -1718,6 +1735,7 @@ mod tests {
             false, // not auto-approved
             wingman_config::PilotTier::Copilot,
             false, // security clean
+            true,  // reviewed
             None,  // no review findings
             false, // no critic veto
             false, // no dangerous paths (J15)
@@ -1746,6 +1764,7 @@ mod tests {
             true, // auto-approved
             wingman_config::PilotTier::Copilot,
             false, // security clean
+            true,  // reviewed
             None,  // no review findings
             false, // no critic veto
             false, // no dangerous paths (J15)
@@ -1851,6 +1870,7 @@ mod tests {
             true,
             wingman_config::PilotTier::Copilot,
             false,
+            true, // reviewed
             None,
             false,
             false, // no dangerous paths (J15)
@@ -1884,6 +1904,7 @@ mod tests {
             true,
             wingman_config::PilotTier::Copilot,
             false,
+            true, // reviewed
             None,
             false,
             false, // no dangerous paths (J15)
@@ -1916,6 +1937,7 @@ mod tests {
             true, // auto-approved
             wingman_config::PilotTier::Copilot,
             true, // security pass blocks
+            true, // reviewed
             None,
             false,
             false, // no dangerous paths (J15)

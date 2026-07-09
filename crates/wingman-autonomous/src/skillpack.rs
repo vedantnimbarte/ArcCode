@@ -202,12 +202,26 @@ pub fn fetch_pack(
         if local.is_dir() {
             copy_dir_recursive(local, &dest).map_err(|e| format!("local copy failed: {e}"))?;
         } else {
+            // Only clone over https/ssh. Git's `ext::`/`file://` transports are
+            // an RCE vector (`git clone 'ext::sh -c evil'`); reject anything
+            // that isn't a normal remote URL so a hostile pack manifest can't
+            // run commands during install.
+            if !is_safe_clone_url(source) {
+                return Err(format!(
+                    "refusing to clone skillpack from unsafe source '{source}' \
+                     (only https:// and git@host: are allowed)"
+                ));
+            }
             let tag = format!("v{}", pack.version);
             let dest_str = dest.to_string_lossy().to_string();
             let out = runner
                 .run(
                     "git",
-                    &["clone", "--depth", "1", "--branch", &tag, source, &dest_str],
+                    // `--` terminates options so a source starting with `-`
+                    // can't be parsed as a flag.
+                    &[
+                        "clone", "--depth", "1", "--branch", &tag, "--", source, &dest_str,
+                    ],
                     home,
                 )
                 .map_err(|e| format!("git clone spawn failed: {e}"))?;
@@ -218,6 +232,19 @@ pub fn fetch_pack(
     }
     install_pack_files(&dest, home).map_err(|e| format!("install failed: {e}"))?;
     Ok(dest)
+}
+
+/// Whether `source` is a git remote URL safe to `clone`. Allows https/http and
+/// ssh (both `ssh://…` and scp-style `git@host:path`); rejects git's
+/// command-executing transports (`ext::`, `fd::`, …) and `file://`.
+fn is_safe_clone_url(source: &str) -> bool {
+    let s = source.trim();
+    if s.starts_with("https://") || s.starts_with("http://") || s.starts_with("ssh://") {
+        return true;
+    }
+    // scp-style `user@host:path`: a single-colon remote with no `::` transport
+    // marker. The `::` check is what rejects `ext::` / `fd::`.
+    !s.contains("::") && s.contains('@') && s.contains(':')
 }
 
 /// Recursively copy a directory tree (skipping `.git`).
@@ -243,6 +270,18 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_clone_url_rejects_command_transports() {
+        assert!(is_safe_clone_url("https://github.com/u/repo.git"));
+        assert!(is_safe_clone_url("ssh://git@github.com/u/repo.git"));
+        assert!(is_safe_clone_url("git@github.com:u/repo.git"));
+        // The dangerous ones: git's ext/fd transports and local file://.
+        assert!(!is_safe_clone_url("ext::sh -c 'touch /tmp/pwned'"));
+        assert!(!is_safe_clone_url("fd::17/foo"));
+        assert!(!is_safe_clone_url("file:///etc/passwd"));
+        assert!(!is_safe_clone_url("/local/path"));
+    }
 
     #[test]
     fn j12_fetch_local_pack_installs_roles_into_agents() {

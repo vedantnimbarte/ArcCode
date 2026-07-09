@@ -934,7 +934,16 @@ async fn handle_assign(
     // rides in the SpawnContext so the spawner can drain it into the child's
     // stdin. A small bounded buffer is plenty — commands are rare.
     let (cmd_tx, cmd_rx) = mpsc::channel::<crate::ipc::ManagerCommand>(8);
-    senders.lock().await.insert(agent_id.clone(), cmd_tx);
+    {
+        // Opportunistically drop entries for workers that have already
+        // finished (their receiver was dropped → sender is_closed) before
+        // inserting the new one. Without this, `senders` grows unbounded over
+        // a long run since completion never removed its entry. Race-free: we
+        // only prune closed channels, never the live one we're about to add.
+        let mut s = senders.lock().await;
+        s.retain(|_, tx| !tx.is_closed());
+        s.insert(agent_id.clone(), cmd_tx);
+    }
 
     let retry = retries.get(task_id).cloned().unwrap_or_default();
     let ctx = SpawnContext {
@@ -950,19 +959,69 @@ async fn handle_assign(
     };
     let spawner = spawner.clone();
     let task_id_for_log = task_id.to_string();
+    // Captured so a spawn error OR a panic inside the worker future still marks
+    // the task Failed. Without this, a panicking worker task unwinds silently,
+    // the task stays InProgress with no live worker, the retry watchdog (which
+    // only reacts to Failed) never fires, and the run hangs to max_ticks.
+    let store_for_fail = store.clone();
+    let agent_for_fail = agent_id.clone();
     let handle = tokio::spawn(async move {
-        match spawner(ctx).await {
-            Ok(_result) => {
-                tracing::debug!(target: "pilot::orch", task = %task_id_for_log, "worker finished");
+        use futures::FutureExt;
+        let task_id = task_id_for_log;
+        match std::panic::AssertUnwindSafe(spawner(ctx)).catch_unwind().await {
+            Ok(Ok(_result)) => {
+                tracing::debug!(target: "pilot::orch", task = %task_id, "worker finished");
             }
-            Err(e) => {
-                tracing::warn!(target: "pilot::orch", task = %task_id_for_log, error = %e, "worker spawn failed");
+            Ok(Err(e)) => {
+                tracing::warn!(target: "pilot::orch", task = %task_id, error = %e, "worker spawn failed");
+                mark_worker_failed(&store_for_fail, &task_id, &agent_for_fail).await;
+            }
+            Err(_panic) => {
+                tracing::error!(target: "pilot::orch", task = %task_id, "worker task panicked; marking task Failed");
+                mark_worker_failed(&store_for_fail, &task_id, &agent_for_fail).await;
             }
         }
     });
 
-    active.lock().await.insert(agent_id.clone(), handle);
+    {
+        // Same opportunistic prune for the JoinHandle map: reap handles for
+        // workers that already finished so `active` doesn't grow for the whole
+        // run. `is_finished` is race-free — a handle only reports finished once
+        // its task has completed.
+        let mut a = active.lock().await;
+        a.retain(|_, h| !h.is_finished());
+        a.insert(agent_id.clone(), handle);
+    }
     Ok(agent_id)
+}
+
+/// Mark a task Failed (and its agent Failed) when its worker future errored or
+/// panicked, so the retry watchdog reassigns it instead of the task hanging in
+/// InProgress forever. Best-effort — a failed append is logged and swallowed.
+async fn mark_worker_failed(store: &Arc<Mutex<RunStore>>, task_id: &str, agent_id: &str) {
+    let mut g = store.lock().await;
+    // Skip if the worker already recorded a terminal status (it may have
+    // written Failed/Review before a late panic in teardown).
+    if let Some(t) = g.state().task(task_id) {
+        if matches!(t.status, TaskStatus::Failed | TaskStatus::Review | TaskStatus::Done) {
+            return;
+        }
+    }
+    let _ = g
+        .append(Event::TaskStatus {
+            t: RunStore::now(),
+            id: task_id.to_string(),
+            status: TaskStatus::Failed,
+            outcome: None,
+        })
+        .await;
+    let _ = g
+        .append(Event::AgentStatus {
+            t: RunStore::now(),
+            agent: agent_id.to_string(),
+            status: AgentStatus::Failed,
+        })
+        .await;
 }
 
 #[allow(clippy::too_many_arguments)]

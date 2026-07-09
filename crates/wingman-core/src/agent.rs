@@ -263,6 +263,12 @@ impl AgentLoop {
         self.history.clear();
     }
 
+    /// Replace the conversation history — used by the TUI `/resume` command to
+    /// reload a saved session's messages into a live agent.
+    pub fn set_history(&mut self, history: Vec<Message>) {
+        self.history = history;
+    }
+
     /// Force a compaction pass now, regardless of the token threshold: fold
     /// everything but the most recent messages into a single recap. Returns
     /// the number of messages folded, or `None` if history is too short.
