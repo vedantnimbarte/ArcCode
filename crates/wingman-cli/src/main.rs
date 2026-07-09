@@ -11,6 +11,7 @@ mod mcp_adapter;
 mod mcp_registry;
 mod oauth;
 mod runtime;
+mod shutdown;
 
 use std::process::ExitCode;
 

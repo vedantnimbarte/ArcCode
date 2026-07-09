@@ -165,6 +165,9 @@ pub struct PilotOptions {
 }
 
 pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
+    // Tree-kill live workers on Ctrl+C / SIGTERM instead of orphaning them.
+    crate::shutdown::install();
+
     // Resolve the effective pilot config: tier override is the only flag the
     // user can flip without editing config. Other overrides (max_agents,
     // max_usd) get applied to a clone so the rest of the run sees them.
