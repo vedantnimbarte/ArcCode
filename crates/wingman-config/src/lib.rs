@@ -547,6 +547,19 @@ impl Config {
             path: tmp.clone(),
             source,
         })?;
+        // The config may carry a plaintext api_key (keyring-unavailable
+        // fallback), so lock it to owner-only before it becomes visible under
+        // the final name. Set on the temp file to avoid a world-readable window.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(
+                |source| ConfigError::Io {
+                    path: tmp.clone(),
+                    source,
+                },
+            )?;
+        }
         std::fs::rename(&tmp, path).map_err(|source| ConfigError::Io {
             path: path.to_path_buf(),
             source,
