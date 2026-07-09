@@ -515,6 +515,42 @@ pub fn cleanup_worktrees(repo_root: &Path, run_id: &str) -> Vec<PathBuf> {
     removed
 }
 
+/// Delete every per-task branch for a run (`wingman/auto-tasks/<run>/…`).
+/// After a successful integration merge these are squashed into the
+/// integration branch and no longer referenced, so keeping them just leaks
+/// refs that accumulate across every run. Best-effort; returns how many were
+/// deleted and never fails.
+pub fn cleanup_task_branches(repo_root: &Path, run_id: &str) -> usize {
+    let pattern = format!("refs/heads/wingman/auto-tasks/{run_id}/");
+    let Ok(list) = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["for-each-ref", "--format=%(refname:short)"])
+        .arg(&pattern)
+        .output()
+    else {
+        return 0;
+    };
+    let mut deleted = 0;
+    for branch in String::from_utf8_lossy(&list.stdout).lines() {
+        let branch = branch.trim();
+        if branch.is_empty() {
+            continue;
+        }
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["branch", "-D", branch])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            deleted += 1;
+        }
+    }
+    deleted
+}
+
 fn rev_parse(repo_root: &Path, rev: &str) -> Result<String, WorktreeError> {
     let out = Command::new("git")
         .arg("-C")

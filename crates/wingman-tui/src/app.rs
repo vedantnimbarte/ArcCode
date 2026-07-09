@@ -1612,18 +1612,21 @@ fn resume_session(agent: &mut Option<AgentLoop>, ui: &mut UiState, entry: Sessio
     match wingman_session::load_session(&entry.path) {
         Ok(records) => {
             let history = wingman_session::records_to_messages(&records);
-            ui.transcript.push(TranscriptItem::System(format!(
-                "resuming session {} ({} messages)",
-                entry.label,
-                history.len()
-            )));
-            // We can't set history directly on AgentLoop without a dedicated
-            // method, so note the limitation.
-            drop(history); // TODO: wire up once AgentLoop::set_history is available
-            ui.transcript.push(TranscriptItem::System(
-                "(session context shown above; history injection requires agent rebuild)".into(),
-            ));
-            let _ = agent; // will be used once set_history is wired
+            let count = history.len();
+            match agent {
+                Some(a) => {
+                    a.set_history(history);
+                    ui.transcript.push(TranscriptItem::System(format!(
+                        "resumed session {} — {count} messages restored into the agent",
+                        entry.label
+                    )));
+                }
+                None => {
+                    ui.transcript.push(TranscriptItem::Error(
+                        "no active agent to resume into — run /login first".into(),
+                    ));
+                }
+            }
         }
         Err(e) => {
             ui.transcript

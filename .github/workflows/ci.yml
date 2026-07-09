@@ -21,11 +21,19 @@ env:
 
 jobs:
   test:
-    name: test
-    # ubuntu-24.04 ships glibc 2.39: wingman embeds ONNX Runtime (fastembed
-    # -> ort), whose prebuilt binary needs glibc >= 2.38 to link — same floor
-    # as the release build.
-    runs-on: ubuntu-24.04
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Test on every platform we ship a release binary for, so cross-
+        # platform code (child-process teardown, detached runs, path handling)
+        # is actually exercised — not just built at release time.
+        #   - ubuntu-24.04 ships glibc 2.39: wingman embeds ONNX Runtime
+        #     (fastembed -> ort), whose prebuilt binary needs glibc >= 2.38 to
+        #     link — same floor as the release build.
+        #   - macos-14 is Apple Silicon; windows-latest is x86_64-msvc.
+        os: [ubuntu-24.04, macos-14, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain

@@ -352,8 +352,11 @@ pub async fn run_to_completion(
     };
 
     // Cleanup worker worktrees before opening the PR — keeps the repo
-    // tidy if the PR step errors out.
+    // tidy if the PR step errors out. Also delete the per-task branches: by
+    // here they've been squashed into the integration branch, so leaving them
+    // only leaks refs that pile up across runs.
     let _removed = worktree::cleanup_worktrees(&project_root, &run_id);
+    let _branches = worktree::cleanup_task_branches(&project_root, &run_id);
 
     if inputs.no_pr {
         store

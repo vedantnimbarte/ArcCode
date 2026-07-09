@@ -446,6 +446,7 @@ pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
             pilot.worker_model.as_deref().unwrap_or(&selection.model),
             &selection.model,
             routing,
+            std::time::Duration::from_secs(pilot.task_timeout_secs),
         )?,
         base_branch,
         project_root: project.root.clone(),
@@ -1119,6 +1120,7 @@ pub async fn resume(
                 .unwrap_or(&selection.model),
             &selection.model,
             routing,
+            std::time::Duration::from_secs(cfg.pilot.task_timeout_secs),
         )?,
         base_branch,
         project_root: project.root,
@@ -1181,6 +1183,7 @@ fn build_real_worker_spawner(
     worker_model: &str,
     manager_model: &str,
     routing: Option<std::sync::Arc<wingman_autonomous::learning::Aggregates>>,
+    task_timeout: std::time::Duration,
 ) -> Result<wingman_autonomous::orchestrator::WorkerSpawner> {
     let wingman_bin = std::env::current_exe().context("locating wingman binary")?;
     let worker_model = worker_model.to_string();
@@ -1235,7 +1238,7 @@ fn build_real_worker_spawner(
                     worktree: ctx.worktree.clone(),
                     session_id: ctx.session_id.clone(),
                     model,
-                    timeout: std::time::Duration::from_secs(1800),
+                    timeout: task_timeout,
                     cmd_rx,
                 };
                 // Pass the shared store by reference; run_worker locks it only
