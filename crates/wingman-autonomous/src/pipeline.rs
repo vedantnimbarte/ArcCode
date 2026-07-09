@@ -147,6 +147,9 @@ pub async fn run_to_completion(
     // set, `run_reviewer` runs the reviewer at the Review→Done choke point
     // (race-free vs the manager) and sends rework verdicts back through the
     // retry ladder, instead of a batched post-run pass.
+    // Captured before `inputs.manager_model` is moved into build_manager, so
+    // the manager phase's tokens can be priced below.
+    let manager_model = inputs.manager_model.clone();
     let reviewer: Option<orchestrator::Reviewer> = if inputs.run_reviewer {
         let provider = aux_provider.clone();
         let model = inputs.reviewer_model.clone();
@@ -193,7 +196,7 @@ pub async fn run_to_completion(
     // already emit `agent.usd`; recording the manager here keeps run totals
     // honest and feeds the per-phase breakdown. Best-effort.
     if let Ok(mut s) = RunStore::load(&run_dir).await {
-        record_phase_usage(&mut s, "manager", &manager_usage).await;
+        record_phase_usage(&mut s, "manager", &manager_model, &manager_usage).await;
     }
 
     // E11 — advisory checkpoint-hygiene check over the recorded tool
@@ -478,7 +481,7 @@ pub async fn run_to_completion(
     } else {
         false
     };
-    record_phase_usage(&mut store, "critic", &critic_usage).await;
+    record_phase_usage(&mut store, "critic", &inputs.reviewer_model, &critic_usage).await;
 
     // E8 — auto-merge gate. Combine the available signals and decide
     // whether to merge automatically. When it decides Merge and the PR was
@@ -768,18 +771,26 @@ fn detect_escalation_triggers(
 /// is logged and swallowed so instrumentation never breaks a run. (Cache
 /// read/write tokens aren't in the event schema yet, so only fresh
 /// input/output are recorded.)
-async fn record_phase_usage(store: &mut RunStore, phase: &str, usage: &wingman_core::Usage) {
+async fn record_phase_usage(
+    store: &mut RunStore,
+    phase: &str,
+    model: &str,
+    usage: &wingman_core::Usage,
+) {
     if usage.input_tokens == 0 && usage.output_tokens == 0 {
         return;
     }
+    let usd = wingman_core::pricing::price_for(model)
+        .map(|p| p.cost(usage))
+        .unwrap_or(0.0);
     if let Err(e) = store
         .append(crate::Event::AgentUsd {
             t: RunStore::now(),
             agent: format!("phase:{phase}"),
-            model: String::new(),
+            model: model.to_string(),
             input_tokens: usage.input_tokens as u64,
             output_tokens: usage.output_tokens as u64,
-            usd: 0.0,
+            usd,
         })
         .await
     {
