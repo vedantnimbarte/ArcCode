@@ -122,6 +122,14 @@ pub struct PipelineOutcome {
     pub escalation_triggers: Vec<crate::escalation::EscalationTrigger>,
 }
 
+/// Severity at/above which the E7 inline reviewer sends a task back for
+/// rework. Its own knob, decoupled from `auto_merge_max_severity`. Set to
+/// `High`: a task only reaches the reviewer after its acceptance checks pass,
+/// so functional correctness is already established — the reviewer's job is to
+/// catch genuinely severe issues, not to loop the run on the medium-severity
+/// nitpicks an over-eager model emits on correct work.
+const REVIEWER_REWORK_GATE: crate::severity::Severity = crate::severity::Severity::High;
+
 /// Drive the run from its current state to completion.
 ///
 /// Works for both fresh runs (RunStore freshly created, plan persisted)
@@ -153,15 +161,28 @@ pub async fn run_to_completion(
     let reviewer: Option<orchestrator::Reviewer> = if inputs.run_reviewer {
         let provider = aux_provider.clone();
         let model = inputs.reviewer_model.clone();
-        let gate = inputs
-            .pr_config
-            .auto_merge_max_severity
-            .parse::<crate::severity::Severity>()
-            .unwrap_or(crate::severity::Severity::Medium);
+        // The reviewer's rework bar is deliberately its own knob, not
+        // `auto_merge_max_severity` (which governs the merge decision): the
+        // reviewer should loop only on real blockers, not the low nitpicks a
+        // meticulous model tends to emit, or it deadlocks correct runs.
+        let gate = REVIEWER_REWORK_GATE;
+        let repo = project_root.clone();
+        let run_id_for_review = run_id.clone();
+        let base_for_review = state_at_start.base_commit.clone();
         Some(std::sync::Arc::new(move |task: crate::model::Task| {
             let provider = provider.clone();
             let model = model.clone();
-            Box::pin(async move { review_task_inline(provider.as_ref(), &model, &task, gate).await })
+            let repo = repo.clone();
+            let run_id = run_id_for_review.clone();
+            let base = base_for_review.clone();
+            Box::pin(async move {
+                // Review the task's real diff. With no diff to show (git error,
+                // empty change), approve rather than reject a change the model
+                // can't see — the old sight-unseen path rejected correct work
+                // and deadlocked the run.
+                let diff = crate::worktree::task_diff(&repo, &run_id, &task.id, &base)?;
+                review_task_inline(provider.as_ref(), &model, &task, &diff, gate).await
+            })
                 as std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
         }))
     } else {
@@ -271,15 +292,16 @@ pub async fn run_to_completion(
         });
     }
 
-    // The manager may finalize tasks incrementally (calling finalize_task
-    // per-task as workers report Review). When that happens, there are no
-    // Review-status tasks left at run-end and merge_integration is a no-op.
-    // When the manager skips finalize, the pipeline does it here at the
-    // end. Either way, we still want to open a PR.
+    // Merge whenever any task completed — whether the manager finalized it
+    // incrementally to Done or left it in Review for this end-of-run pass.
+    // `merge_integration` runs the actual squash per task; `finalize_task`'s
+    // incremental transition only records bookkeeping, it never runs git, so
+    // Done tasks still need this merge or their work never reaches the
+    // integration branch (and cleanup then deletes their branches).
     let need_merge = final_state
         .tasks
         .iter()
-        .any(|t| t.status == TaskStatus::Review);
+        .any(|t| matches!(t.status, TaskStatus::Review | TaskStatus::Done));
 
     let mut store = RunStore::load(&run_dir).await?;
 
@@ -334,12 +356,10 @@ pub async fn run_to_completion(
             Err(e) => return Err(e.into()),
         }
     } else {
-        // Manager finalized tasks incrementally. The integration branch
-        // may not exist yet (orchestrator.handle_finalize emits a
-        // RunMergeTask event but doesn't run git). Run the merge now
-        // against an empty task list — merge_integration will only
-        // process Review tasks, so this is essentially a no-op other
-        // than creating the integration branch ref pointing at base.
+        // No task reached Review or Done — nothing to integrate. Still
+        // create the integration branch ref (pointing at base) so downstream
+        // status/PR steps have a branch to reference; merge_integration
+        // against no mergeable tasks is a no-op beyond that.
         if !final_state.base_commit.is_empty() {
             let _ = worktree::merge_integration(
                 &project_root,
@@ -871,27 +891,39 @@ async fn review_task_inline(
     provider: &dyn Provider,
     model: &str,
     task: &crate::model::Task,
+    diff: &str,
     block_gate: crate::severity::Severity,
 ) -> Option<String> {
-    const SYSTEM: &str = "You are a meticulous code reviewer. Review the described task's \
-        diff and reply with ONLY a JSON object: {\"verdict\":\"approve\"|\"rework\", \
+    const SYSTEM: &str = "You are a pragmatic code reviewer. Review the task's actual diff \
+        (below) against its stated goal and reply with ONLY a JSON object: \
+        {\"verdict\":\"approve\"|\"rework\", \
         \"summary\":\"...\", \"findings\":[{\"severity\":\"low|medium|high|critical\", \
-        \"message\":\"...\"}]}.";
+        \"message\":\"...\"}]}. Judge only the diff shown; do not demand changes \
+        for code you cannot see. Approve when the diff satisfies the goal. Only \
+        request rework for a concrete defect — a bug, a broken build, or the goal \
+        left unmet — and record it as a medium-or-higher finding. Do not rework \
+        over style nits or preferences; file those as low-severity and approve.";
     let summary = task
         .outcome
         .as_ref()
         .map(|o| o.summary.as_str())
         .unwrap_or("(no summary)");
+    // Bound the diff so a large change can't blow the reviewer's context.
+    const MAX_DIFF_CHARS: usize = 12_000;
+    let diff_block: String = if diff.chars().count() > MAX_DIFF_CHARS {
+        let head: String = diff.chars().take(MAX_DIFF_CHARS).collect();
+        format!("{head}\n… (diff truncated)")
+    } else {
+        diff.to_string()
+    };
     let user = format!(
-        "Task #{}: {}\nRole: {}\nOutcome: {}\nFiles: {}",
+        "Task #{}: {}\nRole: {}\nGoal: {}\nWorker summary: {}\n\n## Diff\n```diff\n{}\n```",
         task.id,
         task.title,
         task.role.as_str(),
+        task.goal,
         summary,
-        task.outcome
-            .as_ref()
-            .map(|o| o.files_changed.join(", "))
-            .unwrap_or_default()
+        diff_block,
     );
     let (text, _usage) = complete_text(provider, model, SYSTEM, &user).await.ok()?;
     let report = crate::review::parse_review(extract_json(&text)).ok()?;
@@ -1760,6 +1792,7 @@ mod tests {
                 auto_merge: true,
                 require_ci_green: false,
                 auto_merge_max_severity: "low".into(),
+                base_branch: "main".into(),
             },
             true, // auto-approved
             wingman_config::PilotTier::Copilot,
@@ -1866,6 +1899,7 @@ mod tests {
                 auto_merge: true,
                 require_ci_green: true,
                 auto_merge_max_severity: "low".into(),
+                base_branch: "main".into(),
             },
             true,
             wingman_config::PilotTier::Copilot,
@@ -1900,6 +1934,7 @@ mod tests {
                 auto_merge: true,
                 require_ci_green: true,
                 auto_merge_max_severity: "low".into(),
+                base_branch: "main".into(),
             },
             true,
             wingman_config::PilotTier::Copilot,
@@ -2214,8 +2249,14 @@ mod tests {
         };
         let task = done_task("t1");
         // High finding at the Medium gate → rework, with notes.
-        let notes =
-            review_task_inline(&provider, "m", &task, crate::severity::Severity::Medium).await;
+        let notes = review_task_inline(
+            &provider,
+            "m",
+            &task,
+            "--- a/x\n+++ b/x\n@@\n+bug",
+            crate::severity::Severity::Medium,
+        )
+        .await;
         assert!(notes.is_some(), "rework verdict must return notes");
         assert!(notes.unwrap().contains("no error handling"));
     }
@@ -2227,8 +2268,14 @@ mod tests {
         };
         let task = done_task("t1");
         // Unparseable → fail-open approve → None (finalize proceeds).
-        let notes =
-            review_task_inline(&provider, "m", &task, crate::severity::Severity::Medium).await;
+        let notes = review_task_inline(
+            &provider,
+            "m",
+            &task,
+            "--- a/x\n+++ b/x\n@@\n+ok",
+            crate::severity::Severity::Medium,
+        )
+        .await;
         assert!(notes.is_none(), "garbage must fail open to approve");
     }
 
@@ -2292,6 +2339,7 @@ mod tests {
                     agent: "a".into(),
                     tool: "edit_file".into(),
                     input_hash: None,
+                    file: None,
                     ok: true,
                 })
                 .await

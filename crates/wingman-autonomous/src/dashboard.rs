@@ -892,6 +892,7 @@ mod tests {
                 agent: "agent-0001".into(),
                 tool: "edit_file".into(),
                 input_hash: None,
+                file: None,
                 ok: true,
             },
             Event::TaskStatus {

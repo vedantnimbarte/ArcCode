@@ -726,6 +726,7 @@ async fn run_actor(
                                     format!("message:{body}")
                                 },
                                 input_hash: None,
+                                file: None,
                                 ok: true,
                             })
                             .await
@@ -2829,6 +2830,7 @@ mod tests {
                     agent: "a1".into(),
                     tool: "edit_file".into(),
                     input_hash: None,
+                    file: None,
                     ok: true,
                 },
                 Event::TaskTool {
@@ -2837,6 +2839,7 @@ mod tests {
                     agent: "a1".into(),
                     tool: "edit_file".into(),
                     input_hash: None,
+                    file: None,
                     ok: true,
                 },
                 Event::TaskStatus {
