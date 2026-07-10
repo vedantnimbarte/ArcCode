@@ -1398,6 +1398,10 @@ pub struct PilotConfig {
     pub default_model: Option<String>,
     /// Cheaper model used for worker subprocesses.
     pub worker_model: Option<String>,
+    /// Model for the per-task reviewer / critic. Defaults to `default_model`
+    /// when unset — point it at a stronger model for tougher review.
+    #[serde(default)]
+    pub reviewer_model: Option<String>,
     pub max_concurrent_agents: u32,
     pub max_usd: f64,
     pub task_timeout_secs: u64,
@@ -1426,6 +1430,7 @@ impl Default for PilotConfig {
             tier: PilotTier::default(),
             default_model: None,
             worker_model: None,
+            reviewer_model: None,
             max_concurrent_agents: 4,
             max_usd: 10.0,
             task_timeout_secs: 1800,
@@ -1492,6 +1497,12 @@ pub struct PilotPrConfig {
     /// your repo's default branch (e.g. `master`). The
     /// `WINGMAN_PILOT_BASE_BRANCH` env var overrides it for one-off runs.
     pub base_branch: String,
+    /// Severity at/above which the per-task reviewer sends work back for
+    /// rework: "low" | "medium" | "high" | "critical". Defaults to `high` —
+    /// acceptance checks already gate functional correctness before review, so
+    /// an over-eager reviewer model can't loop a correct change. Lower it for
+    /// stricter review with a well-calibrated reviewer model.
+    pub reviewer_rework_severity: String,
 }
 
 impl Default for PilotPrConfig {
@@ -1501,6 +1512,7 @@ impl Default for PilotPrConfig {
             auto_merge_max_severity: "low".into(),
             require_ci_green: true,
             base_branch: "main".into(),
+            reviewer_rework_severity: "high".into(),
         }
     }
 }

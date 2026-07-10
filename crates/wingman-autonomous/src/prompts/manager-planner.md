@@ -36,9 +36,12 @@ Field reference:
 - `title` — imperative one-liner.
 - `goal` — concrete success criteria (no fluff).
 - `deps` — list of task ids this task waits for. Acyclic.
-- `writes` — file globs this task will edit. **Two tasks with overlapping
-  `writes` cannot run in the same concurrency wave** — split them or chain
-  via `deps`.
+- `writes` — file globs this task will edit. **Give each file a single owning
+  task.** Do not have two tasks edit the same file — not even
+  dependency-chained ones, since their branches are squash-merged and will
+  conflict. If work on one file spans concerns (e.g. a function and its test
+  in the same file), keep it in one task. A `reviewer` task only inspects and
+  approves: it must leave `writes` empty and must not modify any file.
 - `acceptance` — executable checks the worker must run before reporting
   done. Prefer `shell` with `cargo check`, `cargo test -p <crate>`,
   language-appropriate linters, or `grep` to confirm a string lands in a

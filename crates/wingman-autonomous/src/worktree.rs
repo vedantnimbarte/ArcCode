@@ -379,6 +379,25 @@ pub fn merge_integration(
     integration_branch: &str,
     state: &RunState,
 ) -> Result<IntegrationMergeOutcome, WorktreeError> {
+    merge_integration_with_resolver(repo_root, base_commit, integration_branch, state, None)
+}
+
+/// Type of the in-run conflict resolver: given the conflicted paths (which
+/// carry git conflict markers in the working tree), edit them to a resolved
+/// state and return `true`. Returning `false` (or no resolver) preserves the
+/// old behavior — abort the merge and surface [`WorktreeError::Conflict`].
+pub type ConflictResolver<'a> = &'a dyn Fn(&[String]) -> bool;
+
+/// [`merge_integration`] with an optional [`ConflictResolver`]. When a squash
+/// conflicts and the resolver resolves it, the task still lands instead of
+/// blocking the run.
+pub fn merge_integration_with_resolver(
+    repo_root: &Path,
+    base_commit: &str,
+    integration_branch: &str,
+    state: &RunState,
+    resolver: Option<ConflictResolver<'_>>,
+) -> Result<IntegrationMergeOutcome, WorktreeError> {
     // 1. Reset integration branch to base.
     let switch = Command::new("git")
         .arg("-C")
@@ -461,31 +480,47 @@ pub fn merge_integration(
                     }
                 }
             }
-            // Reset the index so the next attempt isn't poisoned.
-            let _ = Command::new("git")
-                .arg("-C")
-                .arg(repo_root)
-                .arg("merge")
-                .arg("--abort")
-                .output();
-            let _ = Command::new("git")
-                .arg("-C")
-                .arg(repo_root)
-                .arg("reset")
-                .arg("--hard")
-                .output();
-            if files.is_empty() {
-                // Not a content conflict — return the raw git error so the
-                // caller can see what actually broke (e.g. lock contention,
-                // unrelated histories, missing ref).
-                return Err(WorktreeError::Git(format!(
-                    "git merge --squash {branch} failed for {task_id} with no conflict files: {squash_stderr}"
-                )));
+            // E4 in-run resolution: the working tree currently holds the
+            // conflict markers. Give the resolver a shot before giving up; on
+            // success, stage the resolutions and fall through to the normal
+            // squash-commit below so this task still lands on the branch.
+            let resolved = !files.is_empty()
+                && resolver.map(|r| r(&files)).unwrap_or(false)
+                && Command::new("git")
+                    .arg("-C")
+                    .arg(repo_root)
+                    .args(["add", "-A"])
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
+                && !has_conflict_markers(repo_root, &files);
+            if !resolved {
+                // Reset the index so the next attempt isn't poisoned.
+                let _ = Command::new("git")
+                    .arg("-C")
+                    .arg(repo_root)
+                    .arg("merge")
+                    .arg("--abort")
+                    .output();
+                let _ = Command::new("git")
+                    .arg("-C")
+                    .arg(repo_root)
+                    .arg("reset")
+                    .arg("--hard")
+                    .output();
+                if files.is_empty() {
+                    // Not a content conflict — return the raw git error so the
+                    // caller can see what actually broke (e.g. lock contention,
+                    // unrelated histories, missing ref).
+                    return Err(WorktreeError::Git(format!(
+                        "git merge --squash {branch} failed for {task_id} with no conflict files: {squash_stderr}"
+                    )));
+                }
+                return Err(WorktreeError::Conflict {
+                    task_id: task_id.clone(),
+                    files,
+                });
             }
-            return Err(WorktreeError::Conflict {
-                task_id: task_id.clone(),
-                files,
-            });
         }
 
         let summary = task
@@ -524,6 +559,21 @@ pub fn merge_integration(
     let _ = WorktreeError::BranchExists; // keep variant referenced
     let _ = WorktreeError::conflict_files; // keep accessor referenced
     Ok(IntegrationMergeOutcome { commits })
+}
+
+/// True if any of `files` (relative to `repo_root`) still contains a git
+/// conflict marker. Used to reject a resolver that reported success but left
+/// markers behind, so a half-resolved file never gets committed.
+fn has_conflict_markers(repo_root: &Path, files: &[String]) -> bool {
+    files.iter().any(|f| {
+        std::fs::read_to_string(repo_root.join(f))
+            .map(|c| {
+                c.lines().any(|l| {
+                    l.starts_with("<<<<<<<") || l.starts_with("=======") || l.starts_with(">>>>>>>")
+                })
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// Remove every per-task worktree under `<project>/.wingman/worktrees/`
@@ -1003,5 +1053,61 @@ mod tests {
 
         // Clean up so test artifacts don't linger.
         let _ = cleanup_worktrees(&repo, run_id);
+    }
+
+    /// In-run resolution: the same conflict, but a resolver rewrites the
+    /// conflicted file. The task must land (no Conflict error) and the
+    /// resolved content must be on the integration branch.
+    #[test]
+    fn resolver_lands_a_conflicting_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some((repo, base)) = init_repo(tmp.path()) else {
+            eprintln!("skipping: git not available");
+            return;
+        };
+        let run_id = "resolve-test";
+        let branch = "wingman/auto/resolve-test";
+        let mut state = RunState::new(run_id, "demo", &base, branch);
+        for (id, body) in [("t1", "hello A"), ("t2", "hello B")] {
+            let mut task = Task::new(id, Role::Developer, format!("edit {id}"));
+            task.status = TaskStatus::Review;
+            state.tasks.push(task);
+            let wt = repo
+                .join(".wingman")
+                .join("worktrees")
+                .join(format!("auto-{run_id}-{id}"));
+            create_worktree(&repo, &base, run_id, id, &wt).unwrap();
+            std::fs::write(wt.join("shared.txt"), body.as_bytes()).unwrap();
+            git(&wt, &["add", "-A"]);
+            git(&wt, &["commit", "-m", &format!("touch from {id}")]);
+        }
+
+        // Resolver: write a clean merged body for any conflicted file.
+        let repo_for_resolver = repo.clone();
+        let resolver = move |files: &[String]| -> bool {
+            for f in files {
+                std::fs::write(repo_for_resolver.join(f), b"hello A\nhello B\n").unwrap();
+            }
+            true
+        };
+
+        let outcome =
+            merge_integration_with_resolver(&repo, &base, branch, &state, Some(&resolver))
+                .expect("resolver should let the merge complete");
+        assert_eq!(outcome.commits.len(), 2, "both tasks land");
+        let merged = std::fs::read_to_string(repo.join("shared.txt")).unwrap();
+        assert!(merged.contains("hello A") && merged.contains("hello B"));
+
+        let _ = cleanup_worktrees(&repo, run_id);
+    }
+
+    #[test]
+    fn has_conflict_markers_detects_and_clears() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("c.txt"), "a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> b\n")
+            .unwrap();
+        std::fs::write(tmp.path().join("clean.txt"), "a\nb\n").unwrap();
+        assert!(has_conflict_markers(tmp.path(), &["c.txt".into()]));
+        assert!(!has_conflict_markers(tmp.path(), &["clean.txt".into()]));
     }
 }
