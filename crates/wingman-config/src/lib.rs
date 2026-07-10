@@ -524,6 +524,14 @@ impl Config {
                 }
             }
         }
+        // Notification webhook URLs are secrets too — resolve `${ENV_VAR}`.
+        for url in self.pilot.notifications.webhooks.values_mut() {
+            if let Some(name) = strip_env_placeholder(url) {
+                if let Ok(val) = std::env::var(name) {
+                    *url = val;
+                }
+            }
+        }
     }
 
     /// Render this config as TOML.
@@ -1651,6 +1659,14 @@ pub struct PilotNotificationsConfig {
     pub info: String,
     /// Cron expression for flushing the digest queue.
     pub digest_cron: String,
+    /// Delivery endpoints per channel name: `channel -> webhook URL`. A
+    /// routed channel with an entry here is POSTed a `{"text": ...}` payload
+    /// (the Slack incoming-webhook shape; also works for Discord/Teams/generic
+    /// receivers and email-webhook services). Channels without an entry fall
+    /// back to the terminal. Values support `${ENV_VAR}` so the URL (a secret)
+    /// can come from the environment.
+    #[serde(default)]
+    pub webhooks: BTreeMap<String, String>,
 }
 
 impl Default for PilotNotificationsConfig {
@@ -1661,6 +1677,7 @@ impl Default for PilotNotificationsConfig {
             progress: "digest".into(),
             info: "suppress".into(),
             digest_cron: "0 9 * * *".into(),
+            webhooks: BTreeMap::new(),
         }
     }
 }

@@ -110,6 +110,12 @@ pub async fn run(cfg: Config, opts: WorkerOptions) -> Result<ExitCode> {
         }
     };
 
+    // E10 — mid-run manager→worker injections (pivot / clarify). The stdin
+    // reader below pushes formatted messages here; the learning hook drains
+    // them into the next turn's system prompt.
+    let ipc_injections: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
     let agent_cfg = AgentConfig {
         model: selection.model.clone(),
         system: Some(system),
@@ -119,34 +125,49 @@ pub async fn run(cfg: Config, opts: WorkerOptions) -> Result<ExitCode> {
             ..Default::default()
         },
         gate,
+        learning: Some(std::sync::Arc::new(IpcInjector {
+            pending: ipc_injections.clone(),
+        })),
         ..Default::default()
     };
     let mut agent = AgentLoop::new(provider, registry, agent_cfg);
 
-    // E10 — read manager→worker IPC commands from stdin. A `cancel` sets a
-    // shared flag the run loop checks so the manager can stop a live worker;
-    // pivot/clarify are logged (mid-stream injection into the running agent
-    // isn't supported by the loop API yet). The reader exits on EOF, which
-    // the parent triggers by dropping the worker's stdin.
-    // ponytail: cancel is the actionable command today; pivot/clarify need an
-    // agent-loop message-injection hook that doesn't exist — add when it does.
+    // E10 — read manager→worker IPC commands from stdin. `cancel` sets a
+    // shared flag the run loop checks; `pivot`/`clarify` are queued into
+    // `ipc_injections` and the learning hook splices them into the next
+    // turn's system prompt. The reader exits on EOF (parent drops stdin).
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         // Blocking stdin read on a dedicated thread (avoids depending on
         // tokio's io-std feature). Exits on EOF when the parent drops stdin.
         let cancel = cancel.clone();
+        let injections = ipc_injections.clone();
         std::thread::spawn(move || {
+            use wingman_autonomous::ipc::ManagerCommand;
             use std::io::BufRead;
             let stdin = std::io::stdin();
             for line in stdin.lock().lines() {
                 let Ok(line) = line else { break };
                 match wingman_autonomous::ipc::parse_command(line.trim()) {
-                    Ok(wingman_autonomous::ipc::ManagerCommand::Cancel { reason }) => {
+                    Ok(ManagerCommand::Cancel { reason }) => {
                         eprintln!("[worker] IPC cancel: {reason}");
                         cancel.store(true, std::sync::atomic::Ordering::SeqCst);
                         break;
                     }
-                    Ok(other) => eprintln!("[worker] IPC command (not injected): {other:?}"),
+                    Ok(ManagerCommand::Pivot { goal, context }) => {
+                        eprintln!("[worker] IPC pivot injected");
+                        injections.lock().unwrap().push(format!(
+                            "## Manager update — the task has PIVOTED\n\nNew goal: {goal}\n\n{context}\n\
+                             Adjust your remaining work to this; do not redo what is already correct.",
+                        ));
+                    }
+                    Ok(ManagerCommand::Clarify { answer }) => {
+                        eprintln!("[worker] IPC clarify injected");
+                        injections
+                            .lock()
+                            .unwrap()
+                            .push(format!("## Manager clarification\n\n{answer}"));
+                    }
                     Err(_) => {}
                 }
             }
@@ -205,6 +226,23 @@ pub async fn run(cfg: Config, opts: WorkerOptions) -> Result<ExitCode> {
 /// model has everything it needs without further round-trips to the
 /// orchestrator. The role markdown lays out hard rules; the task block
 /// answers "what specifically am I doing?"
+/// E10 learning hook that drains queued manager IPC messages (pivot /
+/// clarify) into the next turn's system prompt, so a live run can be steered
+/// mid-flight. The stdin reader fills `pending`; `before_turn` empties it.
+struct IpcInjector {
+    pending: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl wingman_core::LearningHook for IpcInjector {
+    fn before_turn(&self, _history: &[wingman_core::Message]) -> Option<String> {
+        let mut q = self.pending.lock().unwrap();
+        if q.is_empty() {
+            return None;
+        }
+        Some(q.drain(..).collect::<Vec<_>>().join("\n\n"))
+    }
+}
+
 fn compose_worker_system_prompt(role: &Role, task: &Task) -> String {
     // E6 — fold this role's accumulated lessons (from prior reverted /
     // rewritten work) onto the base role prompt so the worker doesn't
@@ -288,4 +326,27 @@ fn parse_role(s: &str) -> Result<Role> {
             Role::Custom(other.to_string())
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wingman_core::LearningHook;
+
+    #[test]
+    fn ipc_injector_drains_pending_once() {
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook = IpcInjector {
+            pending: pending.clone(),
+        };
+        // Empty queue → nothing to inject.
+        assert!(hook.before_turn(&[]).is_none());
+        // Two queued messages are joined and injected once...
+        pending.lock().unwrap().push("clarify: use tabs".into());
+        pending.lock().unwrap().push("pivot: target v2".into());
+        let injected = hook.before_turn(&[]).expect("injects pending");
+        assert!(injected.contains("use tabs") && injected.contains("target v2"));
+        // ...then drained, so the next turn injects nothing.
+        assert!(hook.before_turn(&[]).is_none());
+    }
 }

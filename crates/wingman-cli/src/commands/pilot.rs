@@ -648,19 +648,30 @@ fn report_run_outcome(
     };
     match route(severity, cfg) {
         RoutingDecision::Immediate(channels) => {
-            // Only the terminal is actually delivered today; Slack/email
-            // transports need live accounts (a deferred leaf). Print the
-            // notice to the terminal and, if the routing targeted channels we
-            // can't yet deliver to, say so plainly rather than implying we
-            // sent it there.
+            // Terminal delivery is always the desktop/terminal channel.
             eprintln!("[pilot] 🔔 {body}");
-            let undelivered: Vec<&String> = channels
-                .iter()
-                .filter(|c| !matches!(c.as_str(), "desktop" | "terminal"))
-                .collect();
-            if !undelivered.is_empty() {
+            // Deliver to any routed channel that has a configured webhook URL
+            // (`[pilot.notifications.webhooks].<channel>`), POSTing the Slack
+            // incoming-webhook `{"text": …}` shape. Channels without an
+            // endpoint fall back to the terminal notice above.
+            let runner = wingman_autonomous::pr::SystemCommandRunner;
+            let report = wingman_autonomous::notify::deliver_to_channels(
+                &runner,
+                &channels,
+                &cfg.webhooks,
+                &body,
+            );
+            for ch in &report.delivered {
+                eprintln!("[pilot]    → delivered to '{ch}'");
+            }
+            for (ch, err) in &report.failed {
+                eprintln!("[pilot]    (channel '{ch}' webhook failed: {err})");
+            }
+            if !report.unconfigured.is_empty() {
                 eprintln!(
-                    "[pilot]    (routed to {undelivered:?}, but those transports aren't wired yet — shown here instead)"
+                    "[pilot]    (channels {:?} have no webhook — set \
+                     [pilot.notifications.webhooks].<channel>; shown above instead)",
+                    report.unconfigured
                 );
             }
         }
@@ -1507,10 +1518,16 @@ pub async fn daemon(cfg: Config, cycles: usize) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
 
-    // Honesty check: only `github_issues` has a live discovery path. Warn
-    // (don't fail) for any configured source we can't actually poll, so the
-    // daemon doesn't look broken when it silently finds nothing.
-    const IMPLEMENTED_SOURCES: &[&str] = &["github_issues", "todos"];
+    // Honesty check: warn (don't fail) for any configured source we can't
+    // actually poll, so the daemon doesn't look broken when it silently
+    // finds nothing.
+    const IMPLEMENTED_SOURCES: &[&str] = &[
+        "github_issues",
+        "todos",
+        "ci_failures",
+        "dependabot",
+        "coverage_gaps",
+    ];
     for s in &pilot.daemon.sources {
         if !IMPLEMENTED_SOURCES.contains(&s.as_str()) {
             eprintln!(

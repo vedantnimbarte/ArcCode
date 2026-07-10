@@ -179,6 +179,40 @@ pub fn send_webhook(runner: &dyn CommandRunner, url: &str, body: &str) -> Result
     }
 }
 
+/// Outcome of a delivery pass: which channels went out, which failed (with
+/// the error), and which were routed but have no configured endpoint.
+#[derive(Debug, Default, PartialEq)]
+pub struct DeliveryReport {
+    pub delivered: Vec<String>,
+    pub failed: Vec<(String, String)>,
+    pub unconfigured: Vec<String>,
+}
+
+/// J3 delivery: for each routed `channel`, POST `body` to its configured
+/// webhook (`webhooks[channel]`). `desktop`/`terminal` are skipped (the
+/// caller prints those). Channels with no endpoint land in `unconfigured`.
+pub fn deliver_to_channels(
+    runner: &dyn CommandRunner,
+    channels: &[String],
+    webhooks: &std::collections::BTreeMap<String, String>,
+    body: &str,
+) -> DeliveryReport {
+    let mut report = DeliveryReport::default();
+    for ch in channels {
+        if matches!(ch.as_str(), "desktop" | "terminal") {
+            continue;
+        }
+        match webhooks.get(ch) {
+            Some(url) if !url.trim().is_empty() => match send_webhook(runner, url, body) {
+                Ok(()) => report.delivered.push(ch.clone()),
+                Err(e) => report.failed.push((ch.clone(), e)),
+            },
+            _ => report.unconfigured.push(ch.clone()),
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +311,31 @@ mod tests {
         let args = &calls[0];
         assert!(args.iter().any(|a| a == "https://hooks.slack.com/x"));
         assert!(args.iter().any(|a| a.contains("run done")));
+    }
+
+    #[test]
+    fn deliver_routes_configured_and_reports_rest() {
+        let runner = RecordingCurl {
+            calls: Mutex::new(Vec::new()),
+        };
+        let mut webhooks = std::collections::BTreeMap::new();
+        webhooks.insert("slack".to_string(), "https://hooks.slack.com/x".to_string());
+        webhooks.insert("empty".to_string(), "  ".to_string()); // blank → unconfigured
+        let channels = vec![
+            "desktop".into(), // skipped (terminal)
+            "slack".into(),   // delivered
+            "email".into(),   // no entry → unconfigured
+            "empty".into(),   // blank entry → unconfigured
+        ];
+        let report = deliver_to_channels(&runner, &channels, &webhooks, "run done");
+        assert_eq!(report.delivered, vec!["slack".to_string()]);
+        assert_eq!(
+            report.unconfigured,
+            vec!["email".to_string(), "empty".to_string()]
+        );
+        assert!(report.failed.is_empty());
+        // Exactly one webhook POST (slack); desktop/email/empty didn't POST.
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
     }
 
     #[test]

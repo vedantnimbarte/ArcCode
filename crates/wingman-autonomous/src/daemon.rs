@@ -184,6 +184,168 @@ pub fn fetch_todo_candidates(
     Ok(candidates)
 }
 
+/// Cap on how many candidates each `gh`-backed source surfaces per poll.
+const MAX_GH_CANDIDATES: usize = 20;
+
+/// J2 discovery source: failed CI runs via `gh run list --status failure`.
+/// Each failing workflow run maps to a "fix the failing build" candidate.
+/// These are repo-internal (no external author) so trust is [`TrustLevel::Known`]
+/// — they surface as proposals, high value (a red build blocks everyone).
+pub fn fetch_ci_failure_candidates(
+    runner: &dyn CommandRunner,
+    repo_root: &Path,
+) -> Result<Vec<Candidate>, String> {
+    let out = runner
+        .run(
+            "gh",
+            &[
+                "run",
+                "list",
+                "--status",
+                "failure",
+                "--limit",
+                "20",
+                "--json",
+                "databaseId,displayTitle,workflowName",
+            ],
+            repo_root,
+        )
+        .map_err(|e| format!("gh run list failed: {e}"))?;
+    if !out.success() {
+        return Err(format!("gh run list exited non-zero: {}", out.stderr.trim()));
+    }
+    let items: serde_json::Value =
+        serde_json::from_str(&out.stdout).map_err(|e| format!("bad gh json: {e}"))?;
+    let mut candidates = Vec::new();
+    for it in items.as_array().cloned().unwrap_or_default() {
+        let id = it.get("databaseId").and_then(|n| n.as_u64()).unwrap_or(0);
+        let workflow = it
+            .get("workflowName")
+            .and_then(|w| w.as_str())
+            .unwrap_or("CI");
+        let run_title = it
+            .get("displayTitle")
+            .and_then(|t| t.as_str())
+            .unwrap_or("(untitled run)");
+        candidates.push(Candidate {
+            source: format!("ci_failure#{id}"),
+            title: format!("Fix failing {workflow}: {run_title}"),
+            // A red build is high-value, moderate-confidence (root cause
+            // varies), moderate-risk work.
+            value: 0.8,
+            confidence: 0.5,
+            risk: 0.5,
+            trust: TrustLevel::Known,
+        });
+        if candidates.len() >= MAX_GH_CANDIDATES {
+            break;
+        }
+    }
+    Ok(candidates)
+}
+
+/// J2 discovery source: open Dependabot PRs via `gh pr list`. Each is a
+/// dependency bump to review/merge. Dependabot is a known bot; a bump is
+/// low-risk and high-confidence, so these surface as proposals (auto-run
+/// still requires the trust config to clear the threshold).
+pub fn fetch_dependabot_candidates(
+    runner: &dyn CommandRunner,
+    repo_root: &Path,
+) -> Result<Vec<Candidate>, String> {
+    let out = runner
+        .run(
+            "gh",
+            &[
+                "pr",
+                "list",
+                "--author",
+                "app/dependabot",
+                "--json",
+                "number,title",
+            ],
+            repo_root,
+        )
+        .map_err(|e| format!("gh pr list failed: {e}"))?;
+    if !out.success() {
+        return Err(format!("gh pr list exited non-zero: {}", out.stderr.trim()));
+    }
+    let items: serde_json::Value =
+        serde_json::from_str(&out.stdout).map_err(|e| format!("bad gh json: {e}"))?;
+    let mut candidates = Vec::new();
+    for it in items.as_array().cloned().unwrap_or_default() {
+        let number = it.get("number").and_then(|n| n.as_u64()).unwrap_or(0);
+        let title = it
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("(untitled)");
+        candidates.push(Candidate {
+            source: format!("dependabot#{number}"),
+            title: format!("Dependency update: {title}"),
+            value: 0.5,
+            confidence: 0.8,
+            risk: 0.3,
+            trust: TrustLevel::Known,
+        });
+        if candidates.len() >= MAX_GH_CANDIDATES {
+            break;
+        }
+    }
+    Ok(candidates)
+}
+
+/// J2 discovery source: under-tested files from an existing lcov report
+/// (`lcov.info` / `coverage.lcov` / `coverage/lcov.info`, whichever exists).
+/// Reads coverage the user already generated — it does not run a coverage
+/// tool. Files below `min_ratio` line coverage become "add tests" candidates.
+pub fn fetch_coverage_gap_candidates(
+    repo_root: &Path,
+    min_ratio: f64,
+) -> Result<Vec<Candidate>, String> {
+    let lcov = ["lcov.info", "coverage.lcov", "coverage/lcov.info"]
+        .iter()
+        .map(|p| repo_root.join(p))
+        .find(|p| p.exists());
+    let Some(path) = lcov else {
+        return Ok(Vec::new()); // no coverage report → nothing to surface
+    };
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {path:?}: {e}"))?;
+    let mut candidates = Vec::new();
+    let mut file: Option<String> = None;
+    let (mut found, mut hit) = (0u64, 0u64);
+    for line in text.lines() {
+        if let Some(sf) = line.strip_prefix("SF:") {
+            file = Some(sf.trim().to_string());
+            found = 0;
+            hit = 0;
+        } else if let Some(lf) = line.strip_prefix("LF:") {
+            found = lf.trim().parse().unwrap_or(0);
+        } else if let Some(lh) = line.strip_prefix("LH:") {
+            hit = lh.trim().parse().unwrap_or(0);
+        } else if line.starts_with("end_of_record") {
+            if let Some(f) = file.take() {
+                let ratio = if found == 0 { 1.0 } else { hit as f64 / found as f64 };
+                if found > 0 && ratio < min_ratio {
+                    let pct = (ratio * 100.0).round() as u64;
+                    candidates.push(Candidate {
+                        source: format!("coverage:{f}"),
+                        title: format!("Add tests for {f} ({pct}% line coverage)"),
+                        value: 0.4,
+                        confidence: 0.6,
+                        risk: 0.2,
+                        trust: TrustLevel::Known,
+                    });
+                }
+            }
+            found = 0;
+            hit = 0;
+        }
+        if candidates.len() >= MAX_GH_CANDIDATES {
+            break;
+        }
+    }
+    Ok(candidates)
+}
+
 /// J2 discovery cycle: one full pass of the daemon — fetch candidates
 /// from the configured sources, rank them, and decide an action for each.
 /// The infinite scheduling (sleep `poll_interval_secs`, repeat) is trivial
@@ -209,6 +371,22 @@ pub fn run_cycle(
     }
     if cfg.sources.iter().any(|s| s == "todos") {
         if let Ok(found) = fetch_todo_candidates(runner, repo_root) {
+            candidates.extend(found);
+        }
+    }
+    if cfg.sources.iter().any(|s| s == "ci_failures") {
+        if let Ok(found) = fetch_ci_failure_candidates(runner, repo_root) {
+            candidates.extend(found);
+        }
+    }
+    if cfg.sources.iter().any(|s| s == "dependabot") {
+        if let Ok(found) = fetch_dependabot_candidates(runner, repo_root) {
+            candidates.extend(found);
+        }
+    }
+    if cfg.sources.iter().any(|s| s == "coverage_gaps") {
+        // Surface files below 50% line coverage from an existing lcov report.
+        if let Ok(found) = fetch_coverage_gap_candidates(repo_root, 0.5) {
             candidates.extend(found);
         }
     }
@@ -463,5 +641,63 @@ mod tests {
         let ranked = rank(cands);
         assert_eq!(ranked[0].title, "high");
         assert_eq!(ranked[2].title, "low");
+    }
+
+    struct FakeGhJson(&'static str, &'static str); // (subcommand, json)
+    impl CommandRunner for FakeGhJson {
+        fn run(&self, program: &str, args: &[&str], _cwd: &StdPath) -> std::io::Result<CommandOut> {
+            let stdout = if program == "gh" && args.first().copied() == Some(self.0) {
+                self.1.to_string()
+            } else {
+                String::new()
+            };
+            Ok(CommandOut {
+                status: Some(0),
+                stdout,
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn fetch_ci_failures_maps_runs() {
+        let gh = FakeGhJson(
+            "run",
+            r#"[{"databaseId":991,"displayTitle":"Merge #4","workflowName":"ci"}]"#,
+        );
+        let c = fetch_ci_failure_candidates(&gh, StdPath::new(".")).unwrap();
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].source, "ci_failure#991");
+        assert!(c[0].title.contains("Fix failing ci"));
+        assert_eq!(c[0].trust, TrustLevel::Known);
+    }
+
+    #[test]
+    fn fetch_dependabot_maps_prs() {
+        let gh = FakeGhJson("pr", r#"[{"number":12,"title":"bump serde to 1.0.2"}]"#);
+        let c = fetch_dependabot_candidates(&gh, StdPath::new(".")).unwrap();
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].source, "dependabot#12");
+        assert!(c[0].title.contains("bump serde"));
+    }
+
+    #[test]
+    fn fetch_coverage_gaps_flags_undertested_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        // src/low.rs at 25% (< 50%), src/high.rs at 90% (kept).
+        std::fs::write(
+            tmp.path().join("lcov.info"),
+            "SF:src/low.rs\nLF:4\nLH:1\nend_of_record\nSF:src/high.rs\nLF:10\nLH:9\nend_of_record\n",
+        )
+        .unwrap();
+        let c = fetch_coverage_gap_candidates(tmp.path(), 0.5).unwrap();
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].source, "coverage:src/low.rs");
+        assert!(c[0].title.contains("25%"));
+        // No lcov file → no candidates, not an error.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(fetch_coverage_gap_candidates(empty.path(), 0.5)
+            .unwrap()
+            .is_empty());
     }
 }
