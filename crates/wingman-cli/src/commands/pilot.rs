@@ -491,10 +491,16 @@ pub async fn run(cfg: Config, opts: PilotOptions) -> Result<ExitCode> {
         security_config: pilot.security.clone(),
         run_reviewer: capability_on(&pilot, "per_task_reviewer"),
         run_critic: capability_on(&pilot, "critic"),
-        reviewer_model: pilot
-            .default_model
-            .clone()
-            .unwrap_or_else(|| selection.model.clone()),
+        // Resolve through the same provider/model split the manager uses so a
+        // `provider/model` config value (e.g. `openrouter/deepseek/…`) becomes
+        // the bare model id the provider's API expects — the prefixed string
+        // 400s ("not a valid model ID") and the agent silently fails.
+        reviewer_model: match pilot.reviewer_model.clone().or_else(|| pilot.default_model.clone()) {
+            Some(s) => runtime::resolve_selection(&cfg, Some(&s))
+                .map(|sel| sel.model)
+                .unwrap_or_else(|_| selection.model.clone()),
+            None => selection.model.clone(),
+        },
         sandbox_default_tier: pilot.sandbox.default_tier.clone(),
         dangerous_paths: pilot.approval.dangerous_paths.clone(),
     };
@@ -1246,11 +1252,19 @@ pub async fn resume(
         security_config: cfg.pilot.security.clone(),
         run_reviewer: capability_on(&cfg.pilot, "per_task_reviewer"),
         run_critic: capability_on(&cfg.pilot, "critic"),
-        reviewer_model: cfg
+        // See the run() path: strip the provider prefix so the reviewer model
+        // is a bare id the provider's API accepts.
+        reviewer_model: match cfg
             .pilot
-            .default_model
+            .reviewer_model
             .clone()
-            .unwrap_or_else(|| selection.model.clone()),
+            .or_else(|| cfg.pilot.default_model.clone())
+        {
+            Some(s) => runtime::resolve_selection(&cfg, Some(&s))
+                .map(|sel| sel.model)
+                .unwrap_or_else(|_| selection.model.clone()),
+            None => selection.model.clone(),
+        },
         sandbox_default_tier: cfg.pilot.sandbox.default_tier.clone(),
         dangerous_paths: cfg.pilot.approval.dangerous_paths.clone(),
     };

@@ -122,12 +122,11 @@ pub struct PipelineOutcome {
     pub escalation_triggers: Vec<crate::escalation::EscalationTrigger>,
 }
 
-/// Severity at/above which the E7 inline reviewer sends a task back for
-/// rework. Its own knob, decoupled from `auto_merge_max_severity`. Set to
-/// `High`: a task only reaches the reviewer after its acceptance checks pass,
-/// so functional correctness is already established — the reviewer's job is to
-/// catch genuinely severe issues, not to loop the run on the medium-severity
-/// nitpicks an over-eager model emits on correct work.
+/// Fallback rework gate when `[pilot.pr] reviewer_rework_severity` is unset or
+/// unparseable. `High`: a task only reaches the reviewer after its acceptance
+/// checks pass, so functional correctness is already established — the
+/// reviewer's job is to catch genuinely severe issues, not to loop the run on
+/// the medium-severity nitpicks an over-eager model emits on correct work.
 const REVIEWER_REWORK_GATE: crate::severity::Severity = crate::severity::Severity::High;
 
 /// Drive the run from its current state to completion.
@@ -161,11 +160,16 @@ pub async fn run_to_completion(
     let reviewer: Option<orchestrator::Reviewer> = if inputs.run_reviewer {
         let provider = aux_provider.clone();
         let model = inputs.reviewer_model.clone();
-        // The reviewer's rework bar is deliberately its own knob, not
-        // `auto_merge_max_severity` (which governs the merge decision): the
-        // reviewer should loop only on real blockers, not the low nitpicks a
-        // meticulous model tends to emit, or it deadlocks correct runs.
-        let gate = REVIEWER_REWORK_GATE;
+        // The reviewer's rework bar is its own knob (`[pilot.pr]
+        // reviewer_rework_severity`, default `high`), deliberately separate
+        // from `auto_merge_max_severity` (which governs the merge decision):
+        // the reviewer should loop only on real blockers, not the low nitpicks
+        // a meticulous model tends to emit, or it deadlocks correct runs.
+        let gate = inputs
+            .pr_config
+            .reviewer_rework_severity
+            .parse::<crate::severity::Severity>()
+            .unwrap_or(REVIEWER_REWORK_GATE);
         let repo = project_root.clone();
         let run_id_for_review = run_id.clone();
         let base_for_review = state_at_start.base_commit.clone();
@@ -305,12 +309,33 @@ pub async fn run_to_completion(
 
     let mut store = RunStore::load(&run_dir).await?;
 
+    // E4 in-run conflict resolver: bridge the sync merge path to an async
+    // agent that rewrites conflict markers to a clean resolution. Runs on the
+    // multi-thread runtime via `block_in_place`. If it can't resolve, the
+    // merge falls back to recording a merge-fixer task (the `Conflict` arm
+    // below), so a bad resolution never lands — the file's markers are
+    // re-checked before commit.
+    let resolve_provider = aux_provider.clone();
+    let resolve_model = inputs.reviewer_model.clone();
+    let resolve_root = project_root.clone();
+    let resolver = move |files: &[String]| -> bool {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(resolve_conflicts_inline(
+                resolve_provider.as_ref(),
+                &resolve_model,
+                &resolve_root,
+                files,
+            ))
+        })
+    };
+
     let merge_outcome = if need_merge {
-        match worktree::merge_integration(
+        match worktree::merge_integration_with_resolver(
             &project_root,
             &final_state.base_commit,
             &integration_branch,
             &final_state,
+            Some(&resolver),
         ) {
             Ok(outcome) => {
                 pr::finalize_all_review_tasks(&mut store, &final_state, &outcome.commits).await?;
@@ -887,6 +912,68 @@ fn extract_json(s: &str) -> &str {
 /// Rework, or a finding at/above `block_gate`), or `None` to approve. A
 /// call/parse failure defaults to approve (fail-open, same as the post-run
 /// pass) so a flaky reviewer can't wedge the run.
+/// Strip a single leading/trailing markdown code fence if the model wrapped
+/// its answer in one, so we write the raw file content, not ```-decorated text.
+fn strip_fence(s: &str) -> String {
+    let t = s.trim();
+    if let Some(rest) = t.strip_prefix("```") {
+        // drop the opening fence line (may carry a language tag) and a
+        // closing ``` if present.
+        let body = rest.split_once('\n').map(|x| x.1).unwrap_or("");
+        let body = body.strip_suffix("```").unwrap_or(body);
+        return body.trim_end().to_string();
+    }
+    t.to_string()
+}
+
+/// E4 in-run merge-conflict resolver. For each conflicted file (which holds
+/// git conflict markers), ask the model for the fully resolved contents and
+/// write them back. Returns `true` only if every file was rewritten with no
+/// markers left; any error or a still-conflicted result returns `false`, so
+/// the caller falls back to the merge-fixer task instead of committing garbage.
+async fn resolve_conflicts_inline(
+    provider: &dyn Provider,
+    model: &str,
+    repo_root: &std::path::Path,
+    files: &[String],
+) -> bool {
+    const SYSTEM: &str = "You resolve a git merge conflict in a single file. You are given \
+        the file's full contents including conflict markers (<<<<<<<, =======, >>>>>>>). \
+        Reply with ONLY the fully resolved file contents — every marker removed, both \
+        sides' intent integrated. No commentary, no markdown fences.";
+    for f in files {
+        let path = repo_root.join(f);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return false;
+        };
+        if !content.contains("<<<<<<<") {
+            continue; // nothing to resolve in this file
+        }
+        let user = format!("Path: {f}\n\n{content}");
+        let Ok((answer, _usage)) = complete_text(provider, model, SYSTEM, &user).await else {
+            tracing::warn!(target: "pilot::pipeline", file = %f, "conflict resolver: model call failed");
+            return false;
+        };
+        let resolved = strip_fence(&answer);
+        if resolved.trim().is_empty()
+            || resolved.contains("<<<<<<<")
+            || resolved.contains(">>>>>>>")
+        {
+            return false;
+        }
+        // Preserve a trailing newline like most source files carry.
+        let resolved = if resolved.ends_with('\n') {
+            resolved
+        } else {
+            format!("{resolved}\n")
+        };
+        if std::fs::write(&path, resolved.as_bytes()).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 async fn review_task_inline(
     provider: &dyn Provider,
     model: &str,
@@ -1793,6 +1880,7 @@ mod tests {
                 require_ci_green: false,
                 auto_merge_max_severity: "low".into(),
                 base_branch: "main".into(),
+                reviewer_rework_severity: "high".into(),
             },
             true, // auto-approved
             wingman_config::PilotTier::Copilot,
@@ -1900,6 +1988,7 @@ mod tests {
                 require_ci_green: true,
                 auto_merge_max_severity: "low".into(),
                 base_branch: "main".into(),
+                reviewer_rework_severity: "high".into(),
             },
             true,
             wingman_config::PilotTier::Copilot,
@@ -1935,6 +2024,7 @@ mod tests {
                 require_ci_green: true,
                 auto_merge_max_severity: "low".into(),
                 base_branch: "main".into(),
+                reviewer_rework_severity: "high".into(),
             },
             true,
             wingman_config::PilotTier::Copilot,
@@ -2277,6 +2367,116 @@ mod tests {
         )
         .await;
         assert!(notes.is_none(), "garbage must fail open to approve");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolver_bridge_resolves_conflict_via_block_in_place() {
+        // Exercises the exact live path: the sync merge calls a resolver that
+        // bridges to the async `resolve_conflicts_inline` via block_in_place +
+        // block_on. Uses a canned provider so it's deterministic and offline.
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        let gitc = |dir: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t.t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t.t")
+                .output()
+        };
+        if gitc(&repo, &["init", "-q"]).is_err() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
+        gitc(&repo, &["add", "-A"]).unwrap();
+        gitc(&repo, &["commit", "-qm", "seed"]).unwrap();
+        let base = String::from_utf8(gitc(&repo, &["rev-parse", "HEAD"]).unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let run_id = "bridge";
+        let mut state = crate::model::RunState::new(run_id, "g", &base, "wingman/auto/bridge");
+        for (id, body) in [("t1", "A"), ("t2", "B")] {
+            let mut task = Task::new(id, Role::Developer, format!("edit {id}"));
+            task.status = TaskStatus::Review;
+            state.tasks.push(task);
+            let wt = repo
+                .join(".wingman")
+                .join("worktrees")
+                .join(format!("auto-{run_id}-{id}"));
+            crate::worktree::create_worktree(&repo, &base, run_id, id, &wt).unwrap();
+            std::fs::write(wt.join("shared.txt"), format!("base\n{body}\n")).unwrap();
+            gitc(&wt, &["add", "-A"]).unwrap();
+            gitc(&wt, &["commit", "-qm", "edit"]).unwrap();
+        }
+
+        // Canned model returns a clean merged file.
+        let provider = CannedTextProvider {
+            text: "base\nA\nB\n".into(),
+        };
+        let repo_c = repo.clone();
+        let resolver = move |files: &[String]| -> bool {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(resolve_conflicts_inline(
+                    &provider, "m", &repo_c, files,
+                ))
+            })
+        };
+
+        let outcome = crate::worktree::merge_integration_with_resolver(
+            &repo,
+            &base,
+            "wingman/auto/bridge",
+            &state,
+            Some(&resolver),
+        )
+        .expect("resolver bridge should land the conflicting task");
+        assert_eq!(outcome.commits.len(), 2);
+        let merged = std::fs::read_to_string(repo.join("shared.txt")).unwrap();
+        assert!(merged.contains('A') && merged.contains('B') && !merged.contains("<<<<<<<"));
+    }
+
+    #[test]
+    fn strip_fence_unwraps_a_single_code_block() {
+        assert_eq!(strip_fence("plain"), "plain");
+        assert_eq!(strip_fence("```rust\nlet x = 1;\n```"), "let x = 1;");
+        assert_eq!(strip_fence("```\nno lang\n```"), "no lang");
+    }
+
+    #[tokio::test]
+    async fn resolve_conflicts_inline_writes_resolved_content() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("shared.txt");
+        std::fs::write(&path, "top\n<<<<<<< HEAD\nA\n=======\nB\n>>>>>>> other\n").unwrap();
+        // The model returns the clean merged file (wrapped in a fence to also
+        // exercise strip_fence).
+        let provider = CannedTextProvider {
+            text: "```\ntop\nA\nB\n```".into(),
+        };
+        let ok = resolve_conflicts_inline(&provider, "m", tmp.path(), &["shared.txt".into()]).await;
+        assert!(ok, "resolver should report success");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains("<<<<<<<") && after.contains('A') && after.contains('B'));
+    }
+
+    #[tokio::test]
+    async fn resolve_conflicts_inline_rejects_a_still_conflicted_answer() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("shared.txt");
+        let original = "<<<<<<< HEAD\nA\n=======\nB\n>>>>>>> other\n";
+        std::fs::write(&path, original).unwrap();
+        // Model hands back markers still present → reject, leave file untouched.
+        let provider = CannedTextProvider {
+            text: "<<<<<<< still\nA\n=======\nB\n>>>>>>> broken".into(),
+        };
+        let ok = resolve_conflicts_inline(&provider, "m", tmp.path(), &["shared.txt".into()]).await;
+        assert!(!ok, "a still-conflicted answer must be rejected");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     #[tokio::test]
