@@ -198,14 +198,21 @@ autopilot  (experimental) Agent flies and navigates. Daemon mode, critic
 > functional correctness before it reaches review, so an over-eager reviewer
 > model can't loop a correct change. The PR base branch is configurable via
 > `[pilot.pr].base_branch` (default `main`).
-> `autopilot` is experimental and ships with known gaps: the discovery
-> daemon polls **GitHub issues only** (`ci_failures` / `dependabot` /
-> `todos` / `coverage_gaps` are planned, not implemented); Slack/email
-> intake and notification transports are not wired (notices print to the
-> terminal); voice intake needs audio hardware. Auto-dispatch
-> (`[pilot.daemon].auto_dispatch`) opens real PRs autonomously and is
-> off by default — tune your trust config and dry-run with `daemon
-> --cycles 1` before enabling it.
+> `autopilot` is experimental and ships with known gaps. The discovery
+> daemon now polls `github_issues`, `todos`, `ci_failures`, `dependabot`,
+> and `coverage_gaps` (the last reads an existing `lcov.info` report).
+> **Notification** delivery is wired: any routed channel with an entry under
+> `[pilot.notifications.webhooks]` (e.g. a Slack incoming-webhook URL) is
+> POSTed; channels without an endpoint fall back to the terminal. Mid-run
+> steering works too — `pivot` / `clarify` IPC messages are injected into
+> the worker's next turn. Still open: **inbound intake** (a running
+> Slack/email receiver — the parsing/trust layer exists, the live listener
+> does not); **voice intake** (needs audio hardware); the **`vm` sandbox
+> tier** (fail-closed — pilot refuses vm-tier tasks rather than run them
+> unsandboxed); and live validation of **auto-dispatch**
+> (`[pilot.daemon].auto_dispatch` opens real PRs autonomously; off by
+> default — tune your trust config and dry-run with `daemon --cycles 1`
+> before enabling it).
 
 Pick a tier in `~/.wingman/config.toml`:
 
@@ -261,12 +268,13 @@ provider-support gate). On top of that, the crate now ships the
 `copilot`/`autopilot` machinery: a live control channel (`approve` /
 `veto` / `abort` / `retry`), run `resume`, a per-run plan-approval gate,
 sandbox tiers (`host` / `container` / `vm`, degrading to `host` when no
-Docker daemon is present), and the always-on discovery `daemon` (GitHub
-issues). End-to-end `copilot` runs have been validated on a live provider
+Docker daemon is present), and the always-on discovery `daemon` (five
+sources: GitHub issues, TODOs, CI failures, Dependabot PRs, coverage gaps).
+End-to-end `copilot` runs have been validated on a live provider
 (OpenRouter/DeepSeek) — plan through PR; they need real API keys and are
-**user-validated, not CI-validated** (CI runs the unit suite). `autopilot`-only
-extras (multi-source discovery, Slack/email transports, voice) are partial or
-unimplemented.
+**user-validated, not CI-validated** (CI runs the unit suite). Remaining
+`autopilot`-only gaps: inbound Slack/email intake, voice intake, the `vm`
+sandbox tier, and live-validated auto-dispatch (see Maturity above).
 
 ### Provider support for pilot mode
 
