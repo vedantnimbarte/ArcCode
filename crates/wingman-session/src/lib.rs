@@ -293,3 +293,99 @@ pub fn session_meta(records: &[SessionRecord]) -> Option<(String, String)> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Write a message and a couple of records, then read the file back and
+    /// confirm the log round-trips through JSONL without loss.
+    #[tokio::test]
+    async fn write_then_load_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path()).await.unwrap();
+        let path = log.path().to_path_buf();
+
+        log.write(SessionRecord::SessionStart {
+            ts: "t0".into(),
+            model: "claude".into(),
+            provider: "anthropic".into(),
+            system_hash: None,
+        })
+        .await
+        .unwrap();
+        log.record_message(&Message::user_text("hello")).await.unwrap();
+        drop(log); // flush by closing the handle
+
+        let records = load_session(&path).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(session_meta(&records), Some(("anthropic".into(), "claude".into())));
+        assert!(matches!(&records[1], SessionRecord::User { text, .. } if text == "hello"));
+    }
+
+    /// load_session ignores blank lines rather than erroring on them.
+    #[test]
+    fn load_skips_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(
+            &path,
+            "{\"kind\":\"user\",\"ts\":\"t\",\"text\":\"hi\"}\n\n  \n",
+        )
+        .unwrap();
+        assert_eq!(load_session(&path).unwrap().len(), 1);
+    }
+
+    /// Consecutive ToolResult records must collapse into a single user message
+    /// of tool_result blocks, and that message must land *before* the following
+    /// user prompt — the ordering AgentLoop::with_history depends on.
+    #[test]
+    fn tool_results_accumulate_then_flush_before_next_prompt() {
+        let records = vec![
+            SessionRecord::User { ts: "t".into(), text: "q1".into() },
+            SessionRecord::ToolResult { ts: "t".into(), id: "a".into(), output: "ra".into(), is_error: false },
+            SessionRecord::ToolResult { ts: "t".into(), id: "b".into(), output: "rb".into(), is_error: true },
+            SessionRecord::User { ts: "t".into(), text: "q2".into() },
+        ];
+        let msgs = records_to_messages(&records);
+        // q1, [tool_results a+b], q2
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1].content.len(), 2); // both tool results in one message
+        assert!(matches!(&msgs[1].content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "a"));
+        assert!(matches!(&msgs[2].content[0], ContentBlock::Text { text } if text == "q2"));
+    }
+
+    /// Trailing tool results (no following prompt) are still flushed.
+    #[test]
+    fn trailing_tool_results_are_flushed() {
+        let records = vec![SessionRecord::ToolResult {
+            ts: "t".into(),
+            id: "x".into(),
+            output: "out".into(),
+            is_error: false,
+        }];
+        assert_eq!(records_to_messages(&records).len(), 1);
+    }
+
+    /// list_sessions returns only .jsonl files, newest (highest timestamp) first.
+    #[test]
+    fn list_sessions_is_newest_first_and_jsonl_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("20240101T000000000Z.jsonl"), "").unwrap();
+        std::fs::write(dir.path().join("20240202T000000000Z.jsonl"), "").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "").unwrap();
+        let got = list_sessions(dir.path());
+        assert_eq!(got.len(), 2);
+        assert!(got[0].file_name().unwrap().to_str().unwrap().starts_with("20240202"));
+    }
+
+    /// fork_session with a `take` limit copies only the first N records.
+    #[tokio::test]
+    async fn fork_truncates_to_take() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.jsonl");
+        std::fs::write(&src, "l1\nl2\nl3\n").unwrap();
+        let forked = fork_session(&src, dir.path(), Some(2)).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&forked).unwrap(), "l1\nl2\n");
+    }
+}

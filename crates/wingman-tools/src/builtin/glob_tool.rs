@@ -55,7 +55,10 @@ impl Tool for Glob {
             Ok(g) => g,
             Err(e) => return ToolOutcome::err(format!("bad pattern: {e}")),
         };
-        let set = GlobSetBuilder::new().add(pat).build().unwrap();
+        let set = match GlobSetBuilder::new().add(pat).build() {
+            Ok(set) => set,
+            Err(e) => return ToolOutcome::err(format!("bad pattern: {e}")),
+        };
         let limit = args.limit.unwrap_or(200) as usize;
         let base_for_task = base.clone();
 

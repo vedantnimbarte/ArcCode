@@ -375,3 +375,85 @@ impl McpToolHandle for McpTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// A client that records the last call and returns a canned reply, so the
+    /// McpTool adapter can be exercised without spawning a real server.
+    struct FakeClient {
+        /// `Ok(text)` on success, `Err(msg)` to surface an rpc error.
+        reply: Result<String, String>,
+    }
+
+    #[async_trait]
+    impl McpClient for FakeClient {
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _args: Option<serde_json::Map<String, serde_json::Value>>,
+        ) -> Result<String, McpError> {
+            self.reply.clone().map_err(McpError::Rpc)
+        }
+    }
+
+    fn tool(server: &str, name: &str, reply: Result<String, String>) -> McpTool {
+        let schema = Arc::new(serde_json::Map::new());
+        let server = McpServer {
+            name: server.into(),
+            client: Arc::new(FakeClient { reply }),
+            tools: vec![],
+        };
+        McpTool::build(&server, &RmcpTool::new(name.to_string(), "desc", schema))
+    }
+
+    /// Tools are namespaced `mcp__<server>__<tool>` so they can't collide with
+    /// built-ins or another server's tools.
+    #[test]
+    fn full_name_is_namespaced() {
+        let t = tool("fs", "read_file", Ok(String::new()));
+        assert_eq!(t.full_name(), "mcp__fs__read_file");
+        assert_eq!(t.spec().name, "mcp__fs__read_file");
+    }
+
+    /// A successful call surfaces the server's text as a non-error outcome.
+    #[tokio::test]
+    async fn run_maps_ok_to_outcome() {
+        let t = tool("fs", "read_file", Ok("contents".into()));
+        let out = t.run(serde_json::json!({})).await;
+        assert!(!out.is_error);
+        assert_eq!(out.content, "contents");
+    }
+
+    /// A transport/rpc error becomes an error outcome, not a panic.
+    #[tokio::test]
+    async fn run_maps_err_to_error_outcome() {
+        let t = tool("fs", "read_file", Err("boom".into()));
+        let out = t.run(serde_json::json!({})).await;
+        assert!(out.is_error);
+    }
+
+    /// Non-object args are rejected before ever reaching the server.
+    #[tokio::test]
+    async fn run_rejects_non_object_args() {
+        let t = tool("fs", "read_file", Ok(String::new()));
+        let out = t.run(serde_json::json!("just a string")).await;
+        assert!(out.is_error);
+        assert!(out.content.contains("expected object args"));
+    }
+
+    /// Unknown transports are a config error, not a connect attempt.
+    #[tokio::test]
+    async fn connect_rejects_unknown_transport() {
+        let cfg = McpServerConfig {
+            transport: "carrier-pigeon".into(),
+            ..Default::default()
+        };
+        match connect("x", &cfg).await {
+            Err(McpError::Config(_)) => {}
+            other => panic!("expected Config error, got {:?}", other.err()),
+        }
+    }
+}
