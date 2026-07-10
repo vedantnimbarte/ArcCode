@@ -68,10 +68,10 @@ impl Tool for Grep {
         let include = match args.include.as_deref() {
             None => None,
             Some(s) => match GlobPat::new(s) {
-                Ok(g) => {
-                    let set = GlobSetBuilder::new().add(g).build().unwrap();
-                    Some(set)
-                }
+                Ok(g) => match GlobSetBuilder::new().add(g).build() {
+                    Ok(set) => Some(set),
+                    Err(e) => return ToolOutcome::err(format!("bad include glob: {e}")),
+                },
                 Err(e) => return ToolOutcome::err(format!("bad include glob: {e}")),
             },
         };
