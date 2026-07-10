@@ -123,10 +123,12 @@ pub struct PipelineOutcome {
 }
 
 /// Severity at/above which the E7 inline reviewer sends a task back for
-/// rework. Its own knob, decoupled from `auto_merge_max_severity`: `Medium`
-/// loops the run on genuine defects while letting low nitpicks — the noise a
-/// meticulous model emits on correct work — through to Done.
-const REVIEWER_REWORK_GATE: crate::severity::Severity = crate::severity::Severity::Medium;
+/// rework. Its own knob, decoupled from `auto_merge_max_severity`. Set to
+/// `High`: a task only reaches the reviewer after its acceptance checks pass,
+/// so functional correctness is already established — the reviewer's job is to
+/// catch genuinely severe issues, not to loop the run on the medium-severity
+/// nitpicks an over-eager model emits on correct work.
+const REVIEWER_REWORK_GATE: crate::severity::Severity = crate::severity::Severity::High;
 
 /// Drive the run from its current state to completion.
 ///
@@ -2334,6 +2336,7 @@ mod tests {
                     agent: "a".into(),
                     tool: "edit_file".into(),
                     input_hash: None,
+                    file: None,
                     ok: true,
                 })
                 .await

@@ -221,6 +221,7 @@ pub async fn run_worker(
                         agent: agent_id.to_string(),
                         tool: format!("worker_msg:{}", crate::ipc::encode_message(&msg)),
                         input_hash: None,
+                        file: None,
                         ok: true,
                     })
                     .await;
@@ -527,7 +528,14 @@ async fn forward_agent_event(
     event: &wingman_core::AgentEvent,
 ) {
     match event {
-        wingman_core::AgentEvent::ToolStart { name, .. } => {
+        wingman_core::AgentEvent::ToolStart { name, input, .. } => {
+            // Pull the file this call touched (edit tools take `path`; a few
+            // use `file_path`/`file`) so checkpoint hygiene can dedupe edits
+            // by file rather than treating each call as a new file.
+            let file = ["path", "file_path", "file"]
+                .iter()
+                .find_map(|k| input.get(k).and_then(|v| v.as_str()))
+                .map(str::to_string);
             let _ = store
                 .append(Event::TaskTool {
                     t: RunStore::now(),
@@ -535,6 +543,7 @@ async fn forward_agent_event(
                     agent: agent_id.to_string(),
                     tool: name.clone(),
                     input_hash: None,
+                    file,
                     ok: true,
                 })
                 .await;

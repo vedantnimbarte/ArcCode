@@ -115,11 +115,14 @@ pub fn tool_calls_for_task(events: &[Event], task_id: &str) -> Vec<ToolCall> {
     events
         .iter()
         .filter_map(|e| match e {
-            Event::TaskTool { id, tool, .. } if id == task_id => Some(ToolCall {
+            Event::TaskTool {
+                id, tool, file, ..
+            } if id == task_id => Some(ToolCall {
                 tool: tool.clone(),
-                // The event log carries an `input_hash`, not a file path,
-                // so per-file dedup falls back to "each call is distinct".
-                file: None,
+                // Now populated from the tool's `path` input, so multi-*file*
+                // work is distinguished from a single file edited by several
+                // tool calls (which must not trip the multi-file gate).
+                file: file.clone(),
             }),
             _ => None,
         })
@@ -206,7 +209,19 @@ mod tests {
     }
 
     #[test]
-    fn tool_calls_for_task_filters_by_id() {
+    fn same_file_via_two_different_edit_tools_is_ok() {
+        // Regression: a single-file change made with `edit_file` then
+        // `write_file` (same path) must not trip the multi-file gate just
+        // because two tools touched it.
+        let calls = vec![
+            call("edit_file", Some("README.md")),
+            call("write_file", Some("README.md")),
+        ];
+        assert!(verify(&calls).is_ok());
+    }
+
+    #[test]
+    fn tool_calls_for_task_filters_by_id_and_carries_file() {
         let events = vec![
             Event::TaskTool {
                 t: "t".into(),
@@ -214,6 +229,7 @@ mod tests {
                 agent: "a".into(),
                 tool: "edit_file".into(),
                 input_hash: None,
+                file: Some("a.rs".into()),
                 ok: true,
             },
             Event::TaskTool {
@@ -222,6 +238,7 @@ mod tests {
                 agent: "a".into(),
                 tool: "checkpoint".into(),
                 input_hash: None,
+                file: None,
                 ok: true,
             },
             Event::TaskTool {
@@ -230,12 +247,14 @@ mod tests {
                 agent: "a".into(),
                 tool: "checkpoint".into(),
                 input_hash: None,
+                file: None,
                 ok: true,
             },
         ];
         let calls = tool_calls_for_task(&events, "t1");
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].tool, "edit_file");
+        assert_eq!(calls[0].file.as_deref(), Some("a.rs"));
         assert_eq!(calls[1].tool, "checkpoint");
     }
 }

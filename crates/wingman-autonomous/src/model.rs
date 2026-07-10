@@ -432,6 +432,11 @@ pub enum Event {
         tool: String,
         #[serde(default)]
         input_hash: Option<String>,
+        /// File the tool touched, when it reports one. Lets checkpoint
+        /// hygiene dedupe edits by file (multi-*file* work) instead of
+        /// counting every edit call as a distinct file.
+        #[serde(default)]
+        file: Option<String>,
         ok: bool,
     },
 
