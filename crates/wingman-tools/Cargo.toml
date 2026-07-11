@@ -35,3 +35,6 @@ urlencoding = { workspace = true }
 default = ["treesitter"]
 treesitter = ["dep:wingman-ts", "wingman-ts/treesitter"]
 
+
+[dev-dependencies]
+tempfile = "3"
