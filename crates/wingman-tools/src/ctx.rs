@@ -16,6 +16,10 @@ pub struct ToolCtx {
     /// Each entry is a substring pattern: if the command contains it, the call
     /// is rejected before execution.
     pub extra_denylist: Vec<String>,
+    /// Opt-in from `[tools].allow_network`: permit web_fetch/web_search in any
+    /// mode (including read-only/plan), not just the edit-capable ones. Off by
+    /// default so network egress stays gated unless the user asks for it.
+    pub allow_network: bool,
 }
 
 /// Encode/decode `PermissionMode` as a `u8` for the atomic cell. Kept local
@@ -46,21 +50,25 @@ impl ToolCtx {
             cwd,
             project_root,
             extra_denylist: Vec::new(),
+            allow_network: false,
         }
     }
 
-    /// Like [`new`] but also accepts a project-level denylist of shell patterns.
+    /// Like [`new`] but also accepts a project-level denylist of shell patterns
+    /// and the `allow_network` opt-in.
     pub fn new_with_config(
         mode: PermissionMode,
         cwd: PathBuf,
         project_root: PathBuf,
         extra_denylist: Vec<String>,
+        allow_network: bool,
     ) -> Self {
         Self {
             mode: Arc::new(AtomicU8::new(mode_to_u8(mode))),
             cwd,
             project_root,
             extra_denylist,
+            allow_network,
         }
     }
 
@@ -159,6 +167,19 @@ impl ToolCtx {
     /// Permission for any shell execution.
     pub fn allows_shell(&self) -> bool {
         matches!(self.mode(), PermissionMode::AutoEdit | PermissionMode::Yolo)
+    }
+
+    /// Permission for outbound network access (web_fetch / web_search).
+    ///
+    /// Network egress is a data-exfiltration channel: content the agent reads
+    /// (or prompt-injected instructions inside it) could smuggle secrets out
+    /// via a URL or query string. So the read-only research modes can't reach
+    /// the network — only `auto-edit`/`yolo`, where the user has already
+    /// granted the agent latitude to act. The `[tools].allow_network` opt-in
+    /// lifts this for users who want look-ups in read-only/plan too.
+    pub fn allows_network(&self) -> bool {
+        self.allow_network
+            || matches!(self.mode(), PermissionMode::AutoEdit | PermissionMode::Yolo)
     }
 }
 
@@ -427,6 +448,7 @@ mod tests {
             PathBuf::from("/tmp"),
             PathBuf::from("/tmp"),
             patterns.iter().map(|s| s.to_string()).collect(),
+            false,
         )
     }
 
@@ -498,5 +520,34 @@ mod tests {
     fn denylist_empty_denies_nothing() {
         let ctx = ctx_with_denylist(&[]);
         assert!(!ctx.is_shell_denied("rm -rf /"));
+    }
+
+    #[test]
+    fn network_gated_to_edit_modes() {
+        let root = std::env::temp_dir();
+        let ctx = ToolCtx::new(PermissionMode::ReadOnly, root.clone(), root.clone());
+        assert!(!ctx.allows_network(), "read-only must not reach the network");
+        ctx.set_mode(PermissionMode::Plan);
+        assert!(!ctx.allows_network(), "plan must not reach the network");
+        ctx.set_mode(PermissionMode::AutoEdit);
+        assert!(ctx.allows_network(), "auto-edit may reach the network");
+        ctx.set_mode(PermissionMode::Yolo);
+        assert!(ctx.allows_network(), "yolo may reach the network");
+    }
+
+    #[test]
+    fn allow_network_opt_in_lifts_read_only_gate() {
+        let root = std::env::temp_dir();
+        let ctx = ToolCtx::new_with_config(
+            PermissionMode::ReadOnly,
+            root.clone(),
+            root.clone(),
+            Vec::new(),
+            true,
+        );
+        assert!(
+            ctx.allows_network(),
+            "allow_network opt-in permits network even in read-only"
+        );
     }
 }
