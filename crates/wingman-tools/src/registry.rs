@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::{Tool, ToolCtx};
-use wingman_config::HooksConfig;
-use wingman_core::{ToolDispatcher, ToolOutcome, ToolSpec};
 use async_trait::async_trait;
 use serde_json::Value;
+use wingman_config::HooksConfig;
+use wingman_core::{ToolDispatcher, ToolOutcome, ToolSpec};
 
 pub struct ToolRegistry {
     /// Interior-mutable so MCP servers can be added/removed at runtime
@@ -103,6 +103,7 @@ impl ToolRegistry {
             self.register(crate::builtin::FindSymbol);
             self.register(crate::builtin::Outline);
             self.register(crate::builtin::EditSymbol);
+            self.register(crate::builtin::WhoCalls);
         }
         self
     }
