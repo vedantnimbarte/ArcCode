@@ -6,6 +6,7 @@ pub mod diff;
 pub mod diff_annotate;
 pub mod discover;
 pub mod headless;
+pub mod indexd;
 pub mod init;
 pub mod knows;
 pub mod login;
