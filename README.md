@@ -11,8 +11,9 @@ written in Rust. It runs as a TUI for interactive sessions and as a headless
 one-shot (`--print "prompt"`) for scripting, talks to 73+ LLM providers behind
 a single streaming interface, ships a built-in tool layer for reading,
 searching, and editing the project tree, and learns from every conversation:
-it builds a persistent model of you and your projects, creates and refines
-skills from observed work, and recalls past sessions across projects.
+it builds a persistent model of you and your projects, proposes reusable
+skills mined from your session history (which you review and promote), scores
+how well its skills perform, and recalls past sessions across projects.
 
 It is positioned as an open, provider-agnostic alternative to Claude Code,
 Cursor, and Aider — with native support for Anthropic, OpenAI, ChatGPT
@@ -762,10 +763,16 @@ model = "anthropic/claude-opus-4-7"
 transport = "stdio"                 # "stdio" (default) or "http"
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+env = { API_KEY = "${SOME_KEY}" }   # env vars for the child process
+# cwd = "/path/to/run/in"           # working directory for the child
+# trusted = false                   # MCP tools are gated to auto-edit/yolo
+                                    # unless a server is marked trusted (it
+                                    # may run in read-only/plan mode then)
 
 [mcp.remote]
-transport = "http"
-url = "http://localhost:9000/mcp"
+transport = "http"                  # spec-compliant Streamable-HTTP client
+url = "https://mcp.example.com/mcp" # (initialize handshake, SSE, session id)
+headers = { Authorization = "Bearer ${MCP_TOKEN}" }  # auth / custom headers
 
 [logging]
 filter = "info,wingman=info"

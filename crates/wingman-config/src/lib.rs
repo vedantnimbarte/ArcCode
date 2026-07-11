@@ -112,7 +112,9 @@ pub struct ToolsConfig {
     /// e.g. ["rm -rf /", "sudo"]
     #[serde(default)]
     pub shell_denylist: Vec<String>,
-    /// Override the tool output budget (max lines per tool call). 0 = use global default.
+    /// Override the tool output budget (max lines per tool call) for this
+    /// project. `None` or `0` falls back to `[tokens].tool_output_max_lines`.
+    /// Resolve via [`Config::effective_tool_output_max_lines`].
     #[serde(default)]
     pub tool_output_max_lines: Option<u32>,
     /// Comma-separated list of tools to disable for this project.
@@ -410,8 +412,26 @@ pub struct McpServerConfig {
     /// Command to spawn for stdio transport.
     pub command: Option<String>,
     pub args: Vec<String>,
+    /// Environment variables for the stdio child process. Most MCP servers
+    /// take their API key / config via env, so this is required to reach them.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Working directory for the stdio child process.
+    #[serde(default)]
+    pub cwd: Option<String>,
     /// URL for http transport.
     pub url: Option<String>,
+    /// Extra HTTP headers for http transport (e.g. `Authorization`). Needed to
+    /// reach authenticated remote MCP servers.
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// Whether this server's tools are trusted to run in read-only/plan mode.
+    /// MCP tools are opaque — we can't tell a safe search tool from one that
+    /// writes files or runs commands — so by default they are gated to
+    /// edit-capable modes (auto-edit/yolo) just like the shell tool. Set this
+    /// true only for servers you know are side-effect-free.
+    #[serde(default)]
+    pub trusted: bool,
 }
 
 impl Default for McpServerConfig {
@@ -420,12 +440,25 @@ impl Default for McpServerConfig {
             transport: "stdio".into(),
             command: None,
             args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
             url: None,
+            headers: std::collections::BTreeMap::new(),
+            trusted: false,
         }
     }
 }
 
 impl Config {
+    /// Effective per-tool output line budget: the `[tools]` project override
+    /// when set to a non-zero value, else the global `[tokens]` default.
+    pub fn effective_tool_output_max_lines(&self) -> u32 {
+        match self.tools.tool_output_max_lines {
+            Some(n) if n > 0 => n,
+            _ => self.tokens.tool_output_max_lines,
+        }
+    }
+
     /// Load configuration with the documented merge order. Either path may
     /// be `None` to skip that layer (used by tests and `config init`).
     ///
@@ -1738,6 +1771,33 @@ mod tests {
             PermissionMode::Yolo
         );
         assert!("nope".parse::<PermissionMode>().is_err());
+    }
+
+    #[test]
+    fn mcp_server_parses_env_headers_cwd_trusted() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [mcp.fs]
+            transport = "stdio"
+            command = "mcp-fs"
+            cwd = "/srv/proj"
+            trusted = true
+            env = { API_KEY = "secret", DEBUG = "1" }
+
+            [mcp.remote]
+            transport = "http"
+            url = "https://mcp.example.com/mcp"
+            headers = { Authorization = "Bearer abc" }
+            "#,
+        )
+        .unwrap();
+        let fs = &cfg.mcp["fs"];
+        assert_eq!(fs.cwd.as_deref(), Some("/srv/proj"));
+        assert!(fs.trusted);
+        assert_eq!(fs.env["API_KEY"], "secret");
+        let remote = &cfg.mcp["remote"];
+        assert!(!remote.trusted, "trusted defaults to false");
+        assert_eq!(remote.headers["Authorization"], "Bearer abc");
     }
 
     #[test]
