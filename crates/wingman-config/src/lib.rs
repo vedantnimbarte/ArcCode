@@ -228,6 +228,21 @@ pub struct Config {
     /// Team memory server (optional, beyond the git-backed `memory sync`).
     #[serde(default)]
     pub team: TeamConfig,
+
+    /// Privacy / air-gapped mode.
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
+}
+
+/// Fully-local, air-gapped operation. When `local_only` is on, Wingman refuses
+/// any non-local provider (base URL must be localhost/127.0.0.1), disables the
+/// network tools (`web_fetch`/`web_search`) regardless of permission mode, and
+/// `wingman attest` reports the guarantees — for regulated / air-gapped teams
+/// that cloud agents structurally can't serve.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrivacyConfig {
+    pub local_only: bool,
 }
 
 /// Optional HTTP endpoint for server-backed team memory
@@ -502,6 +517,12 @@ pub struct VerifyConfig {
     /// PATH; a graceful no-op (passes with a note) when none is installed.
     /// Composes onto `turn_gate` (needs it not "off").
     pub lsp_diagnostics: bool,
+    /// Run captured characterization goldens (`wingman golden`) as part of the
+    /// gate: a change that alters a snapshotted command's output fails
+    /// verification. The regression net for undertested/legacy code — "verified
+    /// correct, not just verified builds". On by default (no-op with no
+    /// goldens). Composes onto `turn_gate`.
+    pub golden: bool,
     /// Optional headless-browser visual verification. When `url` is set and a
     /// baseline screenshot exists, a turn that edited files loads the URL,
     /// screenshots it, and fails if it differs from the baseline by more than
@@ -544,6 +565,7 @@ impl Default for VerifyConfig {
             max_retries: 2,
             affected_tests: true,
             lsp_diagnostics: true,
+            golden: true,
             browser: BrowserVerifyConfig::default(),
         }
     }

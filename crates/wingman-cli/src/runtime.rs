@@ -66,7 +66,45 @@ pub fn resolve_selection(cfg: &Config, model_flag: Option<&str>) -> Result<Selec
     Ok(Selection { provider_id, model })
 }
 
+/// Known provider ids that only ever talk to localhost.
+const LOCAL_PROVIDER_IDS: &[&str] = &[
+    "ollama",
+    "lmstudio",
+    "vllm",
+    "llamacpp",
+    "tgi",
+    "gpt4all",
+    "jan",
+    "koboldcpp",
+    "oobabooga",
+    "mlx",
+    "localai",
+    "aphrodite",
+    "mistralrs",
+];
+
+/// True if `provider_id` is guaranteed local: a known-local id, or a configured
+/// base URL pointing at localhost/127.0.0.1.
+pub fn provider_is_local(cfg: &Config, provider_id: &str) -> bool {
+    if LOCAL_PROVIDER_IDS.contains(&provider_id) {
+        return true;
+    }
+    cfg.providers
+        .get(provider_id)
+        .and_then(|pc| pc.base_url.as_deref())
+        .map(|u| u.contains("localhost") || u.contains("127.0.0.1") || u.contains("[::1]"))
+        .unwrap_or(false)
+}
+
 pub fn build_provider(cfg: &Config, provider_id: &str) -> Result<Arc<dyn Provider>> {
+    // Air-gapped guard: in local_only mode, refuse any non-local provider so a
+    // misconfiguration can't silently send code to the cloud.
+    if cfg.privacy.local_only && !provider_is_local(cfg, provider_id) {
+        return Err(anyhow!(
+            "[privacy].local_only is set but provider '{provider_id}' is not local — \
+             use a local provider (ollama / lmstudio / vllm / …) or set a localhost base_url"
+        ));
+    }
     let pc = cfg
         .providers
         .get(provider_id)
@@ -468,6 +506,12 @@ pub async fn build_registry_with_learn(
         .with_audit(audit_path)
         .with_output_redaction(cfg.tools.redact_output_secrets)
         .with_custom_tools(&cfg.tools.custom);
+
+    // Air-gapped guard: hard-remove the network tools so no code leaves the box.
+    if cfg.privacy.local_only {
+        reg.unregister("web_fetch");
+        reg.unregister("web_search");
+    }
     let indexer = build_indexer(&paths)?;
     if let Some(idx) = indexer.clone() {
         reg = reg.with_semantic_search(idx);
@@ -841,6 +885,49 @@ fn edited_symbol_names(_root: &std::path::Path) -> Vec<String> {
     Vec::new()
 }
 
+/// Characterization gate: re-run captured `wingman golden` snapshots and fail
+/// if any command's output drifted — catching unintended behavior changes the
+/// compiler and tests miss. No-op when no goldens are captured.
+pub struct BehaviorGate {
+    root: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl TurnGate for BehaviorGate {
+    fn label(&self) -> String {
+        "golden".into()
+    }
+
+    async fn check(&self) -> GateReport {
+        let root = self.root.clone();
+        let (total, drifted) =
+            tokio::task::spawn_blocking(move || crate::commands::golden::check_all(&root))
+                .await
+                .unwrap_or((0, Vec::new()));
+        if total == 0 {
+            return GateReport {
+                passed: true,
+                summary: "golden: none captured".into(),
+            };
+        }
+        if drifted.is_empty() {
+            GateReport {
+                passed: true,
+                summary: format!("golden: ✓ {total} snapshot(s) unchanged"),
+            }
+        } else {
+            GateReport {
+                passed: false,
+                summary: format!(
+                    "golden: ✗ behavior drifted in {}: {} — run `wingman golden check` to see the diff, re-capture if intended",
+                    drifted.len(),
+                    drifted.join(", ")
+                ),
+            }
+        }
+    }
+}
+
 /// Headless-browser visual verification: load a URL, screenshot it, and fail
 /// if it differs from a committed baseline by more than a threshold — proving
 /// a UI change renders. Fail-open when no browser is available (the `browser`
@@ -1201,6 +1288,11 @@ pub fn build_turn_gate(cfg: &Config, root: &std::path::Path) -> Option<Arc<dyn T
     }
     if cfg.verify.lsp_diagnostics {
         gates.push(Arc::new(LspDiagnosticsGate {
+            root: root.to_path_buf(),
+        }));
+    }
+    if cfg.verify.golden {
+        gates.push(Arc::new(BehaviorGate {
             root: root.to_path_buf(),
         }));
     }
