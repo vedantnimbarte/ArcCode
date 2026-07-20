@@ -51,7 +51,10 @@ impl ToolRegistry {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let mut input = args.to_string();
+        // Redact secret-looking values so the compliance trail never itself
+        // leaks credentials, then bound the size.
+        let redacted = redact_secrets(args);
+        let mut input = redacted.to_string();
         if input.len() > 400 {
             input.truncate(400);
             input.push('…');
@@ -264,6 +267,47 @@ impl ToolDispatcher for ToolRegistry {
     }
 }
 
+/// Recursively redact secret-looking values in a JSON value: any object key
+/// that looks credential-bearing (`key`, `token`, `secret`, `password`,
+/// `authorization`, `api_key`, …) has its string value replaced with
+/// `"[redacted]"`. Used so the audit trail can't itself leak credentials.
+fn redact_secrets(v: &Value) -> Value {
+    fn is_secret_key(k: &str) -> bool {
+        let k = k.to_ascii_lowercase();
+        const NEEDLES: &[&str] = &[
+            "password",
+            "passwd",
+            "secret",
+            "token",
+            "api_key",
+            "apikey",
+            "authorization",
+            "auth",
+            "credential",
+            "private_key",
+            "access_key",
+        ];
+        // `key` alone is too broad (matches innocuous "key"), so require it to
+        // be a suffix/compound (api_key, access_key) or one of the needles.
+        NEEDLES.iter().any(|n| k.contains(n)) || k == "key" || k.ends_with("_key")
+    }
+    match v {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, val) in map {
+                if is_secret_key(k) && val.is_string() {
+                    out.insert(k.clone(), Value::String("[redacted]".into()));
+                } else {
+                    out.insert(k.clone(), redact_secrets(val));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(redact_secrets).collect()),
+        other => other.clone(),
+    }
+}
+
 fn tool_matches(name: &str, pattern: &str) -> bool {
     if pattern.is_empty() {
         return true;
@@ -377,6 +421,42 @@ mod tests {
             "audit missing tool: {body}"
         );
         assert!(body.contains("\"is_error\":false"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn redacts_secret_looking_keys() {
+        let v = serde_json::json!({
+            "path": "src/x.rs",
+            "api_key": "sk-secret",
+            "nested": { "token": "abc", "note": "keep" },
+            "arr": [ { "password": "p" } ]
+        });
+        let r = super::redact_secrets(&v);
+        assert_eq!(r["path"], "src/x.rs");
+        assert_eq!(r["api_key"], "[redacted]");
+        assert_eq!(r["nested"]["token"], "[redacted]");
+        assert_eq!(r["nested"]["note"], "keep");
+        assert_eq!(r["arr"][0]["password"], "[redacted]");
+    }
+
+    #[tokio::test]
+    async fn audit_redacts_secrets_in_the_log() {
+        let dir = std::env::temp_dir().join(format!("wm-audit-red-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("audit.log");
+        let ctx = ToolCtx::new(PermissionMode::ReadOnly, dir.clone(), dir.clone());
+        let mut reg = ToolRegistry::new(ctx).with_audit(Some(log.clone()));
+        reg.register(EchoTool);
+        let _ = reg
+            .dispatch("echo", serde_json::json!({ "api_key": "sk-leak" }))
+            .await;
+        let body = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !body.contains("sk-leak"),
+            "secret leaked into audit log: {body}"
+        );
+        assert!(body.contains("[redacted]"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
