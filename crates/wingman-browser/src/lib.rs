@@ -66,8 +66,10 @@ pub struct Capture {
 /// Chrome binary on the system (headless_chrome locates or fetches one).
 #[cfg(feature = "chrome")]
 pub fn capture(url: &str, timeout: std::time::Duration) -> Result<Capture> {
+    use headless_chrome::protocol::cdp::types::Event;
     use headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption;
     use headless_chrome::{Browser, LaunchOptions};
+    use std::sync::{Arc, Mutex};
 
     let opts = LaunchOptions::default_builder()
         .headless(true)
@@ -78,18 +80,46 @@ pub fn capture(url: &str, timeout: std::time::Duration) -> Result<Capture> {
     let tab = browser
         .new_tab()
         .map_err(|e| BrowserError::Browser(e.to_string()))?;
+
+    // Capture console errors + uncaught exceptions. Register the listener
+    // BEFORE navigation so nothing is missed. The generated CDP event structs
+    // are opaque here, so we filter on their Debug representation — robust and
+    // compile-stable: keep error-level log entries and all thrown exceptions.
+    let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let errors = errors.clone();
+        tab.enable_log()
+            .map_err(|e| BrowserError::Browser(e.to_string()))?;
+        tab.enable_runtime()
+            .map_err(|e| BrowserError::Browser(e.to_string()))?;
+        let _ = tab.add_event_listener(Arc::new(move |event: &Event| match event {
+            Event::LogEntryAdded(e) => {
+                let s = format!("{e:?}");
+                // The CDP LogEntry level enum renders as `Error` in Debug.
+                if s.contains("Error") {
+                    errors.lock().unwrap().push(format!("console: {s}"));
+                }
+            }
+            Event::RuntimeExceptionThrown(e) => {
+                errors.lock().unwrap().push(format!("exception: {e:?}"));
+            }
+            _ => {}
+        }));
+    }
+
     tab.navigate_to(url)
         .map_err(|e| BrowserError::Browser(e.to_string()))?;
     tab.wait_until_navigated()
         .map_err(|e| BrowserError::Browser(e.to_string()))?;
+    // Give async console/exception events a moment to arrive.
+    std::thread::sleep(std::time::Duration::from_millis(300));
     let png = tab
         .capture_screenshot(CaptureScreenshotFormatOption::Png, None, None, true)
         .map_err(|e| BrowserError::Browser(e.to_string()))?;
+    let console_errors = errors.lock().unwrap().clone();
     Ok(Capture {
         screenshot_png: png,
-        // Console-error capture needs a pre-navigation event listener; left
-        // best-effort empty for now (the screenshot diff is the primary signal).
-        console_errors: Vec::new(),
+        console_errors,
     })
 }
 

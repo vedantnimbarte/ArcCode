@@ -91,6 +91,27 @@ jobs:
       - name: cargo audit
         run: cargo audit
 
+  # Type-check and bundle the VS Code extension so its TypeScript can't rot
+  # silently (it lives in its own npm toolchain, separate from the Rust build).
+  # Informational: a separate ecosystem shouldn't block Rust PRs.
+  vscode:
+    name: vscode-extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install deps
+        working-directory: editors/vscode
+        run: npm install
+      - name: Type-check
+        working-directory: editors/vscode
+        run: npx tsc --noEmit
+      - name: Bundle
+        working-directory: editors/vscode
+        run: npm run build
+
   # License + duplicate-dependency + advisory policy via cargo-deny.
   # Also informational until the policy in deny.toml is stabilized.
   deny:

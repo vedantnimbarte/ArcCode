@@ -27,7 +27,7 @@ Minimal embedding:
 ```rust
 use futures::StreamExt;
 use std::sync::Arc;
-use wingman_core::{AgentConfig, AgentEvent, AgentLoop, NoopLearningHook};
+use wingman_core::{AgentConfig, AgentEvent, AgentLoop, ToolDispatcher};
 use wingman_providers::AnthropicProvider;
 use wingman_tools::{ToolCtx, ToolRegistry};
 use wingman_config::PermissionMode;
@@ -40,15 +40,14 @@ async fn main() -> anyhow::Result<()> {
     // 2. A tool registry (built-ins: read/write/edit/grep/shell/lsp/…).
     let cwd = std::env::current_dir()?;
     let ctx = ToolCtx::new(PermissionMode::ReadOnly, cwd.clone(), cwd);
-    let tools = Arc::new(ToolRegistry::new(ctx).with_builtins());
+    let tools: Arc<dyn ToolDispatcher> = Arc::new(ToolRegistry::new(ctx).with_builtins());
 
-    // 3. Configure and run the agent loop.
-    let config = AgentConfig {
-        model: "claude-sonnet-5".into(),
-        system: "You are a helpful coding agent.".into(),
-        ..AgentConfig::default()
-    };
-    let mut agent = AgentLoop::new(provider, tools, config, Arc::new(NoopLearningHook));
+    // 3. Configure and run the agent loop. AgentConfig carries the model,
+    //    system prompt, gate, and (optionally) a LearningHook in `config.learning`.
+    let mut config = AgentConfig::default();
+    config.model = "claude-sonnet-5".into();
+    config.system = Some("You are a helpful coding agent.".into());
+    let mut agent = AgentLoop::new(provider, tools, config); // 3 args
 
     let mut events = agent.run("List the files in this directory.".into());
     while let Some(ev) = events.next().await {
@@ -61,6 +60,9 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 ```
+
+(`system` is `Option<String>`; a custom `LearningHook`/`TurnGate` goes in
+`config.learning` / `config.gate`.)
 
 Bring your own pieces by implementing the traits:
 - **Custom tool:** `impl wingman_tools::Tool` (a `spec()` + async `run()`), register it on the `ToolRegistry`.
