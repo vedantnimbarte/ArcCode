@@ -9,6 +9,7 @@ pub mod discover;
 pub mod distill;
 pub mod doctor;
 pub mod explain;
+pub mod golden;
 pub mod headless;
 pub mod indexd;
 pub mod init;

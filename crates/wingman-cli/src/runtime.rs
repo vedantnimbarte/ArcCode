@@ -841,6 +841,49 @@ fn edited_symbol_names(_root: &std::path::Path) -> Vec<String> {
     Vec::new()
 }
 
+/// Characterization gate: re-run captured `wingman golden` snapshots and fail
+/// if any command's output drifted — catching unintended behavior changes the
+/// compiler and tests miss. No-op when no goldens are captured.
+pub struct BehaviorGate {
+    root: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl TurnGate for BehaviorGate {
+    fn label(&self) -> String {
+        "golden".into()
+    }
+
+    async fn check(&self) -> GateReport {
+        let root = self.root.clone();
+        let (total, drifted) =
+            tokio::task::spawn_blocking(move || crate::commands::golden::check_all(&root))
+                .await
+                .unwrap_or((0, Vec::new()));
+        if total == 0 {
+            return GateReport {
+                passed: true,
+                summary: "golden: none captured".into(),
+            };
+        }
+        if drifted.is_empty() {
+            GateReport {
+                passed: true,
+                summary: format!("golden: ✓ {total} snapshot(s) unchanged"),
+            }
+        } else {
+            GateReport {
+                passed: false,
+                summary: format!(
+                    "golden: ✗ behavior drifted in {}: {} — run `wingman golden check` to see the diff, re-capture if intended",
+                    drifted.len(),
+                    drifted.join(", ")
+                ),
+            }
+        }
+    }
+}
+
 /// Headless-browser visual verification: load a URL, screenshot it, and fail
 /// if it differs from a committed baseline by more than a threshold — proving
 /// a UI change renders. Fail-open when no browser is available (the `browser`
@@ -1201,6 +1244,11 @@ pub fn build_turn_gate(cfg: &Config, root: &std::path::Path) -> Option<Arc<dyn T
     }
     if cfg.verify.lsp_diagnostics {
         gates.push(Arc::new(LspDiagnosticsGate {
+            root: root.to_path_buf(),
+        }));
+    }
+    if cfg.verify.golden {
+        gates.push(Arc::new(BehaviorGate {
             root: root.to_path_buf(),
         }));
     }

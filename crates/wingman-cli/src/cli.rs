@@ -142,6 +142,12 @@ pub enum Command {
     /// Health check: config, provider credentials, local servers, the semantic
     /// index, language servers on PATH, and git/gh tooling.
     Doctor,
+    /// Characterization / golden-master testing: snapshot a command's output,
+    /// then fail if a later change alters it (regression net for legacy code).
+    Golden {
+        #[command(subcommand)]
+        action: GoldenAction,
+    },
     /// Show what Wingman knows about this project: memories, skills,
     /// model routing, the verification gate, and index freshness.
     Knows,
@@ -558,6 +564,25 @@ pub enum SessionAction {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum GoldenAction {
+    /// Capture a command's output as a golden snapshot: `golden capture <name> -- <cmd…>`.
+    Capture {
+        /// Name for this golden.
+        name: String,
+        /// The command to run (everything after `--`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Re-run goldens and fail on any behavior drift. Omit name to check all.
+    Check {
+        /// Limit to one golden by name.
+        name: Option<String>,
+    },
+    /// List captured goldens and their commands.
+    List,
+}
+
+#[derive(Subcommand, Debug)]
 pub enum RouterAction {
     /// Show recorded per-class model win rates (gate pass-rate) for this repo.
     Stats {
@@ -699,6 +724,13 @@ pub async fn run() -> Result<ExitCode> {
         Some(Command::Logout { provider }) => commands::login::logout(provider).await,
         Some(Command::Discover) => commands::discover::run().await,
         Some(Command::Doctor) => commands::doctor::run(load_config()?).await,
+        Some(Command::Golden { action }) => match action {
+            GoldenAction::Capture { name, command } => {
+                commands::golden::capture(name, command).await
+            }
+            GoldenAction::Check { name } => commands::golden::check(name).await,
+            GoldenAction::List => commands::golden::list().await,
+        },
         Some(Command::Knows) => commands::knows::run(load_config()?).await,
         Some(Command::Bench { suite, json }) => commands::bench::run(suite, json).await,
         Some(Command::Router { action }) => commands::router::run(action).await,

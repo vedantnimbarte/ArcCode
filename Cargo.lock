@@ -4722,6 +4722,7 @@ dependencies = [
  "rand 0.8.6",
  "ratatui",
  "reqwest 0.13.4",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
