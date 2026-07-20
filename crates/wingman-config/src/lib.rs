@@ -174,6 +174,21 @@ pub struct Config {
     /// Git-native workflow (Aider-style auto-commit).
     #[serde(default)]
     pub git: GitConfig,
+
+    /// Audit logging (compliance trail of tool calls).
+    #[serde(default)]
+    pub audit: AuditConfig,
+}
+
+/// Append-only audit trail of tool calls — an enterprise/compliance aid.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuditConfig {
+    /// When true, every tool dispatch appends a JSONL record (timestamp, tool,
+    /// a redacted input summary, error flag) to the audit log.
+    pub enabled: bool,
+    /// Log file path. Defaults to `<project>/.wingman/audit.log` when unset.
+    pub log_path: Option<String>,
 }
 
 /// Git-native workflow options.

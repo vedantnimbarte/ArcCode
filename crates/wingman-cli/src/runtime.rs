@@ -450,9 +450,22 @@ pub async fn build_registry_with_learn(
         cfg.tools.shell_denylist.clone(),
         cfg.tools.allow_network,
     );
+    // Audit log path: explicit config, else the project's .wingman/audit.log.
+    let audit_path = if cfg.audit.enabled {
+        Some(
+            cfg.audit
+                .log_path
+                .clone()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| paths.dir.join("audit.log")),
+        )
+    } else {
+        None
+    };
     let mut reg = ToolRegistry::new(ctx)
         .with_builtins()
-        .with_hooks(cfg.hooks.clone());
+        .with_hooks(cfg.hooks.clone())
+        .with_audit(audit_path);
     let indexer = build_indexer(&paths)?;
     if let Some(idx) = indexer.clone() {
         reg = reg.with_semantic_search(idx);

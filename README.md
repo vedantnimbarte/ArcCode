@@ -180,6 +180,13 @@ worker agents in isolated worktrees, and converges into a PR.
 - **Explain-and-teach.** `wingman explain` gives a per-file "what changed and
   why it matters" walkthrough of the working diff (fast-model), for reviewers
   and juniors.
+- **Audit trail.** `[audit].enabled = true` appends a JSONL record (timestamp,
+  tool, redacted input, error flag) for every tool call — a compliance trail
+  for teams.
+- **Benchmark harness.** `wingman bench` runs a suite of prompts and records
+  time-to-first-token, tokens/task, and verified-done rate.
+- **Embeddable.** Use `wingman-core` as a library or drive Wingman from any
+  language over MCP (`wingman mcp-serve`). See [docs/SDK.md](docs/SDK.md).
 - **Multi-model code review.** `wingman review-multi <pr#> --models
   anthropic/claude-opus-4-7,openai/gpt-4.1,gemini/gemini-2.5-pro` fans the
   review out across reviewers in parallel and merges findings by
