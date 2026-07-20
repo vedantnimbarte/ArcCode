@@ -118,6 +118,44 @@ fn init_writes_wingman_md_into_isolated_project() {
     );
 }
 
+#[test]
+fn pilot_help_lists_subcommands() {
+    // Guards that pilot-mode CLI wiring stays intact (pilot is user-validated
+    // against live providers, not CI-validated end-to-end — so at minimum keep
+    // the command surface from silently rotting).
+    let out = wingman()
+        .args(["pilot", "--help"])
+        .output()
+        .expect("run pilot --help");
+    assert!(out.status.success(), "pilot --help should exit 0");
+    let text = String::from_utf8_lossy(&out.stdout);
+    for sub in ["run", "status", "watch", "resume"] {
+        assert!(text.contains(sub), "pilot --help missing subcommand `{sub}`");
+    }
+}
+
+#[test]
+fn pilot_status_without_runs_does_not_panic() {
+    // `pilot status` reads run artifacts under .wingman/autonomous and needs no
+    // provider. In an empty scratch project it must exit cleanly (no runs), not
+    // panic.
+    let s = Scratch::new();
+    let out = wingman()
+        .args(["pilot", "status"])
+        .current_dir(&s.dir)
+        .output()
+        .expect("run pilot status");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains("panicked"),
+        "pilot status must not panic on an empty project: {combined}"
+    );
+}
+
 /// Minimal, dependency-free scratch-dir helper. Kept in-file so these smoke
 /// tests pull in nothing beyond std. Cleaned up on drop.
 struct Scratch {
