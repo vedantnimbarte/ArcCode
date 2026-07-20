@@ -16,7 +16,13 @@ use crate::memory::Memory;
 /// verify things under the project root.
 pub fn referenced_paths(body: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for raw in body.split(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '<' | '>')) {
+    for raw in body.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '<' | '>'
+            )
+    }) {
         let tok = raw.trim_matches(|c: char| matches!(c, '.' | ':' | '!' | '?'));
         if !looks_like_project_path(tok) {
             continue;

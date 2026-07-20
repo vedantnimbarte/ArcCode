@@ -52,7 +52,11 @@ impl std::fmt::Display for Unavailable {
                 lang.label()
             ),
             Unavailable::StartFailed { lang, reason } => {
-                write!(f, "the {} language server failed to start: {reason}", lang.label())
+                write!(
+                    f,
+                    "the {} language server failed to start: {reason}",
+                    lang.label()
+                )
             }
         }
     }

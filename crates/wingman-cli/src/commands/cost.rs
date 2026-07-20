@@ -1,12 +1,12 @@
 //! `wingman cost` — print per-model token usage and estimated USD spend.
 
 use anyhow::Result;
+use std::collections::BTreeMap;
+use std::process::ExitCode;
 use wingman_core::{
     pricing::{price_for, COMPARISON_MODELS},
     Usage,
 };
-use std::collections::BTreeMap;
-use std::process::ExitCode;
 
 pub async fn run_with(json: bool, compare: bool) -> Result<ExitCode> {
     let totals = load_totals();

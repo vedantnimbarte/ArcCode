@@ -22,12 +22,12 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use futures::StreamExt;
 use wingman_autonomous::model::{Acceptance, Role, Task};
 use wingman_autonomous::role::load_role_prompt_with_lessons;
 use wingman_config::{Config, PermissionMode, ProjectPaths};
 use wingman_core::{AgentConfig, AgentEvent, AgentLoop, Compactor, ToolOutputBudget};
 use wingman_tools::{ToolCtx, ToolRegistry};
-use futures::StreamExt;
 
 use crate::runtime;
 
@@ -144,8 +144,8 @@ pub async fn run(cfg: Config, opts: WorkerOptions) -> Result<ExitCode> {
         let cancel = cancel.clone();
         let injections = ipc_injections.clone();
         std::thread::spawn(move || {
-            use wingman_autonomous::ipc::ManagerCommand;
             use std::io::BufRead;
+            use wingman_autonomous::ipc::ManagerCommand;
             let stdin = std::io::stdin();
             for line in stdin.lock().lines() {
                 let Ok(line) = line else { break };

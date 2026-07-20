@@ -4,6 +4,7 @@
 //! (headless --print, --json, future TUI) can just ask `Runtime::build(...)`.
 
 use anyhow::{anyhow, Context, Result};
+use std::sync::Arc;
 use wingman_config::{secrets, Config, PermissionMode, ProjectPaths};
 use wingman_core::{
     AgentConfig, AgentLoop, Compactor, GateReport, Provider, ToolOutputBudget, TurnGate,
@@ -19,7 +20,6 @@ use wingman_providers::{
 use wingman_rag::{Embedder, HashEmbedder, IndexStore, Indexer};
 use wingman_skills::Skill;
 use wingman_tools::{ToolCtx, ToolRegistry};
-use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct Selection {
@@ -962,8 +962,7 @@ pub async fn build_agent_with_fallback(
     selection: &Selection,
     mode: PermissionMode,
 ) -> Result<AgentLoop> {
-    let (agent, _registry) =
-        build_agent_registry_with_fallback(cfg, selection, mode).await?;
+    let (agent, _registry) = build_agent_registry_with_fallback(cfg, selection, mode).await?;
     Ok(agent)
 }
 
@@ -1348,7 +1347,10 @@ mod affected_tests_tests {
         let r = g.check().await;
         assert!(!r.passed);
         assert!(r.summary.contains("compile-failed"));
-        assert!(!r.summary.contains("tests-ran"), "should have short-circuited");
+        assert!(
+            !r.summary.contains("tests-ran"),
+            "should have short-circuited"
+        );
     }
 
     #[tokio::test]
@@ -1379,7 +1381,11 @@ mod affected_tests_tests {
         git(&["config", "user.email", "t@t"]);
         git(&["config", "user.name", "t"]);
         std::fs::create_dir_all(root.join("crates/foo/src")).unwrap();
-        std::fs::write(root.join("crates/foo/Cargo.toml"), "[package]\nname=\"foo\"\n").unwrap();
+        std::fs::write(
+            root.join("crates/foo/Cargo.toml"),
+            "[package]\nname=\"foo\"\n",
+        )
+        .unwrap();
         std::fs::write(root.join("crates/foo/src/lib.rs"), "// v1\n").unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-qm", "init"]);

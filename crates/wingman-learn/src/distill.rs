@@ -9,9 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use wingman_core::{
-    complete_text, CompletionRequest, ContentBlock, Message, Provider, Role,
-};
+use wingman_core::{complete_text, CompletionRequest, ContentBlock, Message, Provider, Role};
 
 /// Cap the transcript we send to the model. Distillation is a cheap side call;
 /// the tail of the session holds the freshest, most relevant facts.

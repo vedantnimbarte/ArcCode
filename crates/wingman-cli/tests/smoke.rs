@@ -25,7 +25,10 @@ fn help_exits_zero_and_lists_subcommands() {
     let text = String::from_utf8_lossy(&out.stdout);
     // A few stable, load-bearing subcommands should always be advertised.
     for sub in ["config", "review", "knows", "pilot", "session"] {
-        assert!(text.contains(sub), "--help output missing subcommand `{sub}`");
+        assert!(
+            text.contains(sub),
+            "--help output missing subcommand `{sub}`"
+        );
     }
 }
 
@@ -130,7 +133,10 @@ fn pilot_help_lists_subcommands() {
     assert!(out.status.success(), "pilot --help should exit 0");
     let text = String::from_utf8_lossy(&out.stdout);
     for sub in ["run", "status", "watch", "resume"] {
-        assert!(text.contains(sub), "pilot --help missing subcommand `{sub}`");
+        assert!(
+            text.contains(sub),
+            "pilot --help missing subcommand `{sub}`"
+        );
     }
 }
 

@@ -670,7 +670,15 @@ impl Config {
         base_url: Option<&str>,
         with_keyring: bool,
     ) -> Result<(), ConfigError> {
-        Self::write_provider_layer(path, provider_id, model, base_url, None, with_keyring, false)
+        Self::write_provider_layer(
+            path,
+            provider_id,
+            model,
+            base_url,
+            None,
+            with_keyring,
+            false,
+        )
     }
 
     /// Shared implementation for the two `*_provider_and_save` entry points.

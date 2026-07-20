@@ -20,7 +20,7 @@ pub use agent::{
     AgentConfig, AgentEvent, AgentLoop, AgentStop, GateReport, LearningHook, NoopLearningHook,
     ToolDispatcher, ToolOutcome, TurnGate,
 };
-pub use error::{WingmanError, Result};
+pub use error::{Result, WingmanError};
 pub use message::{ContentBlock, Message, Role};
 pub use pricing::{price_for, Price};
 pub use provider::{

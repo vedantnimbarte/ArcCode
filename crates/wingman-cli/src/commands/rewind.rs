@@ -50,7 +50,10 @@ fn rewind(root: &std::path::Path, n: usize) {
         println!("↩ {s}");
     }
     if summaries.len() < n {
-        println!("(reached the start of the timeline after {} step(s))", summaries.len());
+        println!(
+            "(reached the start of the timeline after {} step(s))",
+            summaries.len()
+        );
     }
 }
 

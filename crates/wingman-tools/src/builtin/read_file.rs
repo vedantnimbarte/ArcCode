@@ -1,8 +1,8 @@
 use crate::{Tool, ToolCtx};
-use wingman_core::{ToolOutcome, ToolSpec};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use wingman_core::{ToolOutcome, ToolSpec};
 
 pub struct ReadFile;
 
@@ -210,8 +210,8 @@ fn render_notebook(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wingman_config::PermissionMode;
     use serde_json::json;
+    use wingman_config::PermissionMode;
 
     #[test]
     fn renders_notebook_cells() {

@@ -49,7 +49,8 @@ fn resolve_position(abs: &Path, a: &PosArgs) -> Result<Position, String> {
         .symbol
         .as_deref()
         .ok_or("provide either `character` (1-based column) or `symbol`")?;
-    let text = std::fs::read_to_string(abs).map_err(|e| format!("cannot read {}: {e}", abs.display()))?;
+    let text =
+        std::fs::read_to_string(abs).map_err(|e| format!("cannot read {}: {e}", abs.display()))?;
     let line_text = text
         .lines()
         .nth(line0 as usize)
@@ -383,9 +384,7 @@ impl Tool for LspRename {
             Err(e) => return ToolOutcome::err(format!("lsp rename failed: {e}")),
         };
         match wingman_lsp::edit::apply_workspace_edit(&edit).await {
-            Ok(changed) if changed.is_empty() => {
-                ToolOutcome::ok("(rename produced no changes)")
-            }
+            Ok(changed) if changed.is_empty() => ToolOutcome::ok("(rename produced no changes)"),
             Ok(changed) => {
                 let list = changed
                     .iter()
@@ -462,8 +461,20 @@ mod tests {
     #[test]
     fn format_diagnostics_filters_errors_only() {
         let diags = vec![
-            Diagnostic { line: 0, character: 0, severity: 2, message: "warn".into(), source: None },
-            Diagnostic { line: 4, character: 2, severity: 1, message: "boom".into(), source: Some("rustc".into()) },
+            Diagnostic {
+                line: 0,
+                character: 0,
+                severity: 2,
+                message: "warn".into(),
+                source: None,
+            },
+            Diagnostic {
+                line: 4,
+                character: 2,
+                severity: 1,
+                message: "boom".into(),
+                source: Some("rustc".into()),
+            },
         ];
         let all = format_diagnostics(&diags, false);
         assert!(all.contains("warn") && all.contains("boom"));

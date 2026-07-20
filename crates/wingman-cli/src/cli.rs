@@ -1,8 +1,8 @@
 use crate::{commands, logging};
 use anyhow::Result;
-use wingman_config::{global_config_path, Config, PermissionMode, ProjectPaths};
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
+use wingman_config::{global_config_path, Config, PermissionMode, ProjectPaths};
 
 /// wingman — multi-provider terminal coding agent.
 #[derive(Parser, Debug)]
@@ -608,9 +608,7 @@ pub async fn run() -> Result<ExitCode> {
         Some(Command::Discover) => commands::discover::run().await,
         Some(Command::Knows) => commands::knows::run(load_config()?).await,
         Some(Command::Router { action }) => commands::router::run(action).await,
-        Some(Command::Distill { session }) => {
-            commands::distill::run(load_config()?, session).await
-        }
+        Some(Command::Distill { session }) => commands::distill::run(load_config()?, session).await,
         Some(Command::Indexd { status }) => commands::indexd::run(status).await,
         Some(Command::Schedule { all }) => commands::schedule::run(all).await,
         Some(Command::Skill { action }) => match action {
@@ -620,9 +618,7 @@ pub async fn run() -> Result<ExitCode> {
                 project,
                 force,
             } => commands::skill::import(path, project, force).await,
-            SkillAction::Export { name, out_dir } => {
-                commands::skill::export(name, out_dir).await
-            }
+            SkillAction::Export { name, out_dir } => commands::skill::export(name, out_dir).await,
         },
         Some(Command::ReviewMulti { pr, local, models }) => {
             commands::review_multi::run(pr, local, models).await

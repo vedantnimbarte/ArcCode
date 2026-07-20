@@ -200,7 +200,10 @@ impl LearnHook {
                 .as_deref()
                 .map(|s| format!("  {s}"))
                 .unwrap_or_default();
-            lines.push(format!("- {}:{}-{}{}", h.path, h.start_line, h.end_line, sym));
+            lines.push(format!(
+                "- {}:{}-{}{}",
+                h.path, h.start_line, h.end_line, sym
+            ));
         }
         Some(lines.join("\n"))
     }
@@ -322,7 +325,8 @@ impl LearnHandles {
         let memory = Arc::new(MemoryStore::new(cfg.project_root.clone()));
         memory.ensure_indexes()?;
         let stats = Arc::new(StatsStore::open_default()?);
-        let hook = Arc::new(LearnHook::new(cfg, memory.clone(), stats.clone()).with_indexer(indexer));
+        let hook =
+            Arc::new(LearnHook::new(cfg, memory.clone(), stats.clone()).with_indexer(indexer));
         let signals = hook.signals();
         Ok(Self {
             hook,
@@ -372,7 +376,8 @@ mod tests {
         .unwrap();
 
         let embedder = Arc::new(HashEmbedder::new(64));
-        let store = IndexStore::open(&root.join("index.db"), embedder.id(), embedder.dim()).unwrap();
+        let store =
+            IndexStore::open(&root.join("index.db"), embedder.id(), embedder.dim()).unwrap();
         let indexer = Arc::new(Indexer::new(root.clone(), embedder, Arc::new(store)));
         indexer.reindex_repo().await.unwrap();
 

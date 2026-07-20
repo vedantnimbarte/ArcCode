@@ -41,7 +41,11 @@ fn parse_edit(v: &Value) -> Option<TextEdit> {
         start_char: start.get("character")?.as_u64()? as u32,
         end_line: end.get("line")?.as_u64()? as u32,
         end_char: end.get("character")?.as_u64()? as u32,
-        new_text: v.get("newText").and_then(Value::as_str).unwrap_or("").to_string(),
+        new_text: v
+            .get("newText")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
     })
 }
 
@@ -186,8 +190,20 @@ mod tests {
     fn multiple_edits_same_line_apply_right_to_left() {
         let text = "foo + foo\n";
         let edits = vec![
-            TextEdit { start_line: 0, start_char: 0, end_line: 0, end_char: 3, new_text: "bar".into() },
-            TextEdit { start_line: 0, start_char: 6, end_line: 0, end_char: 9, new_text: "baz".into() },
+            TextEdit {
+                start_line: 0,
+                start_char: 0,
+                end_line: 0,
+                end_char: 3,
+                new_text: "bar".into(),
+            },
+            TextEdit {
+                start_line: 0,
+                start_char: 6,
+                end_line: 0,
+                end_char: 9,
+                new_text: "baz".into(),
+            },
         ];
         assert_eq!(apply_edits(text, &edits), "bar + baz\n");
     }
@@ -211,7 +227,7 @@ mod tests {
         // "😀" is 2 UTF-16 units, 4 UTF-8 bytes. The identifier after it starts
         // at UTF-16 char 3 (emoji=0..2, space=2..3? here we put emoji then id).
         let text = "let 😀x = 1;\n"; // chars: l e t sp 😀 x ...
-        // 'x' is at UTF-16 column: "let " = 4 units, 😀 = 2 → x at column 6.
+                                     // 'x' is at UTF-16 column: "let " = 4 units, 😀 = 2 → x at column 6.
         let edits = vec![TextEdit {
             start_line: 0,
             start_char: 6,

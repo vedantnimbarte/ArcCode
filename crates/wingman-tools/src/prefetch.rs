@@ -46,8 +46,25 @@ fn is_source_like(p: &Path) -> bool {
     matches!(
         p.extension().and_then(|e| e.to_str()),
         Some(
-            "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "java" | "c" | "h" | "cpp" | "hpp"
-                | "rb" | "toml" | "json" | "yaml" | "yml" | "md" | "css" | "html"
+            "rs" | "py"
+                | "js"
+                | "ts"
+                | "tsx"
+                | "jsx"
+                | "go"
+                | "java"
+                | "c"
+                | "h"
+                | "cpp"
+                | "hpp"
+                | "rb"
+                | "toml"
+                | "json"
+                | "yaml"
+                | "yml"
+                | "md"
+                | "css"
+                | "html"
         )
     )
 }

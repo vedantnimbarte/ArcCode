@@ -177,7 +177,11 @@ pub async fn sync(git_ref: Option<String>) -> Result<ExitCode> {
     if let Some(gref) = git_ref.as_deref() {
         println!("pulled {added_from_ref} new memory file(s) from {gref}");
     }
-    println!("indexed {} project memories → {}", slugs.len(), dir.join("MEMORY.md").display());
+    println!(
+        "indexed {} project memories → {}",
+        slugs.len(),
+        dir.join("MEMORY.md").display()
+    );
     if !newly_indexed.is_empty() {
         println!("  + folded into the index: {}", join_slugs(&newly_indexed));
     }

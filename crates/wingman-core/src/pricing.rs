@@ -172,7 +172,10 @@ mod tests {
     #[test]
     fn all_comparison_models_are_priced() {
         for m in COMPARISON_MODELS {
-            assert!(price_for(m).is_some(), "comparison model {m} must be priced");
+            assert!(
+                price_for(m).is_some(),
+                "comparison model {m} must be priced"
+            );
         }
     }
 
@@ -196,8 +199,14 @@ mod tests {
     #[test]
     fn cache_read_billed_below_input() {
         let p = price_for("claude-opus-4-8").unwrap();
-        let fresh = Usage { input_tokens: 1000, ..Default::default() };
-        let cached = Usage { cache_read_input_tokens: 1000, ..Default::default() };
+        let fresh = Usage {
+            input_tokens: 1000,
+            ..Default::default()
+        };
+        let cached = Usage {
+            cache_read_input_tokens: 1000,
+            ..Default::default()
+        };
         assert!(p.cost(&cached) < p.cost(&fresh));
     }
 }

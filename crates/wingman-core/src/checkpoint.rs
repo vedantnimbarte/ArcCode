@@ -81,11 +81,7 @@ fn patch_paths(patch: &str) -> Vec<String> {
     patch
         .lines()
         .filter_map(|l| {
-            for pfx in [
-                "*** Update File: ",
-                "*** Add File: ",
-                "*** Delete File: ",
-            ] {
+            for pfx in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
                 if let Some(rest) = l.trim().strip_prefix(pfx) {
                     return Some(rest.trim().to_string());
                 }
@@ -162,7 +158,11 @@ pub fn commit(root: &Path, pres: Vec<Pre>) {
 fn read_entries(root: &Path) -> Vec<Entry> {
     std::fs::read_to_string(manifest(root))
         .ok()
-        .map(|s| s.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -254,7 +254,10 @@ mod tests {
         commit(&root, vec![pre]);
         assert_eq!(depth(&root), 1);
         assert_eq!(undo_last(&root).as_deref(), Some("reverted a.txt"));
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "original");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "original"
+        );
         assert_eq!(depth(&root), 0);
 
         // New file: capture (absent) then create then undo removes it.

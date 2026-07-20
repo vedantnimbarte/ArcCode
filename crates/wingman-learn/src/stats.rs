@@ -456,10 +456,16 @@ mod tests {
         store.record_routing("default", "opus", "r", true).unwrap();
         store.record_routing("default", "opus", "r", true).unwrap();
         store.record_routing("default", "haiku", "r", true).unwrap();
-        store.record_routing("default", "haiku", "r", false).unwrap();
-        store.record_routing("default", "haiku", "r", false).unwrap();
+        store
+            .record_routing("default", "haiku", "r", false)
+            .unwrap();
+        store
+            .record_routing("default", "haiku", "r", false)
+            .unwrap();
         // Different repo — excluded when scoped to "r".
-        store.record_routing("default", "haiku", "other", true).unwrap();
+        store
+            .record_routing("default", "haiku", "other", true)
+            .unwrap();
 
         let stats = store.routing_summary(Some("r")).unwrap();
         assert_eq!(stats.len(), 2);
@@ -472,7 +478,11 @@ mod tests {
 
         // Unscoped includes the other repo.
         let all = store.routing_summary(None).unwrap();
-        let haiku_total: u32 = all.iter().filter(|s| s.model == "haiku").map(|s| s.total).sum();
+        let haiku_total: u32 = all
+            .iter()
+            .filter(|s| s.model == "haiku")
+            .map(|s| s.total)
+            .sum();
         assert_eq!(haiku_total, 4);
         let _ = std::fs::remove_file(&p);
     }

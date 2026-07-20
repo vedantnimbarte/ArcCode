@@ -274,7 +274,8 @@ impl AgentLoop {
     pub fn compact_now(&mut self) -> Option<usize> {
         let plan = self.config.compactor.plan_forced(&self.history)?;
         let replaced = plan.replaced;
-        self.history.splice(0..replaced, std::iter::once(plan.recap));
+        self.history
+            .splice(0..replaced, std::iter::once(plan.recap));
         Some(replaced)
     }
 
@@ -625,7 +626,10 @@ mod tests {
             }
         }
         async fn complete(&self, req: CompletionRequest) -> crate::Result<ProviderEventStream> {
-            self.captured.lock().unwrap().push(req.cache_breakpoints.clone());
+            self.captured
+                .lock()
+                .unwrap()
+                .push(req.cache_breakpoints.clone());
             let events = self
                 .responses
                 .lock()

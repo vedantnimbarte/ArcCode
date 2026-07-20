@@ -551,7 +551,11 @@ mod tests {
         }
         // Corrupt the index to simulate a merge-conflict leftover.
         let idx = store.project_dir().join("MEMORY.md");
-        std::fs::write(&idx, "# wingman memory index\n\n- [ghost](ghost.md) [user] — gone\n").unwrap();
+        std::fs::write(
+            &idx,
+            "# wingman memory index\n\n- [ghost](ghost.md) [user] — gone\n",
+        )
+        .unwrap();
 
         let before: std::collections::BTreeSet<_> =
             store.indexed_project_slugs().into_iter().collect();

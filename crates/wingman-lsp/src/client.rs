@@ -488,7 +488,11 @@ fn one_location(v: &Value) -> Option<Location> {
     let (uri, range) = if let Some(uri) = v.get("uri") {
         (uri, v.get("range"))
     } else if let Some(uri) = v.get("targetUri") {
-        (uri, v.get("targetSelectionRange").or_else(|| v.get("targetRange")))
+        (
+            uri,
+            v.get("targetSelectionRange")
+                .or_else(|| v.get("targetRange")),
+        )
     } else {
         return None;
     };
@@ -601,7 +605,9 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     let decoded = percent_decode(rest);
     // On Windows the leading segment is a drive (C:/…); on unix restore root /.
     if decoded.len() >= 2 && decoded.as_bytes()[1] == b':' {
-        Some(PathBuf::from(decoded.replace('/', std::path::MAIN_SEPARATOR_STR)))
+        Some(PathBuf::from(
+            decoded.replace('/', std::path::MAIN_SEPARATOR_STR),
+        ))
     } else {
         Some(PathBuf::from(format!("/{decoded}")))
     }
@@ -637,7 +643,10 @@ mod tests {
         assert!(uri.starts_with("file:///home/me/"));
         assert!(uri.contains("%20")); // space encoded
         let back = uri_to_path(&uri).unwrap();
-        assert_eq!(back.to_string_lossy().replace('\\', "/"), "/home/me/a b/x.rs");
+        assert_eq!(
+            back.to_string_lossy().replace('\\', "/"),
+            "/home/me/a b/x.rs"
+        );
     }
 
     #[test]

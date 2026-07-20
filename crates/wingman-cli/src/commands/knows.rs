@@ -4,9 +4,9 @@
 //! learning loop's value is obvious (and auditable) to the user.
 
 use anyhow::Result;
-use wingman_config::{Config, ProjectPaths};
 use std::path::Path;
 use std::process::ExitCode;
+use wingman_config::{Config, ProjectPaths};
 
 pub async fn run(cfg: Config) -> Result<ExitCode> {
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -26,7 +26,10 @@ pub async fn run(cfg: Config) -> Result<ExitCode> {
     let all = store.load_all();
     let stale = wingman_learn::staleness::stale_memories(&all, &paths.root);
     if !stale.is_empty() {
-        println!("stale memories: {} (reference files that no longer exist)", stale.len());
+        println!(
+            "stale memories: {} (reference files that no longer exist)",
+            stale.len()
+        );
         for (m, missing) in stale.iter().take(10) {
             println!("  - {} → missing {}", m.name, missing.join(", "));
         }

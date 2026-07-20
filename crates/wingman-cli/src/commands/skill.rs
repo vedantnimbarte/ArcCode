@@ -5,10 +5,10 @@
 //! files; the portable format is a per-skill directory holding a `SKILL.md`.
 
 use anyhow::{Context, Result};
-use wingman_config::ProjectPaths;
-use wingman_learn::extract::{extract_from_dir, write_drafts, ExtractConfig};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use wingman_config::ProjectPaths;
+use wingman_learn::extract::{extract_from_dir, write_drafts, ExtractConfig};
 
 pub async fn extract(min: usize, force: bool) -> Result<ExitCode> {
     let cwd = std::env::current_dir()?;
@@ -115,10 +115,14 @@ pub async fn export(name: String, out_dir: String) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     };
     let bundle_dir = PathBuf::from(&out_dir).join(&skill.name);
-    std::fs::create_dir_all(&bundle_dir).with_context(|| format!("mkdir {}", bundle_dir.display()))?;
+    std::fs::create_dir_all(&bundle_dir)
+        .with_context(|| format!("mkdir {}", bundle_dir.display()))?;
     let path = bundle_dir.join("SKILL.md");
-    std::fs::write(&path, render_skill_md(&skill.name, &skill.description, &skill.body))
-        .with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(
+        &path,
+        render_skill_md(&skill.name, &skill.description, &skill.body),
+    )
+    .with_context(|| format!("write {}", path.display()))?;
     println!("exported skill `{}` → {}", skill.name, path.display());
     Ok(ExitCode::SUCCESS)
 }
@@ -126,8 +130,11 @@ pub async fn export(name: String, out_dir: String) -> Result<ExitCode> {
 /// Collect SKILL.md files from a path: the file itself, `<dir>/SKILL.md`, or
 /// each `<dir>/*/SKILL.md`. Case-insensitive on the filename.
 fn find_skill_md_files(src: &Path) -> Vec<PathBuf> {
-    let is_skill_md =
-        |p: &Path| p.file_name().and_then(|f| f.to_str()).is_some_and(|f| f.eq_ignore_ascii_case("SKILL.md"));
+    let is_skill_md = |p: &Path| {
+        p.file_name()
+            .and_then(|f| f.to_str())
+            .is_some_and(|f| f.eq_ignore_ascii_case("SKILL.md"))
+    };
     if src.is_file() {
         return if is_skill_md(src) {
             vec![src.to_path_buf()]
@@ -194,11 +201,17 @@ fn parse_skill_md(text: &str, path: &Path) -> (String, String, String) {
 }
 
 fn render_wingman_skill(slug: &str, description: &str, body: &str) -> String {
-    format!("---\nname: {slug}\ndescription: {description}\n---\n{}\n", body.trim())
+    format!(
+        "---\nname: {slug}\ndescription: {description}\n---\n{}\n",
+        body.trim()
+    )
 }
 
 fn render_skill_md(name: &str, description: &str, body: &str) -> String {
-    format!("---\nname: {name}\ndescription: {description}\n---\n{}\n", body.trim())
+    format!(
+        "---\nname: {name}\ndescription: {description}\n---\n{}\n",
+        body.trim()
+    )
 }
 
 /// Lowercase, non-alphanumerics to hyphens, collapse/trim hyphens.

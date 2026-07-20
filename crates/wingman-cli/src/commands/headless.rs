@@ -5,10 +5,10 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use anyhow::Result;
+use futures::StreamExt;
 use wingman_config::{Config, PermissionMode, ProjectPaths};
 use wingman_core::AgentEvent;
 use wingman_session::{SessionLog, SessionRecord};
-use futures::StreamExt;
 
 use crate::runtime;
 
