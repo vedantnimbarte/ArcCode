@@ -174,6 +174,12 @@ worker agents in isolated worktrees, and converges into a PR.
 - **Git-native auto-commit.** `[git].auto_commit = true` turns each AI change
   into a reviewable, revertable commit with a generated message (Aider-style),
   composing with the rewind timeline and verification gate.
+- **Local-first privacy preset.** `wingman router preset local` routes the
+  cheap steps (summarize / compaction / commit-message / title) to a local
+  model — simple steps never leave your machine.
+- **Explain-and-teach.** `wingman explain` gives a per-file "what changed and
+  why it matters" walkthrough of the working diff (fast-model), for reviewers
+  and juniors.
 - **Multi-model code review.** `wingman review-multi <pr#> --models
   anthropic/claude-opus-4-7,openai/gpt-4.1,gemini/gemini-2.5-pro` fans the
   review out across reviewers in parallel and merges findings by

@@ -190,6 +190,17 @@ pub enum Command {
         #[arg(long, value_name = "LIST")]
         models: String,
     },
+    /// Explain-and-teach the current changes: a per-file "what changed and
+    /// why it matters" walkthrough of the working diff, aimed at a reviewer or
+    /// junior. Routes to the fast model when configured.
+    Explain {
+        /// Explain the diff against this base ref instead of the working tree.
+        #[arg(long, value_name = "BASE")]
+        local: Option<String>,
+        /// Explain only staged changes.
+        #[arg(long)]
+        staged: bool,
+    },
     /// Interactive diff viewer: walk a unified diff hunk by hunk and
     /// accept or reject each one before writing the result.
     Diff {
@@ -645,6 +656,7 @@ pub async fn run() -> Result<ExitCode> {
         Some(Command::ReviewMulti { pr, local, models }) => {
             commands::review_multi::run(pr, local, models).await
         }
+        Some(Command::Explain { local, staged }) => commands::explain::run(local, staged).await,
         Some(Command::Diff { file, patch }) => commands::diff::run(file, patch).await,
         Some(Command::Pilot { action }) => match action {
             PilotAction::Run {
