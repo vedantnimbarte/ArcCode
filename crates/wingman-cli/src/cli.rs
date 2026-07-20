@@ -139,6 +139,9 @@ pub enum Command {
     /// Probe localhost for running Ollama / LM Studio / vLLM and print
     /// discovered models.
     Discover,
+    /// Health check: config, provider credentials, local servers, the semantic
+    /// index, language servers on PATH, and git/gh tooling.
+    Doctor,
     /// Show what Wingman knows about this project: memories, skills,
     /// model routing, the verification gate, and index freshness.
     Knows,
@@ -522,6 +525,18 @@ pub enum MemoryAction {
     Push,
     /// Pull team memories from the server and merge them (non-clobbering).
     Pull,
+    /// Review distilled pending memories: list, or promote/discard by index.
+    Review {
+        /// Promote the Nth pending fact (1-based) to a project memory.
+        #[arg(long, value_name = "N")]
+        promote: Option<usize>,
+        /// Discard the Nth pending fact (1-based).
+        #[arg(long, value_name = "N")]
+        discard: Option<usize>,
+        /// Promote every pending fact and clear the queue.
+        #[arg(long)]
+        promote_all: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -648,6 +663,11 @@ pub async fn run() -> Result<ExitCode> {
             MemoryAction::Sync { git_ref } => commands::memory::sync(git_ref).await,
             MemoryAction::Push => commands::memory::push().await,
             MemoryAction::Pull => commands::memory::pull().await,
+            MemoryAction::Review {
+                promote,
+                discard,
+                promote_all,
+            } => commands::memory::review(promote, discard, promote_all).await,
         },
         Some(Command::Review {
             pr,
@@ -678,6 +698,7 @@ pub async fn run() -> Result<ExitCode> {
         }
         Some(Command::Logout { provider }) => commands::login::logout(provider).await,
         Some(Command::Discover) => commands::discover::run().await,
+        Some(Command::Doctor) => commands::doctor::run(load_config()?).await,
         Some(Command::Knows) => commands::knows::run(load_config()?).await,
         Some(Command::Bench { suite, json }) => commands::bench::run(suite, json).await,
         Some(Command::Router { action }) => commands::router::run(action).await,

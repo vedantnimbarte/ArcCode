@@ -465,7 +465,9 @@ pub async fn build_registry_with_learn(
     let mut reg = ToolRegistry::new(ctx)
         .with_builtins()
         .with_hooks(cfg.hooks.clone())
-        .with_audit(audit_path);
+        .with_audit(audit_path)
+        .with_output_redaction(cfg.tools.redact_output_secrets)
+        .with_custom_tools(&cfg.tools.custom);
     let indexer = build_indexer(&paths)?;
     if let Some(idx) = indexer.clone() {
         reg = reg.with_semantic_search(idx);
@@ -683,37 +685,88 @@ impl TurnGate for AffectedTestsGate {
                 summary: "affected tests: none (no changed Rust crates)".into(),
             };
         }
-        let mut cmd = String::from("cargo test --quiet");
-        for c in &crates {
-            cmd.push_str(" -p ");
-            cmd.push_str(c);
+        let pkg_flags: String = crates.iter().map(|c| format!(" -p {c}")).collect();
+
+        // Safe symbol-level narrowing: map the diff to the symbols it edited,
+        // then run ONLY the tests whose names match an edited symbol — but
+        // first confirm (via `cargo test -- --list`) that at least one test
+        // actually matches. If none do, fall back to the whole changed crate.
+        // This never runs zero tests under the guise of "passing" (the
+        // false-green trap): narrowing is a pure speed win when it applies and a
+        // no-op otherwise.
+        let symbols = edited_symbol_names(&self.root);
+        let mut narrowed_to: Vec<String> = Vec::new();
+        if !symbols.is_empty() {
+            if let Some(all_tests) = list_tests(&self.root, &pkg_flags).await {
+                narrowed_to = symbols
+                    .iter()
+                    .filter(|s| all_tests.iter().any(|t| t.contains(s.as_str())))
+                    .cloned()
+                    .collect();
+            }
         }
+
+        let cmd = if narrowed_to.is_empty() {
+            format!("cargo test --quiet{pkg_flags}")
+        } else {
+            let filters: String = narrowed_to.iter().map(|s| format!(" {s}")).collect();
+            format!("cargo test --quiet{pkg_flags}{filters}")
+        };
         let mut report = run_check_cmd(&cmd, &self.root).await;
 
-        // Surface the symbols actually edited this turn (tree-sitter-mapped from
-        // the diff hunks) in the receipt. We deliberately do NOT narrow the
-        // `cargo test` invocation to these symbol names: a name filter that
-        // matches no test would run zero tests and pass — a false green that's
-        // worse than running the whole changed crate. Safe symbol-level
-        // narrowing needs resolved references from `test fn -> edited symbol`
-        // (LSP), which is the follow-on; until then crate-level is the floor.
-        let symbols = edited_symbol_names(&self.root);
         if !symbols.is_empty() {
             let shown: Vec<&str> = symbols.iter().take(12).map(String::as_str).collect();
             let more = symbols.len().saturating_sub(shown.len());
+            let narrow_note = if narrowed_to.is_empty() {
+                " (no test names matched — ran the whole changed crate)".to_string()
+            } else {
+                format!(" → narrowed to tests matching: {}", narrowed_to.join(", "))
+            };
             report.summary = format!(
-                "edited symbols: {}{}\n{}",
+                "edited symbols: {}{}{}\n{}",
                 shown.join(", "),
                 if more > 0 {
                     format!(" (+{more})")
                 } else {
                     String::new()
                 },
+                narrow_note,
                 report.summary
             );
         }
         report
     }
+}
+
+/// List every test name in `pkg_flags`'s packages via `cargo test -- --list`.
+/// `None` when the command can't run, so the caller runs the full suite rather
+/// than narrowing on incomplete data.
+async fn list_tests(root: &std::path::Path, pkg_flags: &str) -> Option<Vec<String>> {
+    let cmd = format!("cargo test{pkg_flags} -- --list");
+    let output = if cfg!(windows) {
+        tokio::process::Command::new("cmd")
+            .args(["/C", &cmd])
+            .current_dir(root)
+            .output()
+            .await
+    } else {
+        tokio::process::Command::new("sh")
+            .args(["-c", &cmd])
+            .current_dir(root)
+            .output()
+            .await
+    }
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // Lines look like `module::tests::name: test`.
+    let text = String::from_utf8_lossy(&output.stdout);
+    let names: Vec<String> = text
+        .lines()
+        .filter_map(|l| l.strip_suffix(": test").map(|n| n.trim().to_string()))
+        .collect();
+    Some(names)
 }
 
 /// Repo-relative changed file -> 1-based line numbers touched, from
@@ -825,10 +878,25 @@ impl TurnGate for BrowserGate {
             }
         };
 
+        // Console errors / uncaught exceptions fail the gate regardless of the
+        // pixel diff — a page that renders but throws is still broken.
+        if !capture.console_errors.is_empty() {
+            let list: Vec<String> = capture.console_errors.iter().take(5).cloned().collect();
+            return GateReport {
+                passed: false,
+                summary: format!(
+                    "browser: ✗ {} console error(s)/exception(s) at {}\n{}",
+                    capture.console_errors.len(),
+                    self.cfg.url,
+                    list.join("\n")
+                ),
+            };
+        }
+
         let Some(rel) = &self.cfg.baseline else {
             return GateReport {
                 passed: true,
-                summary: "browser: captured (no baseline configured to compare)".into(),
+                summary: "browser: ✓ no console errors (no baseline configured to compare)".into(),
             };
         };
         let baseline = self.root.join(rel);

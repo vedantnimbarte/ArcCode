@@ -7,6 +7,7 @@ pub mod diff;
 pub mod diff_annotate;
 pub mod discover;
 pub mod distill;
+pub mod doctor;
 pub mod explain;
 pub mod headless;
 pub mod indexd;

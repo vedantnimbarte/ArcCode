@@ -102,6 +102,30 @@ impl PendingStore {
             .collect()
     }
 
+    /// Overwrite the pending file with exactly `facts` (checkbox format), or
+    /// delete it when empty. Used by `wingman memory review` to remove a fact
+    /// after promoting or discarding it.
+    pub fn rewrite(&self, facts: &[String]) -> std::io::Result<()> {
+        if facts.is_empty() {
+            let _ = std::fs::remove_file(&self.path);
+            return Ok(());
+        }
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut body = String::from(
+            "# Pending memories (distilled from sessions)\n\n\
+             Review these; promote the good ones with `save_memory` / `/remember`, then \
+             delete them here. Wingman does not trust this file as memory.\n\n",
+        );
+        for f in facts {
+            body.push_str("- [ ] ");
+            body.push_str(f);
+            body.push('\n');
+        }
+        std::fs::write(&self.path, body)
+    }
+
     /// Append `facts` not already present. Returns how many were newly added.
     pub fn append(&self, facts: &[String]) -> std::io::Result<usize> {
         let existing = self.load();

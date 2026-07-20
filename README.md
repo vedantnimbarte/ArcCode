@@ -198,6 +198,21 @@ worker agents in isolated worktrees, and converges into a PR.
   requests.
 - **VS Code extension.** `editors/vscode` brings `semantic_search` and
   `recall_memory` into the editor over `wingman mcp-serve`.
+- **Hybrid semantic search.** The index fuses dense vector similarity with BM25
+  keyword scoring (reciprocal-rank fusion), so exact identifier/error-string
+  matches surface alongside semantic ones.
+- **Secret-scanned tool output.** High-confidence tokens (OpenAI/GitHub/AWS/
+  Slack/JWT/PEM) are redacted from tool output before the model sees them
+  (`[tools].redact_output_secrets`).
+- **Custom command tools.** Define a tool as a shell command under
+  `[[tools.custom]]` — extend the agent without recompiling.
+- **`wingman doctor`.** One health check for config, credentials, local servers,
+  the index, and language servers on PATH.
+- **`wingman memory review`.** Promote or discard the facts `wingman distill`
+  proposes — the review queue that closes the learning loop.
+- **11 LSP languages.** Rust, Python, JS/TS, Go, Java, C/C++, Ruby, C#, PHP.
+- **Session cost budget.** `[tokens].max_usd_per_session` warns when a session's
+  estimated spend crosses your limit.
 - **Multi-model code review.** `wingman review-multi <pr#> --models
   anthropic/claude-opus-4-7,openai/gpt-4.1,gemini/gemini-2.5-pro` fans the
   review out across reviewers in parallel and merges findings by

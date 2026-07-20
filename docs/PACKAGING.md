@@ -68,8 +68,28 @@ manifest with `InstallerType: wix` instead of the `zip`/`portable` combo above.
 The zip/portable path is preferred because it reuses the binary the release
 workflow already builds and needs no extra toolchain.
 
-## macOS / Linux
+## Homebrew (macOS / Linux)
+
+`packaging/homebrew/wingman.rb` is a formula template covering Apple-silicon
+macOS and Linux x64/arm64. Stamp it with a release tag + checksums and publish
+it to a tap (e.g. `vedantnimbarte/homebrew-wingman`), then:
+
+```bash
+brew install vedantnimbarte/wingman/wingman
+```
+
+## Scoop (Windows)
+
+`packaging/scoop/wingman.json` is a Scoop manifest template (reuses the same
+release zip as winget). Submit it to a Scoop bucket, then:
+
+```powershell
+scoop bucket add wingman https://github.com/vedantnimbarte/scoop-wingman
+scoop install wingman
+```
+
+## macOS / Linux (no package manager)
 
 The `curl | sh` installer (`scripts/install.sh`) downloads the matching archive
-and drops `wingman` on PATH — no package manager needed. Homebrew and a Linux
-package (deb/rpm) are future work.
+and drops `wingman` on PATH — no package manager needed. deb/rpm packaging is
+future work.

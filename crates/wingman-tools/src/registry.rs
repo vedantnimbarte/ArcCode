@@ -16,6 +16,9 @@ pub struct ToolRegistry {
     /// Optional append-only audit log path. When set, each dispatch appends a
     /// JSONL record — an enterprise/compliance trail of what the agent did.
     audit: Option<std::path::PathBuf>,
+    /// Redact high-confidence secret tokens in tool output before it reaches
+    /// the model (data-exfiltration guard). Default on.
+    redact_output: bool,
 }
 
 impl ToolRegistry {
@@ -25,6 +28,7 @@ impl ToolRegistry {
             ctx,
             hooks: HooksConfig::default(),
             audit: None,
+            redact_output: true,
         }
     }
 
@@ -40,6 +44,12 @@ impl ToolRegistry {
         self
     }
 
+    /// Toggle high-confidence secret redaction of tool output. Builder-style.
+    pub fn with_output_redaction(mut self, on: bool) -> Self {
+        self.redact_output = on;
+        self
+    }
+
     /// Append one audit record for a dispatched tool call. Best-effort: a
     /// logging failure never blocks the tool. The input is truncated so the
     /// trail stays compact and doesn't balloon with large tool arguments.
@@ -51,7 +61,10 @@ impl ToolRegistry {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let mut input = args.to_string();
+        // Redact secret-looking values so the compliance trail never itself
+        // leaks credentials, then bound the size.
+        let redacted = redact_secrets(args);
+        let mut input = redacted.to_string();
         if input.len() > 400 {
             input.truncate(400);
             input.push('…');
@@ -169,6 +182,22 @@ impl ToolRegistry {
         self
     }
 
+    /// Register user-defined command tools from `[[tools.custom]]` config.
+    pub fn with_custom_tools(mut self, custom: &[wingman_config::CustomToolConfig]) -> Self {
+        for c in custom {
+            if c.name.trim().is_empty() || c.command.trim().is_empty() {
+                continue;
+            }
+            self.register(crate::builtin::CommandTool::new(
+                c.name.clone(),
+                c.description.clone(),
+                c.command.clone(),
+                c.timeout_secs,
+            ));
+        }
+        self
+    }
+
     /// Register the `spawn_subagent` tool. The `runner` closure is supplied
     /// by the runtime (which knows how to build inner agents) so this
     /// crate stays provider-agnostic.
@@ -224,10 +253,20 @@ impl ToolDispatcher for ToolRegistry {
             .unwrap_or_else(|e| e.into_inner())
             .get(name)
             .cloned();
-        let outcome = match tool {
+        let mut outcome = match tool {
             Some(tool) => tool.run(args.clone(), &self.ctx).await,
             None => ToolOutcome::err(format!("unknown tool: {name}")),
         };
+
+        // Data-exfiltration guard: strip high-confidence secret tokens from the
+        // output before it reaches the model, so a credential the agent read
+        // (e.g. from a .env) can't be echoed back or smuggled out.
+        if self.redact_output {
+            let (redacted, n) = redact_output_secrets(&outcome.content);
+            if n > 0 {
+                outcome.content = redacted;
+            }
+        }
 
         if !outcome.is_error && !pres.is_empty() {
             wingman_core::checkpoint::commit(&self.ctx.project_root, pres);
@@ -262,6 +301,80 @@ impl ToolDispatcher for ToolRegistry {
 
         outcome
     }
+}
+
+/// Recursively redact secret-looking values in a JSON value: any object key
+/// that looks credential-bearing (`key`, `token`, `secret`, `password`,
+/// `authorization`, `api_key`, …) has its string value replaced with
+/// `"[redacted]"`. Used so the audit trail can't itself leak credentials.
+fn redact_secrets(v: &Value) -> Value {
+    fn is_secret_key(k: &str) -> bool {
+        let k = k.to_ascii_lowercase();
+        const NEEDLES: &[&str] = &[
+            "password",
+            "passwd",
+            "secret",
+            "token",
+            "api_key",
+            "apikey",
+            "authorization",
+            "auth",
+            "credential",
+            "private_key",
+            "access_key",
+        ];
+        // `key` alone is too broad (matches innocuous "key"), so require it to
+        // be a suffix/compound (api_key, access_key) or one of the needles.
+        NEEDLES.iter().any(|n| k.contains(n)) || k == "key" || k.ends_with("_key")
+    }
+    match v {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, val) in map {
+                if is_secret_key(k) && val.is_string() {
+                    out.insert(k.clone(), Value::String("[redacted]".into()));
+                } else {
+                    out.insert(k.clone(), redact_secrets(val));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(redact_secrets).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Redact high-confidence secret tokens in `text`, returning `(redacted, n)`.
+/// Only matches unambiguous credential shapes so it doesn't mangle normal
+/// output. Used to stop the agent surfacing/exfiltrating a secret it read.
+pub fn redact_output_secrets(text: &str) -> (String, usize) {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            r"sk-[A-Za-z0-9_-]{20,}",        // OpenAI / Anthropic-style
+            r"gh[pousr]_[A-Za-z0-9]{30,}",   // GitHub tokens
+            r"AKIA[0-9A-Z]{16}",             // AWS access key id
+            r"xox[baprs]-[A-Za-z0-9-]{10,}", // Slack tokens
+            r"AIza[0-9A-Za-z_-]{35}",        // Google API key
+            r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}", // JWT
+            r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", // PEM keys
+        ]
+        .iter()
+        .filter_map(|p| Regex::new(p).ok())
+        .collect()
+    });
+    let mut out = text.to_string();
+    let mut n = 0usize;
+    for re in patterns {
+        let count = re.find_iter(&out).count();
+        if count > 0 {
+            n += count;
+            out = re.replace_all(&out, "[redacted-secret]").into_owned();
+        }
+    }
+    (out, n)
 }
 
 fn tool_matches(name: &str, pattern: &str) -> bool {
@@ -377,6 +490,62 @@ mod tests {
             "audit missing tool: {body}"
         );
         assert!(body.contains("\"is_error\":false"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn redacts_high_confidence_output_tokens() {
+        let (out, n) = super::redact_output_secrets(
+            "key=sk-abcdefghij0123456789ABCDEF and AKIAIOSFODNN7EXAMPLE plus normal text",
+        );
+        assert_eq!(n, 2);
+        assert!(!out.contains("sk-abcdefghij"));
+        assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(out.contains("normal text"));
+        assert!(out.contains("[redacted-secret]"));
+    }
+
+    #[test]
+    fn leaves_ordinary_output_untouched() {
+        let text = "fn main() { let key = compute(); println!(\"{key}\"); }";
+        let (out, n) = super::redact_output_secrets(text);
+        assert_eq!(n, 0);
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn redacts_secret_looking_keys() {
+        let v = serde_json::json!({
+            "path": "src/x.rs",
+            "api_key": "sk-secret",
+            "nested": { "token": "abc", "note": "keep" },
+            "arr": [ { "password": "p" } ]
+        });
+        let r = super::redact_secrets(&v);
+        assert_eq!(r["path"], "src/x.rs");
+        assert_eq!(r["api_key"], "[redacted]");
+        assert_eq!(r["nested"]["token"], "[redacted]");
+        assert_eq!(r["nested"]["note"], "keep");
+        assert_eq!(r["arr"][0]["password"], "[redacted]");
+    }
+
+    #[tokio::test]
+    async fn audit_redacts_secrets_in_the_log() {
+        let dir = std::env::temp_dir().join(format!("wm-audit-red-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("audit.log");
+        let ctx = ToolCtx::new(PermissionMode::ReadOnly, dir.clone(), dir.clone());
+        let mut reg = ToolRegistry::new(ctx).with_audit(Some(log.clone()));
+        reg.register(EchoTool);
+        let _ = reg
+            .dispatch("echo", serde_json::json!({ "api_key": "sk-leak" }))
+            .await;
+        let body = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !body.contains("sk-leak"),
+            "secret leaked into audit log: {body}"
+        );
+        assert!(body.contains("[redacted]"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

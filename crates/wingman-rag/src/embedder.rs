@@ -153,3 +153,84 @@ mod fastembed_impl {
 
 #[cfg(feature = "embeddings")]
 pub use fastembed_impl::FastembedEmbedder;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if na == 0.0 || nb == 0.0 {
+            0.0
+        } else {
+            dot / (na * nb)
+        }
+    }
+
+    async fn embed_one(e: &HashEmbedder, s: &str) -> Vec<f32> {
+        e.embed(&[s.to_string()]).await.unwrap().pop().unwrap()
+    }
+
+    #[test]
+    fn dim_has_a_floor() {
+        assert_eq!(HashEmbedder::new(2).dim(), 8); // floored to 8
+        assert_eq!(HashEmbedder::new(128).dim(), 128);
+        assert_eq!(HashEmbedder::default().dim(), 64);
+    }
+
+    #[tokio::test]
+    async fn output_matches_batch_length_and_dim() {
+        let e = HashEmbedder::new(32);
+        let out = e
+            .embed(&["a".into(), "b".into(), "c".into()])
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|v| v.len() == 32));
+    }
+
+    #[tokio::test]
+    async fn deterministic_and_l2_normalized() {
+        let e = HashEmbedder::new(64);
+        let a = embed_one(&e, "the quick brown fox").await;
+        let b = embed_one(&e, "the quick brown fox").await;
+        assert_eq!(a, b, "same text must embed identically");
+        let norm: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-5,
+            "vector must be L2-normalized, got {norm}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_text_is_zero_vector() {
+        let e = HashEmbedder::new(16);
+        let v = embed_one(&e, "   ").await;
+        assert!(v.iter().all(|&x| x == 0.0));
+    }
+
+    #[tokio::test]
+    async fn token_overlap_raises_similarity() {
+        // A larger dim keeps hash collisions rare so overlap dominates.
+        let e = HashEmbedder::new(512);
+        let base = embed_one(&e, "database connection pool timeout").await;
+        let similar = embed_one(&e, "database connection pool retry").await;
+        let different = embed_one(&e, "banana smoothie recipe kitchen").await;
+        let sim_overlap = cosine(&base, &similar);
+        let sim_none = cosine(&base, &different);
+        assert!(
+            sim_overlap > sim_none,
+            "shared tokens should score higher: overlap={sim_overlap} none={sim_none}"
+        );
+    }
+
+    #[tokio::test]
+    async fn case_insensitive_tokenization() {
+        let e = HashEmbedder::new(128);
+        let lower = embed_one(&e, "hello world").await;
+        let upper = embed_one(&e, "HELLO WORLD").await;
+        assert_eq!(lower, upper);
+    }
+}
