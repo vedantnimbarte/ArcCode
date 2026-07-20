@@ -68,7 +68,12 @@ pub async fn run(
     // agent loop and collects the assistant text.
     let mut handles = Vec::new();
     for raw in &models {
-        let (p, m) = raw.split_once('/').unwrap();
+        let Some((p, m)) = raw.split_once('/') else {
+            eprintln!(
+                "wingman: skipping malformed model '{raw}' (expected `provider/model`)"
+            );
+            continue;
+        };
         let sel = Selection {
             provider_id: p.to_string(),
             model: m.to_string(),
