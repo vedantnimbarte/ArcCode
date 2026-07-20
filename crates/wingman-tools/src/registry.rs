@@ -113,6 +113,7 @@ impl ToolRegistry {
         self.register(crate::builtin::LspHover);
         self.register(crate::builtin::LspDiagnostics);
         self.register(crate::builtin::LspRename);
+        self.register(crate::builtin::LspCodeAction);
         self
     }
 
