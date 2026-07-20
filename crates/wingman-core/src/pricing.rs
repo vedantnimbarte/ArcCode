@@ -148,9 +148,33 @@ pub fn price_for(key: &str) -> Option<Price> {
     })
 }
 
+/// A representative spread of models for cost comparison — "what would this
+/// token volume have cost elsewhere?". Diverse across price tiers and vendors;
+/// every entry resolves in [`price_for`]. Local models are omitted (they'd
+/// trivially show $0 since the user pays no per-token fee).
+pub const COMPARISON_MODELS: &[&str] = &[
+    "anthropic/claude-opus-4-8",
+    "anthropic/claude-sonnet-5",
+    "anthropic/claude-haiku-4-5",
+    "openai/gpt-5",
+    "openai/gpt-5-mini",
+    "openai/gpt-4.1",
+    "gemini/gemini-2.5-pro",
+    "gemini/gemini-2.5-flash",
+    "deepseek/deepseek-v4-pro",
+    "deepseek/deepseek-v4-flash",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_comparison_models_are_priced() {
+        for m in COMPARISON_MODELS {
+            assert!(price_for(m).is_some(), "comparison model {m} must be priced");
+        }
+    }
 
     #[test]
     fn current_default_models_are_priced() {

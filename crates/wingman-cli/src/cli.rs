@@ -105,6 +105,10 @@ pub enum Command {
         /// Output as JSON instead of a table.
         #[arg(long)]
         json: bool,
+        /// Also reprice your actual token volume against other models
+        /// (provider-cost arbitrage) — what the same work would cost elsewhere.
+        #[arg(long)]
+        compare: bool,
     },
     /// Session utilities.
     Session {
@@ -540,7 +544,7 @@ pub async fn run() -> Result<ExitCode> {
         Some(Command::Checkpoint { label }) => commands::checkpoint::create(label).await,
         Some(Command::Undo) => commands::checkpoint::undo().await,
         Some(Command::Rewind { steps }) => commands::rewind::run(steps).await,
-        Some(Command::Cost { json }) => commands::cost::run(json).await,
+        Some(Command::Cost { json, compare }) => commands::cost::run_with(json, compare).await,
         Some(Command::Session { action }) => commands::session::run(action).await,
         Some(Command::Worktree { action }) => match action {
             WorktreeAction::Create { branch } => commands::worktree::create(branch).await,
