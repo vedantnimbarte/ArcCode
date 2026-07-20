@@ -178,6 +178,22 @@ pub struct Config {
     /// Audit logging (compliance trail of tool calls).
     #[serde(default)]
     pub audit: AuditConfig,
+
+    /// Team memory server (optional, beyond the git-backed `memory sync`).
+    #[serde(default)]
+    pub team: TeamConfig,
+}
+
+/// Optional HTTP endpoint for server-backed team memory
+/// (`wingman memory push` / `pull`). The git-backed `wingman memory sync`
+/// needs no server; this is for teams that prefer a central store.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TeamConfig {
+    /// Base URL of the team memory service. Empty disables push/pull.
+    pub endpoint: Option<String>,
+    /// Bearer token. Supports `${ENV_VAR}` and `keyring:...` like other secrets.
+    pub token: Option<String>,
 }
 
 /// Append-only audit trail of tool calls — an enterprise/compliance aid.

@@ -17,6 +17,7 @@ wingman-core = { workspace = true }
 wingman-providers = { workspace = true }
 wingman-tools = { workspace = true }
 wingman-lsp = { workspace = true }
+wingman-browser = { workspace = true }
 wingman-session = { workspace = true }
 wingman-tui = { workspace = true }
 wingman-rag = { workspace = true, default-features = false }
@@ -26,7 +27,7 @@ wingman-skills = { workspace = true }
 wingman-autonomous = { workspace = true }
 wingman-ts = { workspace = true, optional = true }
 
-tokio = { workspace = true, features = ["io-std"] }
+tokio = { workspace = true, features = ["io-std", "net"] }
 futures = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
@@ -66,6 +67,10 @@ treesitter = [
     "wingman-learn/treesitter",
     "wingman-tui/treesitter",
 ]
+# Enables the headless-browser visual verification gate (needs a Chrome/
+# Chromium binary at runtime). Off by default so the standard build needs no
+# browser; the screenshot-diff logic is always compiled, only capture is gated.
+browser = ["wingman-browser/chrome"]
 
 [dev-dependencies]
 tempfile = "3"

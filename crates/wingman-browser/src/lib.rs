@@ -42,11 +42,10 @@ pub fn diff_ratio(a_png: &[u8], b_png: &[u8], tolerance: u8) -> Result<f64> {
     }
     let mut differing = 0u64;
     for (pa, pb) in a.pixels().zip(b.pixels()) {
-        let differs = pa
-            .0
-            .iter()
-            .zip(pb.0.iter())
-            .any(|(&x, &y)| x.abs_diff(y) > tolerance);
+        let differs =
+            pa.0.iter()
+                .zip(pb.0.iter())
+                .any(|(&x, &y)| x.abs_diff(y) > tolerance);
         if differs {
             differing += 1;
         }
