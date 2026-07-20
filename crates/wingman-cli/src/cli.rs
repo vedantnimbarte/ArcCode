@@ -144,6 +144,13 @@ pub enum Command {
         #[arg(long)]
         session: Option<std::path::PathBuf>,
     },
+    /// Keep this project's semantic index warm: initial reindex, then watch
+    /// the tree and refresh on change until interrupted.
+    Indexd {
+        /// Report whether a daemon is running and index freshness, then exit.
+        #[arg(long)]
+        status: bool,
+    },
     /// Run any [[schedule]] entries whose cadence is due.
     Schedule {
         /// Force-run all configured schedule entries regardless of cadence.
@@ -564,6 +571,7 @@ pub async fn run() -> Result<ExitCode> {
         Some(Command::Distill { session }) => {
             commands::distill::run(load_config()?, session).await
         }
+        Some(Command::Indexd { status }) => commands::indexd::run(status).await,
         Some(Command::Schedule { all }) => commands::schedule::run(all).await,
         Some(Command::Skill { action }) => match action {
             SkillAction::Extract { min, force } => commands::skill::extract(min, force).await,
