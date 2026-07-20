@@ -5,6 +5,7 @@
 //! result. Tools that mutate state consult `ToolCtx` for permission.
 
 mod apply_patch;
+mod command_tool;
 mod edit_file;
 mod forget_memory;
 mod glob_tool;
@@ -38,6 +39,7 @@ mod outline;
 mod who_calls;
 
 pub use apply_patch::ApplyPatch;
+pub use command_tool::CommandTool;
 pub use edit_file::EditFile;
 pub use forget_memory::ForgetMemory;
 pub use glob_tool::Glob;

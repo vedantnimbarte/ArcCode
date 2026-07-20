@@ -133,6 +133,28 @@ pub struct ToolsConfig {
     /// unambiguous token shapes to avoid mangling legitimate content.
     #[serde(default = "default_true")]
     pub redact_output_secrets: bool,
+    /// User-defined command tools: extend the agent with a shell command
+    /// without recompiling. Each becomes a tool the model can call; the tool
+    /// input JSON is passed as `$WINGMAN_TOOL_INPUT` and stdin, and stdout is
+    /// the result. Runs under the shell permission (auto-edit/yolo).
+    #[serde(default)]
+    pub custom: Vec<CustomToolConfig>,
+}
+
+/// A user-defined command tool (see [`ToolsConfig::custom`]).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct CustomToolConfig {
+    /// Tool name the model calls (e.g. "run_migration"). Snake_case advised.
+    pub name: String,
+    /// One-line description shown to the model.
+    pub description: String,
+    /// Shell command to run. The tool input JSON arrives on stdin and in
+    /// `$WINGMAN_TOOL_INPUT`; stdout becomes the tool result.
+    pub command: String,
+    /// Optional timeout in seconds (default 30).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -147,6 +169,7 @@ impl Default for ToolsConfig {
             disabled_tools: Vec::new(),
             allow_network: false,
             redact_output_secrets: true,
+            custom: Vec::new(),
         }
     }
 }

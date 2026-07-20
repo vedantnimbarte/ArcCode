@@ -182,6 +182,22 @@ impl ToolRegistry {
         self
     }
 
+    /// Register user-defined command tools from `[[tools.custom]]` config.
+    pub fn with_custom_tools(mut self, custom: &[wingman_config::CustomToolConfig]) -> Self {
+        for c in custom {
+            if c.name.trim().is_empty() || c.command.trim().is_empty() {
+                continue;
+            }
+            self.register(crate::builtin::CommandTool::new(
+                c.name.clone(),
+                c.description.clone(),
+                c.command.clone(),
+                c.timeout_secs,
+            ));
+        }
+        self
+    }
+
     /// Register the `spawn_subagent` tool. The `runner` closure is supplied
     /// by the runtime (which knows how to build inner agents) so this
     /// crate stays provider-agnostic.

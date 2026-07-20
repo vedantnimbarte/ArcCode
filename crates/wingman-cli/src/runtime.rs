@@ -466,7 +466,8 @@ pub async fn build_registry_with_learn(
         .with_builtins()
         .with_hooks(cfg.hooks.clone())
         .with_audit(audit_path)
-        .with_output_redaction(cfg.tools.redact_output_secrets);
+        .with_output_redaction(cfg.tools.redact_output_secrets)
+        .with_custom_tools(&cfg.tools.custom);
     let indexer = build_indexer(&paths)?;
     if let Some(idx) = indexer.clone() {
         reg = reg.with_semantic_search(idx);

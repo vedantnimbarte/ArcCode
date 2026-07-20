@@ -525,6 +525,18 @@ pub enum MemoryAction {
     Push,
     /// Pull team memories from the server and merge them (non-clobbering).
     Pull,
+    /// Review distilled pending memories: list, or promote/discard by index.
+    Review {
+        /// Promote the Nth pending fact (1-based) to a project memory.
+        #[arg(long, value_name = "N")]
+        promote: Option<usize>,
+        /// Discard the Nth pending fact (1-based).
+        #[arg(long, value_name = "N")]
+        discard: Option<usize>,
+        /// Promote every pending fact and clear the queue.
+        #[arg(long)]
+        promote_all: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -651,6 +663,11 @@ pub async fn run() -> Result<ExitCode> {
             MemoryAction::Sync { git_ref } => commands::memory::sync(git_ref).await,
             MemoryAction::Push => commands::memory::push().await,
             MemoryAction::Pull => commands::memory::pull().await,
+            MemoryAction::Review {
+                promote,
+                discard,
+                promote_all,
+            } => commands::memory::review(promote, discard, promote_all).await,
         },
         Some(Command::Review {
             pr,

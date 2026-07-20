@@ -220,6 +220,82 @@ pub async fn pull() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `wingman memory review` — review distilled pending memories: list them, or
+/// promote/discard by index. Promotion writes a real project memory and
+/// removes the fact from the pending queue (the last piece of the learning
+/// loop: distillation proposes, you approve).
+pub async fn review(
+    promote: Option<usize>,
+    discard: Option<usize>,
+    promote_all: bool,
+) -> Result<ExitCode> {
+    let paths = wingman_config::ProjectPaths::discover(&std::env::current_dir()?);
+    let store = wingman_learn::distill::PendingStore::new(&paths.root);
+    let mut facts = store.load();
+    if facts.is_empty() {
+        println!("(no pending distilled memories — run `wingman distill` after some sessions)");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mem = wingman_learn::memory::MemoryStore::new(paths.root.clone());
+
+    // Promote-all: save each as a project memory, then clear the queue.
+    if promote_all {
+        let mut n = 0;
+        for f in &facts {
+            if save_pending_as_memory(&mem, f).is_ok() {
+                n += 1;
+            }
+        }
+        store.rewrite(&[]).ok();
+        println!("promoted {n} pending fact(s) to project memory; queue cleared");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Promote/discard a single 1-based index.
+    if let Some(idx) = promote.or(discard) {
+        if idx == 0 || idx > facts.len() {
+            eprintln!("wingman: index {idx} out of range (1..={})", facts.len());
+            return Ok(ExitCode::from(1));
+        }
+        let fact = facts.remove(idx - 1);
+        if promote.is_some() {
+            save_pending_as_memory(&mem, &fact).map_err(|e| anyhow::anyhow!("save memory: {e}"))?;
+            println!("promoted to project memory: {fact}");
+        } else {
+            println!("discarded: {fact}");
+        }
+        store.rewrite(&facts).ok();
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Default: list with indices.
+    println!("pending distilled memories ({}):", facts.len());
+    for (i, f) in facts.iter().enumerate() {
+        println!("  {}. {f}", i + 1);
+    }
+    println!("\npromote with `wingman memory review --promote N`, discard with `--discard N`, or `--promote-all`.");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn save_pending_as_memory(
+    store: &wingman_learn::memory::MemoryStore,
+    fact: &str,
+) -> anyhow::Result<()> {
+    use wingman_learn::memory::{MemoryDraft, MemoryScope, MemoryType};
+    // Derive a slug/description from the fact's first line.
+    let desc: String = fact.chars().take(80).collect();
+    store
+        .save(MemoryDraft {
+            name: desc.clone(),
+            description: desc,
+            mtype: MemoryType::Project,
+            body: fact.to_string(),
+            scope: Some(MemoryScope::Project),
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
 /// Resolve `[team].endpoint` + token, expanding `${ENV_VAR}` in the token.
 fn team_endpoint() -> Result<Option<(String, Option<String>)>> {
     let global = wingman_config::global_config_path()?;
