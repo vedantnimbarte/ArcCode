@@ -139,6 +139,9 @@ pub enum Command {
     /// Probe localhost for running Ollama / LM Studio / vLLM and print
     /// discovered models.
     Discover,
+    /// Health check: config, provider credentials, local servers, the semantic
+    /// index, language servers on PATH, and git/gh tooling.
+    Doctor,
     /// Show what Wingman knows about this project: memories, skills,
     /// model routing, the verification gate, and index freshness.
     Knows,
@@ -678,6 +681,7 @@ pub async fn run() -> Result<ExitCode> {
         }
         Some(Command::Logout { provider }) => commands::login::logout(provider).await,
         Some(Command::Discover) => commands::discover::run().await,
+        Some(Command::Doctor) => commands::doctor::run(load_config()?).await,
         Some(Command::Knows) => commands::knows::run(load_config()?).await,
         Some(Command::Bench { suite, json }) => commands::bench::run(suite, json).await,
         Some(Command::Router { action }) => commands::router::run(action).await,

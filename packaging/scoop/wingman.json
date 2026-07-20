@@ -1,0 +1,22 @@
+{
+  "//": "Scoop manifest template. __VERSION__ / __SHA_WINDOWS_X64__ are filled by scripts/stamp-packaging.ps1 from a release tag, then submitted to a Scoop bucket.",
+  "version": "__VERSION__",
+  "description": "Multi-provider, terminal-first, self-improving coding agent in Rust.",
+  "homepage": "https://github.com/vedantnimbarte/Wingman",
+  "license": "Apache-2.0",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/vedantnimbarte/Wingman/releases/download/v__VERSION__/wingman-x86_64-pc-windows-msvc.zip",
+      "hash": "__SHA_WINDOWS_X64__"
+    }
+  },
+  "bin": "wingman.exe",
+  "checkver": "github",
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/vedantnimbarte/Wingman/releases/download/v$version/wingman-x86_64-pc-windows-msvc.zip"
+      }
+    }
+  }
+}
