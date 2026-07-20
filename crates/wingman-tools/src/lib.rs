@@ -10,6 +10,7 @@ mod ctx;
 mod registry;
 
 pub mod builtin;
+pub mod prefetch;
 
 pub use ctx::ToolCtx;
 pub use registry::{run_hook, HookResult, ToolRegistry};
